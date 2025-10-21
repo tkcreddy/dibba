@@ -1,0 +1,8 @@
+{
+  "OS_System_Cmd": {
+        "get_cpu_info": "lscpu | sed 's/:/: \"/' | sed 's/$/\"/' | awk -F ': ' '{print \"\\\"\" $1 \"\\\": \\\"\" $2 \"\\\",\"}' | sed 's/\\\"\"/\\\"/' |  sed 's/\\\"\",/\\\",/' | tr -d '\\n'|  sed 's/^/\\{/' | sed 's/.$/\\}/'",
+        "get_mem_info": "/var/log/kcld.log",
+        "get_system_info": ""
+
+    }
+}

@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option go_package = "k8s.io/cri-api/pkg/apis/runtime/v1;runtime";
+
+service RuntimeService {
+  rpc PullImage(PullImageRequest) returns (PullImageResponse);
+}
+
+message ImageSpec {
+  string image = 1;
+}
+
+message AuthConfig {
+  string username = 1;
+  string password = 2;
+  string auth = 3;
+}
+
+message PullImageRequest {
+  ImageSpec image = 1;
+  AuthConfig auth = 2;
+}
+
+message PullImageResponse {
+  string image_ref = 1;
+}

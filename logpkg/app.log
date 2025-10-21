@@ -1,0 +1,27 @@
+2024-01-17 15:31:57,990 - my_app - INFO - Calling function: add_numbers
+2024-01-17 15:31:57,991 - my_app - INFO - Arguments: (3, 5), {}
+2024-01-17 15:31:57,991 - my_app - INFO - Function returned: 8
+2024-01-17 15:31:57,991 - my_app - INFO - Final result: 8
+2024-01-17 15:34:33,680 - my_app - INFO - Calling function: add_numbers
+2024-01-17 15:34:33,681 - my_app - INFO - Arguments: (3, 'k'), {}
+2024-01-17 15:34:33,681 - my_app - ERROR - Error in function add_numbers: unsupported operand type(s) for +: 'int' and 'str'
+2024-01-17 15:35:07,754 - my_app - INFO - Calling function: add_numbers
+2024-01-17 15:35:07,754 - my_app - INFO - Arguments: (3, 5), {}
+2024-01-17 15:35:07,754 - my_app - INFO - Function returned: 8
+2024-01-17 15:35:07,754 - my_app - INFO - Final result: 8
+2024-01-17 17:49:26,924 - my_app - INFO - Calling function: add_numbers
+2024-01-17 17:49:26,925 - my_app - INFO - Arguments: (3, 5), {}
+2024-01-17 17:49:26,925 - my_app - INFO - Function returned: 8
+2024-01-17 17:49:26,925 - my_app - INFO - Final result: 8
+2024-01-17 18:29:19,822 - my_app - INFO - Calling function: add_numbers
+2024-01-17 18:29:19,822 - my_app - INFO - Arguments: (3, 5), {}
+2024-01-17 18:29:19,822 - my_app - INFO - Function returned: 8
+2024-01-17 18:29:19,822 - my_app - INFO - Final result: 8
+2024-01-17 19:23:32,131 - my_app - INFO - Calling function: add_numbers
+2024-01-17 19:23:32,131 - my_app - INFO - Arguments: (3, 5), {}
+2024-01-17 19:23:32,131 - my_app - INFO - Function returned: 8
+2024-01-17 19:23:32,132 - my_app - INFO - Final result: 8
+2024-01-17 19:36:02,243 - my_app - INFO - Calling function: add_numbers
+2024-01-17 19:36:02,244 - my_app - INFO - Arguments: (3, 5), {}
+2024-01-17 19:36:02,244 - my_app - INFO - Function returned: 8
+2024-01-17 19:36:02,244 - my_app - INFO - Final result: 8
