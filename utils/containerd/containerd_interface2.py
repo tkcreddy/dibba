@@ -18,6 +18,7 @@ import subprocess
 from shutil import which
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
+from logpkg.log_kcld import LogKCld, log_to_file
 
 from google.protobuf import any_pb2
 from google.protobuf.json_format import ParseDict
@@ -35,6 +36,7 @@ from generated.api.services.diff.v1 import diff_pb2, diff_pb2_grpc
 from generated.api.services.leases.v1 import leases_pb2, leases_pb2_grpc
 
 # ---------- Config ----------
+logger = LogKCld()
 CONTAINERD_SOCKET = "unix:///run/containerd/containerd.sock"
 NAMESPACE = os.environ.get("CONTAINERD_NAMESPACE", "k8s.io")
 DEFAULT_SNAPSHOTTER = os.environ.get("CONTAINERD_SNAPSHOTTER", "overlayfs")

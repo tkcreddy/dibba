@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, Extra
+from pydantic import BaseModel, Extra,ConfigDict
 from utils.ReadConfig import ReadConfig as rc
 from utils.celery.celery_config import celery_app
 from utils.celery.tasks.worker_node_tasks import *
@@ -105,9 +105,10 @@ class CreateInstanceRequest(BaseModel):
     namespace: str
     min_count: int
     max_count: int
+    model_config = ConfigDict(extra='allow')
 
-    class Config:
-        extra = 'allow'
+    # class Config:
+    #     extra = 'allow'
 
 
 class TerminateInstanceRequest(BaseModel):

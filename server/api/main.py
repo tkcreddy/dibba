@@ -35,8 +35,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 # Celery Configuration
 celery = Celery(
     "worker",
-    broker="rediss://localhost:6379/0?ssl_cert_reqs=required&ssl_ca_certs=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fca.crt&ssl_certfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.crt&ssl_keyfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.key",
-    backend="rediss://localhost:6379/0?ssl_cert_reqs=required&ssl_ca_certs=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fca.crt&ssl_certfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.crt&ssl_keyfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.key"
+    broker="rediss://localhost:6379/0?ssl_cert_reqs=required&ssl_ca_certs=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fdibba%2Fconfig%2Fssl%2Fca.crt&ssl_certfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.crt&ssl_keyfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.key",
+    backend="rediss://localhost:6379/0?ssl_cert_reqs=required&ssl_ca_certs=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fdibba%2Fconfig%2Fssl%2Fca.crt&ssl_certfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.crt&ssl_keyfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.key"
 
 )
 

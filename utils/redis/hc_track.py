@@ -3,7 +3,7 @@ from utils.ReadConfig import ReadConfig as rc
 from logpkg.log_kcld import LogKCld, log_to_file
 logger = LogKCld()
 
-read_config = rc('/Users/krishnareddy/PycharmProjects/baks/')
+read_config = rc('/Users/krishnareddy/PycharmProjects/dibba/')
 redis_config = read_config.redis_queue_config
 
 class HcTrack:

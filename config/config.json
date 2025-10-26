@@ -28,24 +28,24 @@
     "aws_interface":  "aws_interface_queue",
     "health_check": "health_check_queue",
     "command_return_interface": "command_return_queue",
-    "broker_url": "rediss://localhost:6379/0?ssl_cert_reqs=required&ssl_ca_certs=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fca.crt&ssl_certfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.crt&ssl_keyfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.key",
-    "backend_url": "rediss://localhost:6379/0?ssl_cert_reqs=required&ssl_ca_certs=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fca.crt&ssl_certfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.crt&ssl_keyfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fbaks%2Fconfig%2Fssl%2Fclient.key"
+    "broker_url": "rediss://redis-server:6379/0?ssl_cert_reqs=required&ssl_ca_certs=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fdibba%2Fconfig%2Fssl%2Fca.crt&ssl_certfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fdibba%2Fconfig%2Fssl%2Fclient.crt&ssl_keyfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fdibba%2Fconfig%2Fssl%2Fclient.key",
+    "backend_url": "rediss://redis-server:6379/0?ssl_cert_reqs=required&ssl_ca_certs=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fdibba%2Fconfig%2Fssl%2Fca.crt&ssl_certfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fdibba%2Fconfig%2Fssl%2Fclient.crt&ssl_keyfile=%2FUsers%2Fkrishnareddy%2FPycharmProjects%2Fdibba%2Fconfig%2Fssl%2Fclient.key"
 
   },
   "redis_db": {
-    "redis_host": "localhost",
+    "redis_host": "redis-server",
     "redis_port": 6379,
     "redis_db": 1,
-    "ssl_certfile": "/Users/krishnareddy/PycharmProjects/baks/config/ssl/client.crt",
-    "ssl_keyfile": "/Users/krishnareddy/PycharmProjects/baks/config/ssl/client.key",
-    "ssl_ca_certs": "/Users/krishnareddy/PycharmProjects/baks/config/ssl/ca.crt"
+    "ssl_certfile": "/Users/krishnareddy/PycharmProjects/dibba/config/ssl/client.crt",
+    "ssl_keyfile": "/Users/krishnareddy/PycharmProjects/dibba/config/ssl/client.key",
+    "ssl_ca_certs": "/Users/krishnareddy/PycharmProjects/dibba/config/ssl/ca.crt"
   },
     "redis_queue": {
-    "redis_host": "localhost",
+    "redis_host": "redis-server",
     "redis_port": 6379,
     "redis_db": 0,
-    "ssl_certfile": "/Users/krishnareddy/PycharmProjects/baks/config/ssl/client.crt",
-    "ssl_keyfile": "/Users/krishnareddy/PycharmProjects/baks/config/ssl/client.key",
-    "ssl_ca_certs": "/Users/krishnareddy/PycharmProjects/baks/config/ssl/ca.crt"
+    "ssl_certfile": "/Users/krishnareddy/PycharmProjects/dibba/config/ssl/client.crt",
+    "ssl_keyfile": "/Users/krishnareddy/PycharmProjects/dibba/config/ssl/client.key",
+    "ssl_ca_certs": "/Users/krishnareddy/PycharmProjects/dibba/config/ssl/ca.crt"
   }
 }

@@ -21,3 +21,4 @@ grpcio
 grpcio-tools
 protobuf
 #celery-beat
+python-multipart
