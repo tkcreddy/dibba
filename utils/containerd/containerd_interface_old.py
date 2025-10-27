@@ -15,7 +15,6 @@ import uuid
 import hashlib
 import grpc
 import subprocess
-import time
 from shutil import which
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
@@ -712,18 +711,6 @@ class RuntimeManager:
         self.c = client
         self.snapshots = snapshot_mgr
 
-    def _any_to_dict(self, a: any_pb2.Any) -> dict:
-        """
-        Decode an Any (we store the OCI spec here) into a dict when possible.
-        """
-        if not a or not a.value:
-            return {}
-        try:
-            # Your builder encodes the spec as JSON bytes
-            return json.loads(a.value.decode("utf-8"))
-        except Exception:
-            return {}
-
     def create_container(self, cid: str, image_ref: str, spec_any: any_pb2.Any,
                          labels: Optional[Dict[str, str]] = None):
         self.c.containers.Create(
@@ -770,10 +757,8 @@ class RuntimeManager:
         except grpc.RpcError:
             # Try a harder kill then delete again
             try:
-                self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9), metadata=ns_md(), timeout=timeouts
-[0])
-                self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), metadata=ns_md(), timeout=timeouts[1
-])
+                self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9), metadata=ns_md(), timeout=timeouts[0])
+                self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), metadata=ns_md(), timeout=timeouts[1])
             except grpc.RpcError:
                 pass
 
@@ -782,73 +767,6 @@ class RuntimeManager:
             self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=cid), metadata=ns_md())
         except grpc.RpcError:
             pass
-
-
-
-    def get_container_info(self, cid: str) -> Dict:
-        """
-        Return merged info about a container and its (optional) task.
-        - From Containers API: image, labels, runtime, snapshotter, OCI spec
-        - From Tasks API: pid + a best-effort status (if task exists)
-        """
-        info: Dict = {"id": cid, "task": {}}
-
-        # --- Containers API ---
-        try:
-            resp = self.c.containers.Get(
-                containers_pb2.GetContainerRequest(id=cid),
-                metadata=ns_md()
-            )
-            c = resp.container
-            info.update({
-                "image": c.image,
-                "labels": dict(c.labels),
-                "runtime": c.runtime.name if c.runtime and c.runtime.name else "",
-                "snapshotter": c.snapshotter,
-                "spec": self._any_to_dict(c.spec),
-            })
-        except grpc.RpcError as e:
-            # Not found or another error — return minimal info
-            info["error"] = f"containers.Get: {e.code().name}: {e.details()}"
-            return info
-
-        # --- Tasks API (optional) ---
-        # Try State first (commonly available), fall back to Get if needed.
-        task_pid = None
-        task_status = None
-
-        # Try State
-        try:
-            st = self.c.tasks.State(
-                tasks_pb2.StateRequest(container_id=cid),
-                metadata=ns_md()
-            )
-            # StateResponse usually has pid and status enum/string
-            if hasattr(st, "pid"):
-                task_pid = st.pid
-            if hasattr(st, "status"):
-                # status can be an enum int or string depending on generated stubs
-                task_status = getattr(st, "status", None)
-        except grpc.RpcError:
-            # Fallback: Get
-            try:
-                gt = self.c.tasks.Get(
-                    tasks_pb2.GetRequest(container_id=cid),
-                    metadata=ns_md()
-                )
-                if hasattr(gt, "task") and getattr(gt.task, "pid", 0):
-                    task_pid = gt.task.pid
-                # 'Get' may not include status; leave as None if not present
-            except grpc.RpcError:
-                pass
-
-        if task_pid is not None:
-            info["task"]["pid"] = task_pid
-        if task_status is not None:
-            # normalize to string for readability if it’s an enum/int
-            info["task"]["status"] = str(task_status)
-
-        return info
 
 # ========== Pod Manager ==========
 class PodManager:
@@ -1133,15 +1051,7 @@ if __name__ == "__main__":
     app = pods.add_container(
         pod, name="nginx",
         image="docker.io/library/nginx:latest",
-        args=[
-        "/bin/sh", "-c",
-        (
-            "rm -f /etc/nginx/conf.d/default.conf && "
-            "printf 'server { listen 8080; location / { root /usr/share/nginx/html; index index.html; } }' "
-            "> /etc/nginx/conf.d/custom.conf && "
-            "exec nginx -g 'daemon off;'"
-        )
-    ],
+        args=None,
         resources=app_resources
     )
 

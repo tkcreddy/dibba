@@ -15,8 +15,9 @@ import uuid
 import hashlib
 import grpc
 import subprocess
+import time
 from shutil import which
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 from typing import Optional, Dict, List, Tuple
 
 from google.protobuf import any_pb2
@@ -182,6 +183,7 @@ def _mcores_to_shares(millicores: int) -> int:
     shares = int(1024 * (millicores / 1000.0))
     return max(2, shares)
 
+
 # ========== Data specs ==========
 @dataclass
 class ResourceSpec:
@@ -213,6 +215,16 @@ class ResourceSpec:
         if cpu: res["cpu"] = cpu
         if mem: res["memory"] = mem
         return res
+
+@dataclass
+class ContainerSpec:
+    name: str
+    image: str
+    args: Optional[List[str]] = None
+    env: Dict[str, str] = field(default_factory=dict)
+    resources: Optional[ResourceSpec] = None
+
+
 # ---- Content / CRI helpers ----
 def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0.25) -> bool:
     # Use Content.Info which returns NOT_FOUND if the blob is absent under the current namespace.
@@ -711,6 +723,18 @@ class RuntimeManager:
         self.c = client
         self.snapshots = snapshot_mgr
 
+    def _any_to_dict(self, a: any_pb2.Any) -> dict:
+        """
+        Decode an Any (we store the OCI spec here) into a dict when possible.
+        """
+        if not a or not a.value:
+            return {}
+        try:
+            # Your builder encodes the spec as JSON bytes
+            return json.loads(a.value.decode("utf-8"))
+        except Exception:
+            return {}
+
     def create_container(self, cid: str, image_ref: str, spec_any: any_pb2.Any,
                          labels: Optional[Dict[str, str]] = None):
         self.c.containers.Create(
@@ -757,8 +781,10 @@ class RuntimeManager:
         except grpc.RpcError:
             # Try a harder kill then delete again
             try:
-                self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9), metadata=ns_md(), timeout=timeouts[0])
-                self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), metadata=ns_md(), timeout=timeouts[1])
+                self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9), metadata=ns_md(), timeout=timeouts
+[0])
+                self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), metadata=ns_md(), timeout=timeouts[1
+])
             except grpc.RpcError:
                 pass
 
@@ -768,6 +794,73 @@ class RuntimeManager:
         except grpc.RpcError:
             pass
 
+
+
+    def get_container_info(self, cid: str) -> Dict:
+        """
+        Return merged info about a container and its (optional) task.
+        - From Containers API: image, labels, runtime, snapshotter, OCI spec
+        - From Tasks API: pid + a best-effort status (if task exists)
+        """
+        info: Dict = {"id": cid, "task": {}}
+
+        # --- Containers API ---
+        try:
+            resp = self.c.containers.Get(
+                containers_pb2.GetContainerRequest(id=cid),
+                metadata=ns_md()
+            )
+            c = resp.container
+            info.update({
+                "image": c.image,
+                "labels": dict(c.labels),
+                "runtime": c.runtime.name if c.runtime and c.runtime.name else "",
+                "snapshotter": c.snapshotter,
+                "spec": self._any_to_dict(c.spec),
+            })
+        except grpc.RpcError as e:
+            # Not found or another error — return minimal info
+            info["error"] = f"containers.Get: {e.code().name}: {e.details()}"
+            return info
+
+        # --- Tasks API (optional) ---
+        # Try State first (commonly available), fall back to Get if needed.
+        task_pid = None
+        task_status = None
+
+        # Try State
+        try:
+            st = self.c.tasks.State(
+                tasks_pb2.StateRequest(container_id=cid),
+                metadata=ns_md()
+            )
+            # StateResponse usually has pid and status enum/string
+            if hasattr(st, "pid"):
+                task_pid = st.pid
+            if hasattr(st, "status"):
+                # status can be an enum int or string depending on generated stubs
+                task_status = getattr(st, "status", None)
+        except grpc.RpcError:
+            # Fallback: Get
+            try:
+                gt = self.c.tasks.Get(
+                    tasks_pb2.GetRequest(container_id=cid),
+                    metadata=ns_md()
+                )
+                if hasattr(gt, "task") and getattr(gt.task, "pid", 0):
+                    task_pid = gt.task.pid
+                # 'Get' may not include status; leave as None if not present
+            except grpc.RpcError:
+                pass
+
+        if task_pid is not None:
+            info["task"]["pid"] = task_pid
+        if task_status is not None:
+            # normalize to string for readability if it’s an enum/int
+            info["task"]["status"] = str(task_status)
+
+        return info
+
 # ========== Pod Manager ==========
 class PodManager:
     def __init__(self, client: ContainerdClient):
@@ -776,14 +869,6 @@ class PodManager:
         self.snaps = SnapshotManager(client)
         self.runtime = RuntimeManager(client, self.snaps)
         self.cni = CniManager()
-
-    # def _ensure_unpacked(self, image: str):
-    #     manifest_desc = self.images.resolve_manifest(image)
-    #     manifest, cfg = self.images.load_manifest_and_config(manifest_desc)
-    #     self.snaps.grpc_unpack(
-    #         image, manifest, cfg,
-    #         self.snaps._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
-    #     )
 
     def _ensure_unpacked(self, image: str):
         """
@@ -909,6 +994,7 @@ class PodManager:
                       args: Optional[List[str]] = None,
                       env: Optional[Dict[str, str]] = None,
                       resources: Optional[ResourceSpec] = None) -> Dict:
+
         pod_name = pod["name"]
         pod_ns = pod["ns"]
 
@@ -945,6 +1031,23 @@ class PodManager:
         print(f"🚀 App started: cid={cid}, pid={pid}, image={image}")
         return {"cid": cid, "pid": pid, "snapshot_key": snap_key}
 
+    def add_containers(self, pod: Dict, specs: List[ContainerSpec]) -> Dict[str, Dict]:
+        """
+        Launch multiple containers (apps/sidecars) into the same pod namespaces.
+        Returns a dict: { <name>: {"cid":..., "pid":..., "snapshot_key":...}, ... }
+        """
+        results: Dict[str, Dict] = {}
+        for spec in specs:
+            res = self.add_container(
+                pod=pod,
+                name=spec.name,
+                image=spec.image,
+                args=spec.args,
+                env=spec.env,
+                resources=spec.resources
+            )
+            results[spec.name] = res
+        return results
 
     def _snapshotter_name(self) -> str:
         return self.snaps._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
@@ -1032,31 +1135,106 @@ class PodManager:
 
 
 # -------------------- Demo / Example --------------------
+# if __name__ == "__main__":
+#     client = ContainerdClient()
+#     pods = PodManager(client)
+#
+#     # Create a pod with CPU/memory for the pause sandbox + CNI attach
+#     pause_resources = ResourceSpec(cpu_millicores=100, memory="64Mi")
+#     pod = pods.create_pod(
+#         "pause",
+#         pause_image="registry.k8s.io/pause:3.9",
+#         resources=pause_resources,
+#         cni_network=os.environ.get("CNI_NET_NAME", DEFAULT_CNI_NET_NAME),
+#         cni_ifname=os.environ.get("CNI_IFNAME", DEFAULT_IFNAME),
+#     )
+#
+#     # Add nginx with CPU/memory and a CPU set
+#     app_resources = ResourceSpec(cpu_millicores=500, memory="256Mi", cpuset_cpus="0-1")
+#     app = pods.add_container(
+#         pod, name="nginx",
+#         image="docker.io/library/nginx:latest",
+#         args=[
+#         "/bin/sh", "-c",
+#         (
+#             "rm -f /etc/nginx/conf.d/default.conf && "
+#             "printf 'server { listen 8080; location / { root /usr/share/nginx/html; index index.html; } }' "
+#             "> /etc/nginx/conf.d/custom.conf && "
+#             "exec nginx -g 'daemon off;'"
+#         )
+#     ],
+#         resources=app_resources
+#     )
+#
+#     print("\nSummary:")
+#     print(json.dumps({
+#         "pause": pod["pause"],
+#         "nginx": app
+#     }, indent=2))
+
 if __name__ == "__main__":
     client = ContainerdClient()
     pods = PodManager(client)
 
-    # Create a pod with CPU/memory for the pause sandbox + CNI attach
+    # 1) Create the pod (pause sandbox + CNI)
     pause_resources = ResourceSpec(cpu_millicores=100, memory="64Mi")
     pod = pods.create_pod(
-        "pause",
+        "demo-pod",
         pause_image="registry.k8s.io/pause:3.9",
         resources=pause_resources,
         cni_network=os.environ.get("CNI_NET_NAME", DEFAULT_CNI_NET_NAME),
         cni_ifname=os.environ.get("CNI_IFNAME", DEFAULT_IFNAME),
     )
 
-    # Add nginx with CPU/memory and a CPU set
-    app_resources = ResourceSpec(cpu_millicores=500, memory="256Mi", cpuset_cpus="0-1")
-    app = pods.add_container(
-        pod, name="nginx",
-        image="docker.io/library/nginx:latest",
-        args=None,
-        resources=app_resources
-    )
+    # 2) Define containers: one main app + two sidecars
+    main_resources = ResourceSpec(cpu_millicores=500, memory="256Mi", cpuset_cpus="0-1")
+    sidecar_small = ResourceSpec(cpu_millicores=100, memory="64Mi")
+
+    containers: List[ContainerSpec] = [
+        # Main app (nginx) — listening on 8080 rather than 80
+        ContainerSpec(
+            name="nginx",
+            image="docker.io/library/nginx:latest",
+            args=[
+                "/bin/sh", "-c",
+                (
+                    "rm -f /etc/nginx/conf.d/default.conf && "
+                    "printf 'server { listen 8080; location / { root /usr/share/nginx/html; index index.html; } }' "
+                    "> /etc/nginx/conf.d/custom.conf && "
+                    "exec nginx -g \"daemon off;\""
+                )
+            ],
+            resources=main_resources
+        ),
+
+        # Sidecar: simple log tailer (follows nginx access logs)
+        ContainerSpec(
+            name="log-tailer",
+            image="docker.io/library/busybox:latest",
+            args=["/bin/sh", "-c", "mkdir -p /var/log/nginx; touch /var/log/nginx/access.log; tail -F /var/log/nginx/access.log"],
+            resources=sidecar_small,
+            # If you want to share the log path from nginx rootfs you’d need a shared volume/mount;
+            # for a pure demo we just tail an empty file.
+        ),
+
+        # Sidecar: tiny “metrics” loop
+        ContainerSpec(
+            name="metrics",
+            image="docker.io/library/alpine:latest",
+            args=["/bin/sh", "-c", "while true; do echo metrics_ok $(date +%s); sleep 5; done"],
+            env={"METRICS_PORT": "9090"},
+            resources=sidecar_small
+        ),
+    ]
+
+    # 3) Launch them
+    apps = pods.add_containers(pod, containers)
 
     print("\nSummary:")
     print(json.dumps({
         "pause": pod["pause"],
-        "nginx": app
+        "apps": apps
     }, indent=2))
+
+    # Example: cleanup all (uncomment if you want auto-clean)
+    # pods.delete_pod(pod, apps=list(apps.values()))

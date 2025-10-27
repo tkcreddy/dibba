@@ -1,4 +1,4 @@
-from containerd_interface import ContainerdInterface
+from containerd_interface_old import ContainerdInterface
 
 client = ContainerdInterface()
 

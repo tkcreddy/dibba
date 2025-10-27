@@ -31,6 +31,7 @@ class _UtilitiesExtension:
         # Remove padding characters
         base64_encoded = base64_encoded.rstrip("=")
         base64_encoded = re.sub("-", "_", base64_encoded)
+        base64_encoded = base64_encoded[:16]
 
         return base64_encoded
 
