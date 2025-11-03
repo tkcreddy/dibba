@@ -1,162 +1,162 @@
-# Baks
+# Dibba
 
+A lightweight, Python-based container orchestration layer built on:
+- Celery for distributed task execution
+- Redis for messaging and state
+- Protobuf for typed RPC/data contracts
+- containerd 2.0 for runtime management
+- Calico for CNI networking
 
+Dibba provides simple, fast, and secure orchestration primitives for pods/containers, networking, and worker lifecycle management with optional AWS integration.
 
-## **Project Analysis**
-### **Overview**
-This project is a **FastAPI application** designed to:
-- Manage AWS EC2 instances through an asynchronous workflow using **Celery** and **Redis**.
-- Secure the API using **OAuth2 with JWT-based authentication**.
-- Provide endpoint-based APIs to:
-    - **Create EC2 instances** and store their metadata in Redis for tracking.
-    - **Terminate EC2 instances by namespace**.
-    - **Monitor and query Celery task statuses**.
+## Features
+- Pod and container lifecycle via containerd 2.0
+- Calico-backed CNI networking (configurable)
+- Celery task queue architecture with per-host routing
+- Redis-backed state and coordination
+- Protobuf-based interfaces and models
+- Optional AWS EC2 worker provisioning and teardown
+- REST API (FastAPI) for control-plane operations
+- Structured logging and secure message routing
 
-### **Components of the Project**
-The following components come together to build the system:
+## Architecture
+- Control Plane: FastAPI + Celery producers for task submission and monitoring
+- Data Plane: Celery workers on hosts performing containerd and network operations
+- Messaging: Redis as broker/DB; Kombu exchanges/queues for secure routing
+- Networking: Calico CNI for pod networking
+- Runtime: containerd (pause sandbox + app containers)
+- Optional Cloud: AWS EC2 provisioning for worker nodes
 
-| **Component** | **Description** |
-| --- | --- |
-| **Authentication** | Uses OAuth2 with JWT for securing private routes, implemented using FastAPI's inbuilt `Depends`. |
-| **Celery Task Management** | Handles long-running tasks (e.g., EC2 instance creation/termination) asynchronously. |
-| **Redis Integration** | Manages caching, task metadata, and application data like user passwords via Redis. |
-| **AWS EC2 Operations** | Abstracted in Celery tasks to create or terminate EC2 instances using AWS SDK (`boto3`). |
-| **Logging** | Custom logging implemented using `logpkg.log_kcld` for both file logging and console tracking. |
-### **Project Structure**
-``` 
-project/
-├── main_api.py                   # Main FastAPI application with routing and core logic
-├── requirements.txt              # Python dependencies
-├── utils/                        # Utility folder for Celery, Configs, and Redis Integrations
-│   ├── ReadConfig.py             # Reads app configuration (AWS, Redis, etc.)
-│   ├── celery/
-│   │   ├── celery_config.py      # Celery app configuration (broker, backend settings, etc.)
-│   │   ├── tasks/
-│   │   │   ├── aws_tasks.py      # AWS EC2-related Celery tasks for creating/terminating instances
-│   └── redis/
-│       ├── redis_interface.py    # Redis Interface for saving/retrieving keys/nodes.
-├── logpkg/                       # Logging utilities
-│   ├── log_kcld.py               # Custom logging implementation
-├── docs/                         # Documentation directory
-│   ├── README.md                 # Overview of the application
-│   ├── authentication.md         # Details about authentication (OAuth2 + JWT)
-│   ├── api_endpoints.md          # Detailed API routes and usage
-│   ├── architecture.md           # Technical architecture and workflows
-├── tests/                        # Unit tests for APIs, Redis, and Celery
-```
-### **Technology Stack**
-- **Framework**: FastAPI (Python 3)
-- **Task Queue**: Celery
-- **Broker**: Redis
-- **Database**: Redis (used for caching and storing instance/user data)
-- **AWS SDK**: `boto3` for EC2 management
-- **JWT**: For authentication
-- **Logging**: Custom logging built with `logpkg`
+## Prerequisites
+- Python 3.13.x
+- virtualenv
+- Redis instance accessible to control plane and workers
+- containerd (2.x) installed on worker nodes
+- Calico CNI installed and configured on worker nodes
+- Optional: AWS credentials for EC2 management
 
-### **Core Features**
-1. **Authentication**:
-    - Uses OAuth2 and JWT for securing the APIs.
-    - Token-based implementation with `/token` endpoint for generating access tokens.
-    - Token expiration configured for 30 minutes.
+## Installation
+- Create and activate a virtualenv
+- Install dependencies from requirements.txt
 
-2. **AWS EC2 Management**:
-    - Create EC2 instances using `/create-instances/` API.
-    - Terminate EC2 instances by namespace via `/terminate-namespace/`.
+Example:
+- python -m venv .venv
+- source .venv/bin/activate
+- pip install -r requirements.txt
 
-3. **Task Monitoring**:
-    - Monitor any Celery task's status by querying `/task/{task_id}`.
-    - Tasks can result in `PENDING`, `SUCCESS`, or `FAILURE` states.
+Note: This project uses virtualenv. Avoid other package managers unless explicitly required.
 
-4. **Redis Integration**:
-    - Stores instance metadata (e.g., IPs, IDs) and user hashed passwords.
+## Configuration
+Common configuration areas:
+- Redis: host, port, database
+- AWS: access key, secret, region (if using cloud workers)
+- Security: shared key for encoding/decoding secure routing tokens
+- containerd: socket, namespace, snapshotter
+- CNI: CNI_PATH, CNI_CONF_DIR, CNI_NET_NAME, CNI_IFNAME
 
-5. **Custom Logging**:
-    - Logs critical API events, errors, and task statuses using `log_kcld`.
+Environment variables:
+- CONTAINERD_SOCKET (default: unix:///run/containerd/containerd.sock)
+- CONTAINERD_NAMESPACE (default: k8s.io)
+- CONTAINERD_SNAPSHOTTER (default: overlayfs)
+- CNI_PATH (default: /opt/cni/bin)
+- CNI_CONF_DIR (default: /etc/cni/net.d)
+- CNI_NET_NAME (default: calico)
+- CNI_IFNAME (default: eth0)
 
-## **Documentation for the `docs/` Directory**
-These files will contain detailed documentation for developers working on or using the project:
-### 1. `README.md`
-``` markdown
-# FastAPI AWS EC2 Manager
+## Running
+Typical processes:
+- API server (FastAPI)
+- Celery workers (control/worker nodes)
+- Optional Celery Beat for periodic tasks
+- Optional Flower for monitoring
 
-This project is a FastAPI-based web application designed to manage **AWS EC2 instances** asynchronously with **Celery** and **Redis**. It provides APIs for EC2 instance creation, termination, and task monitoring, ensuring secure access through OAuth2-based authentication.
+Examples:
+- API: uvicorn main_api:app --host 0.0.0.0 --port 8000
+- Workers/Beat/Flower: use provided scripts in the repository
 
----
+Ensure:
+- Redis is running and reachable
+- Workers can reach Redis
+- containerd and Calico are healthy on worker hosts
 
-## **Features**
-1. **OAuth2 Authentication**:
-    - JWT-based token system to protect APIs.
-    - `/token` endpoint for generating access tokens.
-2. **Task Management**:
-    - Uses Celery for creating and terminating EC2 instances asynchronously.
-3. **Redis Integration**:
-    - Centralized storage for:
-      - Celery task results and progress tracking.
-      - Instance metadata (e.g., IPs, IDs, namespaces).
-4. **Logging**:
-    - In-depth logging of task operations and errors.
+## API
+Authentication:
+- OAuth2 Password flow
+- Token endpoint: POST /token
+- Include bearer token for subsequent requests
 
----
+Endpoints (summary):
+- POST /create-instances: provision AWS EC2 workers (requires AWS config)
+- POST /terminate-namespace: tear down all workers for a namespace
+- GET /task/{task_id}: task status introspection
+- GET /get_worker_node_data: request host info (routed to a specific worker)
+- GET /get_worker_node_ip: request host IP (routed)
+- GET /get_worker_usage_data: request host usage metrics (routed)
 
-## **Quickstart**
+Notes:
+- Per-host routing encodes the target host name into a secure queue name.
+- Long-running actions execute via Celery workers; the API returns task IDs.
 
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Orchestration
+Pods/Containers:
+- Pause sandbox pod creation
+- One or more application containers within the pod
+- Resource hints (cpu, memory) via resource specifications
+- CNI network attachment through Calico
 
-2. Start Redis:
-   ```bash
-   redis-server
-   ```
+Runtime controls:
+- Namespace-scoped containerd client configuration
+- Override containerd socket/namespace/snapshotter via env or task args
+- Per-request network overrides (CNI net name, interface)
 
-3. Start Celery workers:
-   ```bash
-   celery -A utils.celery.celery_config.celery_app worker --loglevel=info
-   ```
+## AWS Workers (Optional)
+- Create EC2 instances with custom AMI, instance type, networking
+- Register instances in Redis under a logical namespace
+- Terminate all instances for a given namespace
 
-4. Start FastAPI server:
-   ```bash
-   uvicorn main_api:app --host 0.0.0.0 --port 8000
-   ```
+## Security
+- API JWT for control-plane access
+- Secure queue naming/routing using a shared key
+- Restrict containerd socket access on workers
+- Recommend TLS/auth for Redis in production
 
-For detailed API usage, see [api_endpoints.md](./api_endpoints.md)!
+## Observability
+- Structured logging across API and workers
+- Celery task IDs for progress tracking
+- Optional Flower dashboard
+- Hooks available to export metrics
 
----
-```
-### 2. `authentication.md`
-``` markdown
-# Authentication
+## Development
+- Use the provided virtualenv for isolation
+- Tasks live under utils/celery/tasks
+- Utilities for containerd, Redis, Calico, and AWS are organized under utils/
+- Follow existing task patterns for new operations
+- Prefer protobuf contracts for cross-component compatibility
 
-This application uses OAuth2 with JWT for authenticating users.
+## Production Checklist
+- Redis in HA mode or managed service with TLS/auth
+- Harden API: proper identity provider, rotate secrets
+- Lock down worker hosts and containerd socket
+- Validate Calico policies per namespace
+- Monitor Celery workers and queue depths
+- Use dedicated VPC subnets/security groups for AWS workers
 
-## **Endpoints**
-1. **`/token` (POST)**:
-   - URL: `/token`
-   - Description: Accepts username and password, then generates a Bearer JWT token.
-   - **Request Body**:
-     ```json
-     {
-       "username": "string",
-       "password": "string"
-     }
-     ```
-   - **Response**:
-     ```json
-     {
-       "access_token": "string",
-       "token_type": "bearer"
-     }
-     ```
+## Roadmap
+- Multi-network attachment and IPAM customization
+- Advanced scheduling and placement constraints
+- Pluggable storage backends
+- gRPC control-plane interface
+- Fine-grained RBAC and audit logging
 
----
+## License
+Apache 2.0 (update to your actual license as needed)
 
-### **Token Expiry**
-- Tokens are valid for **30 minutes** from the time of creation.
-- If expired, you need to reauthenticate via `/token`.
+## Support
+- Issues: open a ticket in the repository
+- Discussions: use the project’s discussion board
+- Security: report vulnerabilities privately to maintainers
 
----
-
-### **Securing API Calls**
-Secured endpoints require an `Authorization` header:
-```
+About
+- Maintained by the Dibba contributors
+- Contact: via repository issues
+- Assistant: AI Assistant (software development assistant)

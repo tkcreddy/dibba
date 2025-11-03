@@ -8,10 +8,15 @@ from utils.celery.tasks.aws_tasks import get_ec2_instances, create_worker_nodes,
 from utils.extensions.utilities_extention import UtilitiesExtension
 from kombu import Exchange
 from utils.redis.redis_interface import RedisInterface
+from dataclasses import dataclass,field
 import logging
 import jwt
 from datetime import datetime, timedelta
 from logpkg.log_kcld import LogKCld, log_to_file
+from typing import Optional, Dict, List, Tuple
+from utils.containerd.containerd_interface import ContainerdClient, PodManager, ResourceSpec,ContainerSpec
+
+
 
 logger = LogKCld()
 # Initialize FastAPI app
@@ -48,6 +53,49 @@ aws_queue_info = {
     'routing_key': ue.encode_hostname_with_key('aws_interface'),
     'delivery_mode': 2
 }
+
+
+@dataclass
+class ContainerSpec:
+    name: str
+    image: str
+    args: Optional[List[str]] = None
+    env: Dict[str, str] = field(default_factory=dict)
+    resources: Optional[ResourceSpec] = None
+
+
+# Models for request validation
+class CreateInstanceRequest(BaseModel):
+    instance_type: str
+    ami_id: str
+    key_name: str
+    security_group_ids: list[str]
+    subnet_id: str
+    namespace: str
+    min_count: int
+    max_count: int
+    model_config = ConfigDict(extra='allow')
+
+
+class CreatePodsRequest(BaseModel):
+    namespace: str
+    containers: List[ContainerSpec]
+    host_name: str
+
+    # class Config:
+    #     extra = 'allow'
+
+
+class TerminateInstanceRequest(BaseModel):
+    namespace: str
+
+
+class TaskId(BaseModel):
+    task_id: str
+
+
+class HostName(BaseModel):
+    host_name: str
 
 
 #@log_to_file(logger)
@@ -94,33 +142,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     except jwt.InvalidTokenError as e:
         raise HTTPException(status_code=401, detail="Invalid token") from e
 
-
-# Models for request validation
-class CreateInstanceRequest(BaseModel):
-    instance_type: str
-    ami_id: str
-    key_name: str
-    security_group_ids: list[str]
-    subnet_id: str
-    namespace: str
-    min_count: int
-    max_count: int
-    model_config = ConfigDict(extra='allow')
-
-    # class Config:
-    #     extra = 'allow'
-
-
-class TerminateInstanceRequest(BaseModel):
-    namespace: str
-
-
-class TaskId(BaseModel):
-    task_id: str
-
-
-class HostName(BaseModel):
-    host_name: str
 
 
 #@log_to_file(logger)
@@ -286,6 +307,24 @@ async def get_worker_usage_data(request: HostName, user: str = Depends(get_curre
         logger.error(f"Error submitting get_usage task: {e}")
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
+
+@app.get("/create_pods/")
+async def create_pods(request: HostName,user: str = Depends(get_current_user)):
+    host_queue_info = {
+        'exchange': Exchange('secure_exchange', type='direct'),
+        'queue': ue.encode_hostname_with_key(request.host_name),
+        'routing_key': ue.encode_hostname_with_key(request.host_name),
+        'delivery_mode': 2
+    }
+    try:
+        task = get_usage.apply_async(
+            args=(),
+            **host_queue_info
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting get_usage task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 if __name__ == "__main__":
     import uvicorn
