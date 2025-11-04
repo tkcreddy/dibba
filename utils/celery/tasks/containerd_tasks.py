@@ -29,11 +29,8 @@ logger = LogKCld()
 
 @celery_app.task
 @log_to_file(logger)
-def create_pods(containers: List[ContainerSpec] = None,
+def create_pod_task(containers: List[ContainerSpec] = None,
     app_namespace: str = None,           # <- dynamic namespace
-    cni_network: str = None,             # <- optional override
-    cni_ifname: str = None,              # <- optional override
-    containerd_socket: str = None,       # <- optional socket override
     **kwargs
 ):
     """
@@ -46,9 +43,9 @@ def create_pods(containers: List[ContainerSpec] = None,
     """
     # Resolve dynamic values
     ns = app_namespace or DEFAULT_NAMESPACE
-    sock = containerd_socket or DEFAULT_CONTAINERD_SOCKET
-    cni_net = cni_network or DEFAULT_CNI_NET_NAME
-    cni_dev = cni_ifname or DEFAULT_IFNAME
+    sock =  DEFAULT_CONTAINERD_SOCKET
+    cni_net = DEFAULT_CNI_NET_NAME
+    cni_dev =  DEFAULT_IFNAME
 
     # # Basic validation
     # if not app_name:

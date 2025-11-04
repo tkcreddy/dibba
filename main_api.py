@@ -4,6 +4,7 @@ from pydantic import BaseModel, Extra,ConfigDict
 from utils.ReadConfig import ReadConfig as rc
 from utils.celery.celery_config import celery_app
 from utils.celery.tasks.worker_node_tasks import *
+from utils.celery.tasks.containerd_tasks import *
 from utils.celery.tasks.aws_tasks import get_ec2_instances, create_worker_nodes, terminate_worker_node
 from utils.extensions.utilities_extention import UtilitiesExtension
 from kombu import Exchange
@@ -78,12 +79,8 @@ class CreateInstanceRequest(BaseModel):
 
 
 class CreatePodsRequest(BaseModel):
-    namespace: str
     containers: List[ContainerSpec]
-    host_name: str
-
-    # class Config:
-    #     extra = 'allow'
+    namespace: str
 
 
 class TerminateInstanceRequest(BaseModel):
@@ -309,16 +306,26 @@ async def get_worker_usage_data(request: HostName, user: str = Depends(get_curre
 
 
 @app.get("/create_pods/")
-async def create_pods(request: HostName,user: str = Depends(get_current_user)):
+async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current_user)):
     host_queue_info = {
         'exchange': Exchange('secure_exchange', type='direct'),
         'queue': ue.encode_hostname_with_key(request.host_name),
         'routing_key': ue.encode_hostname_with_key(request.host_name),
         'delivery_mode': 2
     }
+    request_data = request.dict()
+    defined_fields = CreatePodsRequest.__annotations__.keys()
+    extra_kwargs = {k: v for k, v in request_data.items() if k not in defined_fields}
+
     try:
-        task = get_usage.apply_async(
-            args=(),
+        task = create_pod_task.apply_async(
+            args=(
+                request.containers,
+                request.namespace
+            ),
+            kwargs={
+                **extra_kwargs
+                   },
             **host_queue_info
         )
         return {"message": "Task submitted successfully", "task_id": task.id}
