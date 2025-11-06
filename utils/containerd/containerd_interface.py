@@ -19,6 +19,8 @@ import time
 from shutil import which
 from dataclasses import dataclass,field
 from typing import Optional, Dict, List, Tuple
+from utils.ReadConfig import ReadConfig as rc
+from logpkg.log_kcld import LogKCld, log_to_file
 
 from google.protobuf import any_pb2
 from google.protobuf.json_format import ParseDict
@@ -36,8 +38,13 @@ from generated.runtime.v1 import api_pb2, api_pb2_grpc
 from generated.api.services.diff.v1 import diff_pb2, diff_pb2_grpc
 from generated.api.services.leases.v1 import leases_pb2, leases_pb2_grpc
 
+logger = LogKCld()
+
+read_conf = rc()
+
 
 # ---- add this helper near your imports ----
+@log_to_file(logger)
 def _normalize_unix_target(sock: str) -> str:
     """
     Accepts either:
@@ -77,6 +84,7 @@ DEFAULT_CNI_NET_NAME = os.environ.get("CNI_NET_NAME", "calico")  # must match co
 DEFAULT_IFNAME = os.environ.get("CNI_IFNAME", "eth0")
 
 # --- platform auto-detect (overridden if FORCE_PLATFORM is set) ---
+@log_to_file(logger)
 def _detect_platform() -> Tuple[str, str]:
     m = os.uname().machine.lower()
     arch_map = {
@@ -101,12 +109,15 @@ DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
 DOCKER_MAN  = "application/vnd.docker.distribution.manifest.v2+json"
 ANNOTATION_UNCOMPRESSED = "containerd.io/uncompressed"
 
+@log_to_file(logger)
 def _is_index(mt: str) -> bool:
     return mt.endswith("image.index.v1+json") or mt == DOCKER_LIST
 
+@log_to_file(logger)
 def _is_manifest(mt: str) -> bool:
     return mt.endswith("image.manifest.v1+json") or mt == DOCKER_MAN
 
+@log_to_file(logger)
 def ns_md(extra=None) -> Tuple[Tuple[str,str], ...]:
     md = [("containerd-namespace", NAMESPACE)]
     if extra:
@@ -114,6 +125,7 @@ def ns_md(extra=None) -> Tuple[Tuple[str,str], ...]:
     return tuple(md)
 
 # ========== Utilities ==========
+@log_to_file(logger)
 def _candidates_for_ref(ref: str) -> List[str]:
     out = {ref}
     last = ref.split("/")[-1]
@@ -129,11 +141,13 @@ def _candidates_for_ref(ref: str) -> List[str]:
     out.add(ref.replace("k8s.gcr.io/", "registry.k8s.io/"))
     return list(out)
 
+@log_to_file(logger)
 def _read_blob_json(content_stub, digest: str, extra_md=None) -> dict:
     stream = content_stub.Read(content_pb2.ReadContentRequest(digest=digest), metadata=ns_md(extra_md))
     data = b"".join(part.data for part in stream if part.data)
     return json.loads(data.decode("utf-8"))
 
+@log_to_file(logger)
 def _compute_chain_id(diff_ids: List[str]) -> str:
     if not diff_ids:
         raise ValueError("chainID needs at least one diff_id")
@@ -146,6 +160,7 @@ def _compute_chain_id(diff_ids: List[str]) -> str:
         chain = f"sha256:{h.hexdigest()}"
     return chain
 
+@log_to_file(logger)
 def _parse_bytes(value: str | int | None) -> Optional[int]:
     if value is None:
         return None
@@ -170,6 +185,7 @@ def _parse_bytes(value: str | int | None) -> Optional[int]:
         mul = units.get(suf[-1], 1)
     return int(float(num) * mul)
 
+@log_to_file(logger)
 def _mcores_to_quota_period(millicores: int, period_us: int = 100_000) -> Tuple[int, int]:
     if millicores <= 0:
         return (0, period_us)
@@ -177,6 +193,7 @@ def _mcores_to_quota_period(millicores: int, period_us: int = 100_000) -> Tuple[
     quota = max(quota, 1000)
     return (quota, period_us)
 
+@log_to_file(logger)
 def _mcores_to_shares(millicores: int) -> int:
     if millicores <= 0:
         return 2
@@ -197,6 +214,7 @@ class ResourceSpec:
     memory: Optional[str | int] = None
     cpuset_cpus: Optional[str] = None
 
+    @log_to_file(logger)
     def to_linux_resources_dict(self) -> Dict:
         cpu: Dict = {}
         mem: Dict = {}
@@ -226,6 +244,7 @@ class ContainerSpec:
 
 
 # ---- Content / CRI helpers ----
+@log_to_file(logger)
 def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0.25) -> bool:
     # Use Content.Info which returns NOT_FOUND if the blob is absent under the current namespace.
     for i in range(retries + 1):
@@ -242,12 +261,14 @@ def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0
             raise
 
 class _CRIImageClient:
+    @log_to_file(logger)
     def __init__(self, socket_target="/run/containerd/containerd.sock"):
         # Accept either a path or a 'unix://...' target
         target = _normalize_unix_target(socket_target)
         self.channel = grpc.insecure_channel(target)
         self.stub = api_pb2_grpc.ImageServiceStub(self.channel)
 
+    @log_to_file(logger)
     def pull(self, image_ref: str) -> str | None:
         try:
             resp = self.stub.PullImage(api_pb2.PullImageRequest(
@@ -258,6 +279,7 @@ class _CRIImageClient:
             print(f"[cri] PullImage error: {e.code().name}: {e.details()}")
             return None
 
+    @log_to_file(logger)
     def image_status(self, image_ref: str) -> str | None:
         try:
             st = self.stub.ImageStatus(api_pb2.ImageStatusRequest(
@@ -270,6 +292,7 @@ class _CRIImageClient:
         return None
 # ========== Client ==========
 class ContainerdClient:
+    @log_to_file(logger)
     def __init__(self,
                  socket: str = CONTAINERD_SOCKET,
                  namespace: str = NAMESPACE):
@@ -286,9 +309,11 @@ class ContainerdClient:
 
 # ========== Image Resolution ==========
 class ImageResolver:
+    @log_to_file(logger)
     def __init__(self, client: ContainerdClient):
         self.c = client
 
+    @log_to_file(logger)
     def resolve_image_name(self, wanted: str) -> str:
         for cand in _candidates_for_ref(wanted):
             try:
@@ -328,12 +353,14 @@ class ImageResolver:
             return tgt
         raise RuntimeError(f"Unsupported target media type: {tgt.media_type}")
 
+    @log_to_file(logger)
     def load_manifest_and_config(self, manifest_desc, extra_md=None):
         manifest = _read_blob_json(self.c.content, manifest_desc.digest, extra_md)
         cfg_digest = manifest["config"]["digest"]
         config = _read_blob_json(self.c.content, cfg_digest, extra_md)
         return manifest, config
 
+    @log_to_file(logger)
     def chain_id_for_image(self, image_ref: str) -> str:
         md = None
         manifest_desc = self.resolve_manifest(image_ref, md)
@@ -345,11 +372,13 @@ class ImageResolver:
 
 # ========== Snapshot / Unpack ==========
 class SnapshotManager:
+    @log_to_file(logger)
     def __init__(self, client: ContainerdClient, default_snapshotter: str = DEFAULT_SNAPSHOTTER):
         self.c = client
         self._snapshotter_value_cache: Optional[str] = None
         self.default_snapshotter = default_snapshotter
 
+    @log_to_file(logger)
     def _snapshotter_candidates(self) -> List[str]:
         raw = []
         if self.default_snapshotter:
@@ -359,6 +388,7 @@ class SnapshotManager:
         full = [f"io.containerd.snapshotter.v1.{name}" for name in raw]
         return raw + full
 
+    @log_to_file(logger)
     def prepare_rw_snapshot(self, parent_chain_id: str, key_hint: str, extra_md=None) -> Tuple[List
 , str]:
         key = f"{key_hint}-{uuid.uuid4().hex[:8]}"
@@ -389,6 +419,7 @@ class SnapshotManager:
                 continue
         raise RuntimeError("Unable to select snapshotter for containerd Snapshots API.")
 
+    @log_to_file(logger)
     def _snap_stat_exists(self, snapshotter: str, key_or_name: str, extra_md=None) -> bool:
         try:
             self.c.snapshots.Stat(
@@ -401,6 +432,7 @@ class SnapshotManager:
                 return False
             raise
 
+    @log_to_file(logger)
     def _snap_remove_active(self, snapshotter: str, key: str, extra_md=None):
         try:
             self.c.snapshots.Remove(
@@ -410,6 +442,7 @@ class SnapshotManager:
         except grpc.RpcError:
             pass
 
+    @log_to_file(logger)
     def grpc_unpack(self, image_ref: str, manifest: dict, cfg: dict, snapshotter: str):
         layers = manifest.get("layers", [])
         diff_ids = (cfg.get("rootfs") or {}).get("diff_ids", [])
@@ -464,6 +497,8 @@ class SnapshotManager:
             parent_chain = cur_chain
 
         return parent_chain
+
+    @log_to_file(logger)
     def _new_lease(self, id_hint: str = "unpack") -> leases_pb2.Lease:
         lid = f"{id_hint}-{uuid.uuid4().hex[:8]}"
         resp = self.c.leases.Create(
@@ -471,6 +506,7 @@ class SnapshotManager:
             metadata=ns_md())
         return resp.lease
 
+    @log_to_file(logger)
     def _delete_lease(self, lease_id: str):
         try:
             self.c.leases.Delete(leases_pb2.DeleteRequest(id=lease_id), metadata=ns_md())
@@ -480,9 +516,11 @@ class SnapshotManager:
 
 # ========== OCI Spec Builder ==========
 class OciSpecBuilder:
+    @log_to_file(logger)
     def __init__(self, hostname: Optional[str] = None):
         self.hostname = hostname or ""
 
+    @log_to_file(logger)
     def build(self,
               process_args: List[str],
               env: Optional[Dict[str, str]] = None,
@@ -560,12 +598,15 @@ class CniManager:
       into an in-memory conflist and we execute the FIRST plugin (commonly 'calico').
       For multi-plugin chains, install cnitool or extend this to iterate plugins.
     """
+
+    @log_to_file(logger)
     def __init__(self, cni_bin_dir: str = CNI_BIN_DIR, cni_conf_dir: str = CNI_CONF_DIR):
         self.cni_bin_dir = cni_bin_dir
         self.cni_conf_dir = cni_conf_dir
         self.cnitool = which("cnitool")
 
     # ----- shared env for CNI calls -----
+    @log_to_file(logger)
     def _base_env(self, container_id: str, netns_path: str, ifname: str, extra_env: dict | None = None):
         env = os.environ.copy()
         env.update({
@@ -581,6 +622,7 @@ class CniManager:
         return env
 
     # ======== cnitool fast path ========
+    @log_to_file(logger)
     def _cnitool_add(self, network_name: str, netns_path: str, env: dict, timeout: int) -> dict:
         cmd = [self.cnitool, "add", network_name, netns_path]
         res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
@@ -591,6 +633,7 @@ class CniManager:
         except Exception:
             return {"raw": res.stdout}
 
+    @log_to_file(logger)
     def _cnitool_del(self, network_name: str, netns_path: str, env: dict, timeout: int):
         cmd = [self.cnitool, "del", network_name, netns_path]
         res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
@@ -598,6 +641,7 @@ class CniManager:
             print(f"[cni] delete warning: {res.stderr.strip() or res.stdout.strip()}")
 
     # ======== config discovery supporting .conflist and .conf ========
+    @log_to_file(logger)
     def _load_conf_or_conflist(self, path: str) -> dict | None:
         try:
             with open(path, "r") as f:
@@ -615,6 +659,7 @@ class CniManager:
         except Exception:
             return None
 
+    @log_to_file(logger)
     def _find_conflist(self, network_name: str) -> dict:
         try:
             files = sorted(
@@ -637,12 +682,14 @@ class CniManager:
         )
 
     # ======== plugin execution helpers (fallback path) ========
+    @log_to_file(logger)
     def _plugin_bin(self, plugin_type: str) -> str:
         path = os.path.join(self.cni_bin_dir, plugin_type)
         if not os.path.exists(path):
             raise FileNotFoundError(f"CNI plugin binary '{plugin_type}' not found in {self.cni_bin_dir}")
         return path
 
+    @log_to_file(logger)
     def _exec_plugin(self, plugin_type: str, command: str, netns_path: str, container_id: str,
                      ifname: str, config_obj: dict, timeout: int = 20) -> str:
         env = os.environ.copy()
@@ -665,6 +712,7 @@ class CniManager:
             )
         return res.stdout.decode()
 
+    @log_to_file(logger)
     def _direct_add_first_plugin(self, network_name: str, container_id: str, netns_path: str,
                                  ifname: str, timeout: int) -> dict:
         conflist = self._find_conflist(network_name)
@@ -689,6 +737,7 @@ class CniManager:
             return {"raw": out}
 
     # ---------- Public API ----------
+    @log_to_file(logger)
     def add(self, network_name: str, container_id: str, netns_path: str, ifname: str = DEFAULT_IFNAME,
             timeout: int = 20) -> dict:
         env = self._base_env(container_id, netns_path, ifname)
@@ -696,6 +745,7 @@ class CniManager:
             return self._cnitool_add(network_name, netns_path, env, timeout)
         return self._direct_add_first_plugin(network_name, container_id, netns_path, ifname, timeout)
 
+    @log_to_file(logger)
     def delete(self, network_name: str, container_id: str, netns_path: str, ifname: str = DEFAULT_IFNAME,
                timeout: int = 20):
         env = self._base_env(container_id, netns_path, ifname)
@@ -719,10 +769,12 @@ class CniManager:
 
 # ========== Container/Task ==========
 class RuntimeManager:
+    @log_to_file(logger)
     def __init__(self, client: ContainerdClient, snapshot_mgr: SnapshotManager):
         self.c = client
         self.snapshots = snapshot_mgr
 
+    @log_to_file(logger)
     def _any_to_dict(self, a: any_pb2.Any) -> dict:
         """
         Decode an Any (we store the OCI spec here) into a dict when possible.
@@ -735,6 +787,7 @@ class RuntimeManager:
         except Exception:
             return {}
 
+    @log_to_file(logger)
     def create_container(self, cid: str, image_ref: str, spec_any: any_pb2.Any,
                          labels: Optional[Dict[str, str]] = None):
         self.c.containers.Create(
@@ -751,6 +804,7 @@ class RuntimeManager:
             metadata=ns_md()
         )
 
+    @log_to_file(logger)
     def start_task(self, cid: str, mounts, tty: bool = False, create_timeout=15.0, start_timeout=30.0) -> int:
         create_req = tasks_pb2.CreateTaskRequest(
             container_id=cid,
@@ -762,6 +816,7 @@ class RuntimeManager:
                                   metadata=ns_md(), timeout=start_timeout)
         return resp.pid
 
+    @log_to_file(logger)
     def stop_and_delete_task(self, cid: str, kill_signal: int = 15, timeouts: Tuple[float,float] = (3.0, 10.0)) -> None:
         """
         Best-effort: send signal, then delete the task; finally delete the container.
@@ -794,8 +849,7 @@ class RuntimeManager:
         except grpc.RpcError:
             pass
 
-
-
+    @log_to_file(logger)
     def get_container_info(self, cid: str) -> Dict:
         """
         Return merged info about a container and its (optional) task.
@@ -863,6 +917,7 @@ class RuntimeManager:
 
 # ========== Pod Manager ==========
 class PodManager:
+    @log_to_file(logger)
     def __init__(self, client: ContainerdClient):
         self.c = client
         self.images = ImageResolver(client)
@@ -870,6 +925,7 @@ class PodManager:
         self.runtime = RuntimeManager(client, self.snaps)
         self.cni = CniManager()
 
+    @log_to_file(logger)
     def _ensure_unpacked(self, image: str):
         """
         Ensure blobs exist in content store and unpack chain into snapshots.
@@ -881,6 +937,7 @@ class PodManager:
           - re-check blobs (with a tiny retry), then grpc_unpack
         """
 
+        @log_to_file(logger)
         def _layers_from_manifest(m: dict) -> list[str]:
             return [l["digest"] for l in (m.get("layers") or [])]
 
@@ -940,6 +997,7 @@ class PodManager:
             self.snaps._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
         )
 
+    @log_to_file(logger)
     def create_pod(self, name: str, pause_image: str = "registry.k8s.io/pause:3.9",
                    resources: Optional[ResourceSpec] = None,
                    cni_network: str = DEFAULT_CNI_NET_NAME,
@@ -989,6 +1047,7 @@ class PodManager:
                 "cni": {"network": cni_network, "ifname": cni_ifname},
                 "snapshot_key": snap_key}
 
+    @log_to_file(logger)
     def add_container(self, pod: Dict, name: str,
                       image: str,
                       args: Optional[List[str]] = None,
@@ -1031,6 +1090,7 @@ class PodManager:
         print(f"🚀 App started: cid={cid}, pid={pid}, image={image}")
         return {"cid": cid, "pid": pid, "snapshot_key": snap_key}
 
+    @log_to_file(logger)
     def add_containers(self, pod: Dict, specs: List[ContainerSpec]) -> Dict[str, Dict]:
         """
         Launch multiple containers (apps/sidecars) into the same pod namespaces.
@@ -1049,9 +1109,11 @@ class PodManager:
             results[spec.name] = res
         return results
 
+    @log_to_file(logger)
     def _snapshotter_name(self) -> str:
         return self.snaps._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
 
+    @log_to_file(logger)
     def delete_container(self, app: Dict) -> None:
         """
         Delete an app container:
@@ -1075,6 +1137,7 @@ class PodManager:
             except Exception as e:
                 print(f"[cleanup] snapshot remove warning ({snap_key}): {e}")
 
+    @log_to_file(logger)
     def delete_pod(self, pod: Dict, apps: Optional[List[Dict]] = None) -> None:
         """
         Delete a pod and release its Calico IP:

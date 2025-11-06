@@ -95,7 +95,7 @@ class HostName(BaseModel):
     host_name: str
 
 
-#@log_to_file(logger)
+@log_to_file(logger)
 def authenticate_user(username: str, password: str):
     if not rd.get_user_pass(username):
         return False
@@ -103,7 +103,7 @@ def authenticate_user(username: str, password: str):
         return username
 
 
-#@log_to_file(logger)
+@log_to_file(logger)
 def create_access_token(data: dict, expires_delta: timedelta):
     to_encode = data.copy()
     expire = datetime.now(UTC) + expires_delta
@@ -111,7 +111,7 @@ def create_access_token(data: dict, expires_delta: timedelta):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-#@log_to_file(logger)
+@log_to_file(logger)
 @app.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form_data.username, form_data.password)
@@ -125,7 +125,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
 
 #Dependency to get the current user
-#@log_to_file(logger)
+@log_to_file(logger)
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -141,7 +141,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 
 
 
-#@log_to_file(logger)
+@log_to_file(logger)
 @app.post("/create-instances/")
 async def create_instances(request: CreateInstanceRequest, user: str = Depends(get_current_user)):
     """
@@ -180,7 +180,7 @@ async def create_instances(request: CreateInstanceRequest, user: str = Depends(g
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 
-#@log_to_file(logger)
+@log_to_file(logger)
 @app.post("/terminate-namespace/")
 async def terminate_namespace(request: TerminateInstanceRequest, user: str = Depends(get_current_user)):
     """
@@ -211,7 +211,7 @@ async def terminate_namespace(request: TerminateInstanceRequest, user: str = Dep
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 
-#@log_to_file(logger)
+@log_to_file(logger)
 async def monitor_task(task_id: str, namespace: str, max_count: int):
     """
     Background task to monitor the Celery task result and save instances to Redis.
@@ -235,7 +235,7 @@ async def monitor_task(task_id: str, namespace: str, max_count: int):
         logger.error(f"Error in monitoring task {task_id}: {e}")
 
 
-#@log_to_file(logger)
+@log_to_file(logger)
 @app.get("/task/{task_id}")
 async def get_task_status(task_id: str, user: str = Depends(get_current_user)):
     task = celery_app.AsyncResult(task_id)
@@ -247,7 +247,7 @@ async def get_task_status(task_id: str, user: str = Depends(get_current_user)):
         "progress": task.info if task.state == "PROGRESS" else None,
     }
 
-
+@log_to_file(logger)
 @app.get("/get_worker_node_data/")
 async def get_worker_node_data(request: HostName, user: str = Depends(get_current_user)):
     host_queue_info = {
@@ -267,6 +267,7 @@ async def get_worker_node_data(request: HostName, user: str = Depends(get_curren
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 
+@log_to_file(logger)
 @app.get("/get_worker_node_ip/")
 async def get_worker_node_ip(request: HostName, user: str = Depends(get_current_user)):
     host_queue_info = {
@@ -286,6 +287,7 @@ async def get_worker_node_ip(request: HostName, user: str = Depends(get_current_
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 
+@log_to_file(logger)
 @app.get("/get_worker_usage_data/")
 async def get_worker_usage_data(request: HostName, user: str = Depends(get_current_user)):
     host_queue_info = {
@@ -305,6 +307,7 @@ async def get_worker_usage_data(request: HostName, user: str = Depends(get_curre
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 
+@log_to_file(logger)
 @app.get("/create_pods/")
 async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current_user)):
     host_queue_info = {
