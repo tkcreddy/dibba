@@ -13,7 +13,12 @@ class _ReadConfig:
             self.base_dir = os.path.join(base_dir, 'config')
             print(f'base_dir: {self.base_dir}')
         else:
-            self.base_dir = 'config/'
+            PATH = os.getcwd()
+            print("Loading config from default path")
+            self.base_dir = os.path.join(PATH, 'config')
+            #self.base_dir = 'config/'
+            print(f'base_dir: {self.base_dir}')
+
 
         try:
             self.file_path = os.path.join(self.base_dir, 'config.json')

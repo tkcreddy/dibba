@@ -4,17 +4,17 @@ from utils.ReadConfig import ReadConfig as rc
 from utils.singleton import Singleton
 import os
 #print(os.getcwd())
-PATH=os.getcwd()
+#PATH=os.getcwd()
 
 
 class _LogKCld(object):
-    read_config = rc(PATH)
+    read_config = rc()
     logging_config = read_config.logging_config
     # name="my_app"
     log_file = logging_config['file_path']
     log_level = logging_config['level']
 
-    def __init__(self, name="kcld", log_file=log_file, level=log_level) -> None:
+    def __init__(self, name="dibba", log_file=log_file, level=log_level) -> None:
         """
         Initializes a Logger object.
 
