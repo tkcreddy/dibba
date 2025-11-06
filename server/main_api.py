@@ -12,7 +12,7 @@ from utils.redis.redis_interface import RedisInterface
 from dataclasses import dataclass,field
 import logging
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta,UTC
 from logpkg.log_kcld import LogKCld, log_to_file
 from typing import Optional, Dict, List, Tuple
 from utils.containerd.containerd_interface import ContainerdClient, PodManager, ResourceSpec,ContainerSpec
@@ -106,7 +106,7 @@ def authenticate_user(username: str, password: str):
 #@log_to_file(logger)
 def create_access_token(data: dict, expires_delta: timedelta):
     to_encode = data.copy()
-    expire = datetime.utcnow() + expires_delta
+    expire = datetime.now(UTC) + expires_delta
     to_encode["exp"] = expire
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 

@@ -1,4 +1,4 @@
-import redis
+import redis,ssl
 import json
 from utils.ReadConfig import ReadConfig as rc
 from logpkg.log_kcld import LogKCld, log_to_file
@@ -15,7 +15,8 @@ class RedisInterface:
         self.redis_client = redis.Redis(host=redis_config['redis_host'], port=redis_config['redis_port'], db=redis_config['redis_db'], decode_responses=True, ssl=True,
                                         ssl_ca_certs=redis_config['ssl_ca_certs'],
                                         ssl_certfile=redis_config['ssl_certfile'],
-                                        ssl_keyfile=redis_config['ssl_keyfile'])
+                                        ssl_keyfile=redis_config['ssl_keyfile'],
+                                        ssl_cert_reqs=ssl.CERT_REQUIRED)
         #self.redis_kkk= redis.StrictRedis
 
     @log_to_file(logger)

@@ -1,7 +1,7 @@
 {
   "logging": {
     "level": "INFO",
-    "file_path": "/var/log/kcld.log"
+    "file_path": "/var/log/dibba/dibba.log"
   },
   "kafka": {
     "bootstrap_servers": "kafka-server:9093",

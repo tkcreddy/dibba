@@ -18,10 +18,10 @@ CNI_CONF_DIR = os.environ.get("CNI_CONF_DIR", "/etc/cni/net.d")
 DEFAULT_CNI_NET_NAME = os.environ.get("CNI_NET_NAME", "calico")
 DEFAULT_IFNAME = os.environ.get("CNI_IFNAME", "eth0")
 
-parser = argparse.ArgumentParser(description='A Python CLI application')
-parser.add_argument('--configDir', type=str, help='Please specify ConfigDir')
-args = parser.parse_args()
-read_config = rc(args.configDir)
+# parser = argparse.ArgumentParser(description='A Python CLI application')
+# parser.add_argument('--configDir', type=str, help='Please specify ConfigDir')
+# args = parser.parse_args()
+read_config = rc("./")
 key_read = read_config.encryption_config
 
 logger = LogKCld()
