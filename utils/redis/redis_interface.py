@@ -4,7 +4,7 @@ from utils.ReadConfig import ReadConfig as rc
 from logpkg.log_kcld import LogKCld, log_to_file
 logger = LogKCld()
 
-read_conf = rc('/Users/krishnareddy/PycharmProjects/dibba/')
+read_conf = rc()
 redis_config = read_conf.redis_db_config
 
 
