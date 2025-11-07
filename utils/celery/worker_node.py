@@ -3,12 +3,8 @@ from kombu import Queue,Exchange
 from socket import gethostname
 from utils.ReadConfig import ReadConfig as rc
 from utils.extensions.utilities_extention import UtilitiesExtension
-import argparse
 
-parser = argparse.ArgumentParser(description='A Python CLI application')
-parser.add_argument('--configDir', type=str, help='Please specify ConfigDir')
-args = parser.parse_args()
-read_config = rc(args.configDir)
+read_config = rc()
 secure_exchange = Exchange('secure_exchange', type='direct')
 hostname = gethostname()
 key = read_config.encryption_config['key']
@@ -20,4 +16,6 @@ celery_app.conf.task_queues = [
             Queue(hostname_queue_name, exchange=secure_exchange, routing_key=hostname_queue_name),
 
         ]
-celery_app.autodiscover_tasks(['utils.celery.tasks.worker_node_tasks','utils.celery.tasks.containerd_tasks'])
+#celery_app.autodiscover_tasks(['utils.celery.tasks.worker_node_tasks','utils.celery.tasks.containerd_tasks'])
+#celery_app.autodiscover_tasks(['utils.celery.tasks.worker_node_tasks','utils.celery.tasks.containerd_tasks'])
+celery_app.conf.include = 'utils.celery.tasks.containerd_tasks'
