@@ -1035,7 +1035,7 @@ class PodManager:
             namespaces=ns,
             resources=resources,
         )
-        cid = f"{uuid.uuid4().hex[:6]}-{name}"
+        cid = f"{name}"
         self.runtime.create_container(cid, pause_image, spec_any, labels={"pod": name, "role": "pause"})
         pid = self.runtime.start_task(cid, mounts)
 
@@ -1092,7 +1092,7 @@ class PodManager:
             namespaces=namespaces,
             resources=resources
         )
-        cid = f"{uuid.uuid4().hex[:6]}-{pod_name}-{name}"
+        cid = f"{pod_name}-{name}"
         self.runtime.create_container(cid, image, spec_any, labels={"pod": pod_name, "app": name})
         pid = self.runtime.start_task(cid, mounts)
         print(f"🚀 App started: cid={cid}, pid={pid}, image={image}")

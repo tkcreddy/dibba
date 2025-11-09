@@ -2,22 +2,16 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Extra,ConfigDict
 from server.api_models import CreatePodsRequest
-from utils.ReadConfig import ReadConfig as rc
-from utils.celery.celery_config import celery_app
 from utils.celery.tasks.worker_node_tasks import *
 from utils.celery.tasks.containerd_tasks import *
 from utils.celery.tasks.aws_tasks import get_ec2_instances, create_worker_nodes, terminate_worker_node
 from utils.extensions.utilities_extention import UtilitiesExtension
 from kombu import Exchange
 from utils.redis.redis_interface import RedisInterface
-from dataclasses import dataclass,field
-from dataclasses import asdict
 import logging
 import jwt
 from datetime import datetime, timedelta,UTC
 from logpkg.log_kcld import LogKCld, log_to_file
-from typing import Optional, Dict, List, Tuple
-from utils.containerd.schemas import ContainerSpec
 from dataclasses import is_dataclass, asdict
 
 

@@ -3,6 +3,7 @@ from utils.containerd.containerd_interface import ContainerdClient, PodManager
 from typing import Optional, Dict, List, Any,Tuple
 from logpkg.log_kcld import LogKCld, log_to_file
 from utils.ReadConfig import ReadConfig as rc
+import uuid
 #from utils.containerd.models import ResourceSpec
 
 from utils.containerd.schemas import ContainerSpec, ResourceSpec
@@ -87,7 +88,7 @@ def create_pod_task(
         # Create the pause sandbox (pod)
         pause_resources = ResourceSpec(cpu_millicores=100, memory="64Mi")
         pod = pods.create_pod(
-            name="pause",
+            name=f"{uuid.uuid4().hex[:16]}",
             pause_image="registry.k8s.io/pause:3.9",
             resources=pause_resources,
             cni_network=cni_net,
