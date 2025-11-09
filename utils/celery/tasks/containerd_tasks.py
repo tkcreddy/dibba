@@ -1,10 +1,11 @@
 from utils.celery.celery_config import celery_app
 from utils.containerd.containerd_interface import ContainerdClient, PodManager
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Any,Tuple
 from logpkg.log_kcld import LogKCld, log_to_file
 from utils.ReadConfig import ReadConfig as rc
-from utils.containerd.models import ResourceSpec
-from utils.containerd.schemas import ContainerSpec
+#from utils.containerd.models import ResourceSpec
+
+from utils.containerd.schemas import ContainerSpec, ResourceSpec
 from utils.containerd.adapters import linux_resources_from_spec
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.singleton import Singleton
@@ -29,19 +30,43 @@ key_read = read_config.encryption_config
 logger = LogKCld()
 
 
+def _rehydrate_containers(containers_json):
+    """
+    containers_json: List[dict] coming from FastAPI (JSON-serializable)
+    Return: List[ContainerSpec] with nested ResourceSpec properly cast.
+    """
+    specs = []
+    if not isinstance(containers_json, list):
+        raise TypeError(f"'containers' must be a list of dicts, got {type(containers_json)}")
+
+    for idx, item in enumerate(containers_json):
+        if not isinstance(item, dict):
+            raise TypeError(f"containers[{idx}] must be dict, got {type(item)}")
+
+        d = dict(item)  # shallow copy
+        # fix nested resources
+        if "resources" in d and isinstance(d["resources"], dict):
+            d["resources"] = ResourceSpec(**d["resources"])
+
+        # (optional) normalize missing fields
+        d.setdefault("env", None)
+        d.setdefault("mounts", None)
+        d.setdefault("args", None)
+
+        specs.append(ContainerSpec(**d))
+    return specs
+
+
+
 
 @celery_app.task
 @log_to_file(logger)
-def create_pod_task(self,  containers: list[dict], app_namespace: str = None, **kwargs):
-    # Rebuild objects only if your PodManager expects typed objects
+def create_pod_task(
+                    containers,
+                    app_namespace: Optional[str] = None,
+                    **extra_kwargs):
 
-    # typed = []
-    # for c in containers:
-    #     # Defensive: handle missing resources
-    #     if "resources" in c and isinstance(c["resources"], dict):
-    #         c["resources"] = ResourceSpec(**c["resources"])
-    #     typed.append(ContainerSpec(**c))
-    # Resolve dynamic values
+    ns = app_namespace or "k8s.io"
     ns = app_namespace or DEFAULT_NAMESPACE
     sock =  DEFAULT_CONTAINERD_SOCKET
     cni_net = DEFAULT_CNI_NET_NAME
@@ -69,26 +94,28 @@ def create_pod_task(self,  containers: list[dict], app_namespace: str = None, **
             cni_ifname=cni_dev,
         )
 
-        app_defs = []
-        for c in containers:
-            rs = c.get("resources", {})
-            lr = linux_resources_from_spec(
-                cpu_millicores=rs.get("cpu_millicores", 0),
-                memory=rs.get("memory", "64Mi"),
-                cpuset_cpus=rs.get("cpuset_cpus"),
-            )
-            app_defs.append({
-                "name": c["name"],
-                "image": c["image"],
-                "args": c.get("args", []),
-                "env": c.get("env") or {},
-                "mounts": c.get("mounts") or [],
-                "linux_resources": lr,             # <- give builder what it needs
-            })
+        # app_defs = []
+        # for c in containers:
+        #     rs = c.get("resources", {})
+        #     lr = linux_resources_from_spec(
+        #         cpu_millicores=rs.get("cpu_millicores", 0),
+        #         memory=rs.get("memory", "64Mi"),
+        #         cpuset_cpus=rs.get("cpuset_cpus"),
+        #     )
+        #     app_defs.append({
+        #         "name": c["name"],
+        #         "image": c["image"],
+        #         "args": c.get("args", []),
+        #         "env": c.get("env") or {},
+        #         "mounts": c.get("mounts") or [],
+        #         "linux_resources": lr,             # <- give builder what it needs
+        #     })
 
-
+        #containers = [ContainerSpec(**c) for c in (containers or [])]
+        #host_name = kwargs.get("host_name")  # avoid .get on strings
+        container_specs = _rehydrate_containers(containers)
         # Create the application container in the pod
-        apps = pods.add_containers(pod, app_defs)
+        apps = pods.add_containers(pod, container_specs)
 
         # Return simple, JSON-serializable data for Celery
         return {

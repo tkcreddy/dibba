@@ -58,22 +58,6 @@ aws_queue_info = {
 }
 
 
-# class CreatePodsRequest(BaseModel):
-#     host_name: str
-#     namespace: Optional[str] = None
-#     containers: List[ContainerSpec]
-#     model_config = ConfigDict(extra='allow')
-
-
-# @dataclass
-# class ContainerSpec:
-#     name: str
-#     image: str
-#     args: Optional[List[str]] = None
-#     env: Dict[str, str] = field(default_factory=dict)
-#     resources: Optional[ResourceSpec] = None
-
-
 # Models for request validation
 class CreateInstanceRequest(BaseModel):
     instance_type: str
@@ -173,28 +157,29 @@ async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current
         'routing_key': ue.encode_hostname_with_key(request.host_name),
         'delivery_mode': 2
     }
-    logger.error(f"Inside create_pods")
-    # request_data = request.dict() if hasattr(request, "dict") else as_plain(request)
-    # defined_fields = CreatePodsRequest.__annotations__.keys()
-    # extra_kwargs = {k: v for k, v in request_data.items() if k not in defined_fields}
+    logger.info(f"Inside create_pods")
 
-    # **Serialize containers to plain dicts**
-    #containers_payload = [as_plain(c) for c in request.containers]
-    containers_payload = [c.model_dump(mode="json") for c in request.containers]
 
-    #containers_payload = [asdict(c) for c in request.containers]
-    #containers_payload = [c.model_dump() for c in request.containers]
+    #containers_payload = [c.model_dump(mode="json") for c in request.containers]
+    containers_payload = [c.model_dump() for c in request.containers]
+
+
     extra_kwargs = {
         k: v for k, v in request.model_dump().items()
         if k not in CreatePodsRequest.__annotations__.keys()
-    }
+    } or {"host_name": request.host_name}
     #containers_payload  =  containers_payload.to_dict()
     namespace = request.namespace
 
     try:
         task = create_pod_task.apply_async(
             args=(containers_payload, namespace),
-            kwargs={**extra_kwargs},
+            kwargs={
+            "host_name": request.host_name,
+            # any extra kwargs you want to flow to the task (must be JSON-safe)
+            # "cni_network": "calico",
+            # "cni_ifname": "eth0",
+        },
             **host_queue_info
         )
         return {"message": "Task submitted successfully", "task_id": task.id}
