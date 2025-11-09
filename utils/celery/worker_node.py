@@ -16,6 +16,5 @@ celery_app.conf.task_queues = [
             Queue(hostname_queue_name, exchange=secure_exchange, routing_key=hostname_queue_name),
 
         ]
-#celery_app.autodiscover_tasks(['utils.celery.tasks.worker_node_tasks','utils.celery.tasks.containerd_tasks'])
-#celery_app.autodiscover_tasks(['utils.celery.tasks.worker_node_tasks','utils.celery.tasks.containerd_tasks'])
-celery_app.conf.include = 'utils.celery.tasks.containerd_tasks'
+celery_app.autodiscover_tasks(['utils.celery.tasks.worker_node_tasks'])
+celery_app.conf.include = ["utils.celery.tasks.containerd_tasks"]

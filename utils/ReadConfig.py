@@ -69,3 +69,4 @@ class _ReadConfig:
 
 class ReadConfig(_ReadConfig, metaclass=Singleton):
     pass
+

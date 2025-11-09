@@ -21,6 +21,7 @@ from dataclasses import dataclass,field
 from typing import Optional, Dict, List, Tuple
 from utils.ReadConfig import ReadConfig as rc
 from logpkg.log_kcld import LogKCld, log_to_file
+from typing import Union
 
 from google.protobuf import any_pb2
 from google.protobuf.json_format import ParseDict
@@ -37,6 +38,7 @@ from generated.runtime.v1 import api_pb2, api_pb2_grpc
 # diff + leases for gRPC-only unpack
 from generated.api.services.diff.v1 import diff_pb2, diff_pb2_grpc
 from generated.api.services.leases.v1 import leases_pb2, leases_pb2_grpc
+from utils.containerd.models import ResourceSpec
 
 logger = LogKCld()
 
@@ -202,37 +204,37 @@ def _mcores_to_shares(millicores: int) -> int:
 
 
 # ========== Data specs ==========
-@dataclass
-class ResourceSpec:
-    """
-    CPU/memory constraints for a container.
-    - cpu_millicores: e.g., 500 -> ~0.5 CPU. Sets both shares and CFS quota.
-    - memory: bytes OR a string like "256Mi"
-    - cpuset_cpus: e.g., "0-1,3"
-    """
-    cpu_millicores: Optional[int] = None
-    memory: Optional[str | int] = None
-    cpuset_cpus: Optional[str] = None
-
-    @log_to_file(logger)
-    def to_linux_resources_dict(self) -> Dict:
-        cpu: Dict = {}
-        mem: Dict = {}
-        if self.cpu_millicores is not None:
-            shares = _mcores_to_shares(self.cpu_millicores)
-            quota, period = _mcores_to_quota_period(self.cpu_millicores, 100_000)
-            cpu["shares"] = shares
-            cpu["quota"] = quota
-            cpu["period"] = period
-        if self.cpuset_cpus:
-            cpu["cpus"] = self.cpuset_cpus
-        mem_bytes = _parse_bytes(self.memory) if self.memory is not None else None
-        if mem_bytes is not None and mem_bytes > 0:
-            mem["limit"] = mem_bytes
-        res = {}
-        if cpu: res["cpu"] = cpu
-        if mem: res["memory"] = mem
-        return res
+# @dataclass
+# class ResourceSpec:
+#     """
+#     CPU/memory constraints for a container.
+#     - cpu_millicores: e.g., 500 -> ~0.5 CPU. Sets both shares and CFS quota.
+#     - memory: bytes OR a string like "256Mi"
+#     - cpuset_cpus: e.g., "0-1,3"
+#     """
+#     cpu_millicores: Optional[int] = None
+#     memory: Optional[str | int] = None
+#     cpuset_cpus: Optional[str] = None
+#
+#     @log_to_file(logger)
+#     def to_linux_resources_dict(self) -> Dict:
+#         cpu: Dict = {}
+#         mem: Dict = {}
+#         if self.cpu_millicores is not None:
+#             shares = _mcores_to_shares(self.cpu_millicores)
+#             quota, period = _mcores_to_quota_period(self.cpu_millicores, 100_000)
+#             cpu["shares"] = shares
+#             cpu["quota"] = quota
+#             cpu["period"] = period
+#         if self.cpuset_cpus:
+#             cpu["cpus"] = self.cpuset_cpus
+#         mem_bytes = _parse_bytes(self.memory) if self.memory is not None else None
+#         if mem_bytes is not None and mem_bytes > 0:
+#             mem["limit"] = mem_bytes
+#         res = {}
+#         if cpu: res["cpu"] = cpu
+#         if mem: res["memory"] = mem
+#         return res
 
 @dataclass
 class ContainerSpec:
@@ -525,9 +527,15 @@ class OciSpecBuilder:
               process_args: List[str],
               env: Optional[Dict[str, str]] = None,
               namespaces: Optional[List[Dict]] = None,
-              resources: Optional[ResourceSpec] = None,
+              resources: Union[dict, "ResourceSpec"]= None,
               cwd: str = "/",
               root_readonly: bool = False) -> any_pb2.Any:
+        if hasattr(resources, "to_linux_resources_dict"):
+            linux_res = resources.to_linux_resources_dict()           # ResourceSpec -> dict
+        elif isinstance(resources, dict):
+            linux_res = resources
+        else:
+            raise TypeError("resources must be ResourceSpec or dict")
 
         default_env = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

@@ -84,3 +84,4 @@ def log_to_file(logger):
 
 class LogKCld(_LogKCld, metaclass=Singleton):
     pass
+

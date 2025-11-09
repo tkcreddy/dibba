@@ -1,11 +1,13 @@
 from utils.celery.celery_config import celery_app
-from utils.containerd.containerd_interface import ContainerdClient, PodManager, ResourceSpec,ContainerSpec
+from utils.containerd.containerd_interface import ContainerdClient, PodManager
 from typing import Optional, Dict, List, Tuple
 from logpkg.log_kcld import LogKCld, log_to_file
 from utils.ReadConfig import ReadConfig as rc
+from utils.containerd.models import ResourceSpec
+from utils.containerd.schemas import ContainerSpec
+from utils.containerd.adapters import linux_resources_from_spec
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.singleton import Singleton
-import argparse
 import os
 
 # Defaults (can be overridden by task args or env)
@@ -27,20 +29,18 @@ key_read = read_config.encryption_config
 logger = LogKCld()
 
 
+
 @celery_app.task
 @log_to_file(logger)
-def create_pod_task(containers: List[ContainerSpec] = None,
-    app_namespace: str = None,           # <- dynamic namespace
-    **kwargs
-):
-    """
-    Creates a pause 'pod' and one application container inside it.
+def create_pod_task(self,  containers: list[dict], app_namespace: str = None, **kwargs):
+    # Rebuild objects only if your PodManager expects typed objects
 
-    Dynamic knobs:
-      - app_namespace: containerd namespace (defaults to env CONTAINERD_NAMESPACE or 'k8s.io')
-      - containerd_socket: containerd gRPC target (defaults to env or unix:///run/containerd/containerd.sock)
-      - cni_network / cni_ifname: override Calico network name and interface (defaults from env)
-    """
+    # typed = []
+    # for c in containers:
+    #     # Defensive: handle missing resources
+    #     if "resources" in c and isinstance(c["resources"], dict):
+    #         c["resources"] = ResourceSpec(**c["resources"])
+    #     typed.append(ContainerSpec(**c))
     # Resolve dynamic values
     ns = app_namespace or DEFAULT_NAMESPACE
     sock =  DEFAULT_CONTAINERD_SOCKET
@@ -56,7 +56,6 @@ def create_pod_task(containers: List[ContainerSpec] = None,
     # app_cpuset = app_cpu_limit
 
     try:
-        # Create a client bound to the requested namespace/socket
         client = ContainerdClient(socket=sock, namespace=ns)
         pods = PodManager(client)
 
@@ -70,8 +69,26 @@ def create_pod_task(containers: List[ContainerSpec] = None,
             cni_ifname=cni_dev,
         )
 
+        app_defs = []
+        for c in containers:
+            rs = c.get("resources", {})
+            lr = linux_resources_from_spec(
+                cpu_millicores=rs.get("cpu_millicores", 0),
+                memory=rs.get("memory", "64Mi"),
+                cpuset_cpus=rs.get("cpuset_cpus"),
+            )
+            app_defs.append({
+                "name": c["name"],
+                "image": c["image"],
+                "args": c.get("args", []),
+                "env": c.get("env") or {},
+                "mounts": c.get("mounts") or [],
+                "linux_resources": lr,             # <- give builder what it needs
+            })
+
+
         # Create the application container in the pod
-        apps = pods.add_containers(pod, containers)
+        apps = pods.add_containers(pod, app_defs)
 
         # Return simple, JSON-serializable data for Celery
         return {

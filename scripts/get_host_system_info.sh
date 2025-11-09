@@ -4,4 +4,4 @@ ACCESS_TOKEN=`curl -X POST "http://127.0.0.1:8000/token" \
      -H "Content-Type: application/x-www-form-urlencoded" | jq -r '.access_token'`
 echo $ACCESS_TOKEN
 curl -X GET "http://127.0.0.1:8000/get_worker_node_data/" -H "Authorization: Bearer $ACCESS_TOKEN"   -H "Content-Type: application/json" \
--d '{ "host_name": "Krishnas-MBP.lan" }'
+-d '{ "host_name": "ip-172-31-17-19" }'

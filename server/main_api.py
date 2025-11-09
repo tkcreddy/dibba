@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Extra,ConfigDict
+from server.api_models import CreatePodsRequest
 from utils.ReadConfig import ReadConfig as rc
 from utils.celery.celery_config import celery_app
 from utils.celery.tasks.worker_node_tasks import *
@@ -10,13 +11,14 @@ from utils.extensions.utilities_extention import UtilitiesExtension
 from kombu import Exchange
 from utils.redis.redis_interface import RedisInterface
 from dataclasses import dataclass,field
+from dataclasses import asdict
 import logging
 import jwt
 from datetime import datetime, timedelta,UTC
 from logpkg.log_kcld import LogKCld, log_to_file
 from typing import Optional, Dict, List, Tuple
-from utils.containerd.containerd_interface import ContainerdClient, PodManager, ResourceSpec,ContainerSpec
-
+from utils.containerd.schemas import ContainerSpec
+from dataclasses import is_dataclass, asdict
 
 
 logger = LogKCld()
@@ -56,13 +58,20 @@ aws_queue_info = {
 }
 
 
-@dataclass
-class ContainerSpec:
-    name: str
-    image: str
-    args: Optional[List[str]] = None
-    env: Dict[str, str] = field(default_factory=dict)
-    resources: Optional[ResourceSpec] = None
+# class CreatePodsRequest(BaseModel):
+#     host_name: str
+#     namespace: Optional[str] = None
+#     containers: List[ContainerSpec]
+#     model_config = ConfigDict(extra='allow')
+
+
+# @dataclass
+# class ContainerSpec:
+#     name: str
+#     image: str
+#     args: Optional[List[str]] = None
+#     env: Dict[str, str] = field(default_factory=dict)
+#     resources: Optional[ResourceSpec] = None
 
 
 # Models for request validation
@@ -76,11 +85,6 @@ class CreateInstanceRequest(BaseModel):
     min_count: int
     max_count: int
     model_config = ConfigDict(extra='allow')
-
-
-class CreatePodsRequest(BaseModel):
-    containers: List[ContainerSpec]
-    namespace: str
 
 
 class TerminateInstanceRequest(BaseModel):
@@ -112,6 +116,25 @@ def create_access_token(data: dict, expires_delta: timedelta):
 
 
 @log_to_file(logger)
+def as_plain(obj):
+    if obj is None:
+        return None
+    if hasattr(obj, "model_dump"):     # Pydantic v2
+        return obj.model_dump()
+    if hasattr(obj, "dict"):           # Pydantic v1
+        return obj.dict()
+    if is_dataclass(obj):              # Python dataclass
+        return asdict(obj)
+    if isinstance(obj, (list, tuple)):
+        return [as_plain(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: as_plain(v) for k, v in obj.items()}
+    # last resort: object's __dict__
+    return getattr(obj, "__dict__", obj)
+
+
+
+@log_to_file(logger)
 @app.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form_data.username, form_data.password)
@@ -139,6 +162,45 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     except jwt.InvalidTokenError as e:
         raise HTTPException(status_code=401, detail="Invalid token") from e
 
+
+@log_to_file(logger)
+@app.post("/create-pods")
+@app.post("/create-pods/")
+async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current_user)):
+    host_queue_info = {
+        'exchange': Exchange('secure_exchange', type='direct'),
+        'queue': ue.encode_hostname_with_key(request.host_name),
+        'routing_key': ue.encode_hostname_with_key(request.host_name),
+        'delivery_mode': 2
+    }
+    logger.error(f"Inside create_pods")
+    # request_data = request.dict() if hasattr(request, "dict") else as_plain(request)
+    # defined_fields = CreatePodsRequest.__annotations__.keys()
+    # extra_kwargs = {k: v for k, v in request_data.items() if k not in defined_fields}
+
+    # **Serialize containers to plain dicts**
+    #containers_payload = [as_plain(c) for c in request.containers]
+    containers_payload = [c.model_dump(mode="json") for c in request.containers]
+
+    #containers_payload = [asdict(c) for c in request.containers]
+    #containers_payload = [c.model_dump() for c in request.containers]
+    extra_kwargs = {
+        k: v for k, v in request.model_dump().items()
+        if k not in CreatePodsRequest.__annotations__.keys()
+    }
+    #containers_payload  =  containers_payload.to_dict()
+    namespace = request.namespace
+
+    try:
+        task = create_pod_task.apply_async(
+            args=(containers_payload, namespace),
+            kwargs={**extra_kwargs},
+            **host_queue_info
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting get_usage task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 
 @log_to_file(logger)
@@ -307,36 +369,8 @@ async def get_worker_usage_data(request: HostName, user: str = Depends(get_curre
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 
-@log_to_file(logger)
-@app.get("/create_pods/")
-async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current_user)):
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    request_data = request.dict()
-    defined_fields = CreatePodsRequest.__annotations__.keys()
-    extra_kwargs = {k: v for k, v in request_data.items() if k not in defined_fields}
-
-    try:
-        task = create_pod_task.apply_async(
-            args=(
-                request.containers,
-                request.namespace
-            ),
-            kwargs={
-                **extra_kwargs
-                   },
-            **host_queue_info
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting get_usage task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
-
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

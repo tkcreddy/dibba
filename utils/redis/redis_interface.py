@@ -17,7 +17,6 @@ class RedisInterface:
                                         ssl_certfile=redis_config['ssl_certfile'],
                                         ssl_keyfile=redis_config['ssl_keyfile'],
                                         ssl_cert_reqs=ssl.CERT_REQUIRED)
-        #self.redis_kkk= redis.StrictRedis
 
     @log_to_file(logger)
     def save_user_pass(self, user, password):
