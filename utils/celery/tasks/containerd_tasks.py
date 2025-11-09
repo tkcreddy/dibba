@@ -67,7 +67,7 @@ def create_pod_task(
                     app_namespace: Optional[str] = None,
                     **extra_kwargs):
 
-    ns = app_namespace or "k8s.io"
+
     ns = app_namespace or DEFAULT_NAMESPACE
     sock =  DEFAULT_CONTAINERD_SOCKET
     cni_net = DEFAULT_CNI_NET_NAME
