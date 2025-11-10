@@ -24,7 +24,7 @@ def _parse_mem_bytes(s: str) -> int:
     num = ""
     unit = ""
     for ch in s:
-        if (ch.isdigit() or ch == "."):
+        if ch.isdigit() or ch == ".":
             num += ch
         else:
             unit += ch

@@ -38,6 +38,7 @@ from generated.runtime.v1 import api_pb2, api_pb2_grpc
 # diff + leases for gRPC-only unpack
 from generated.api.services.diff.v1 import diff_pb2, diff_pb2_grpc
 from generated.api.services.leases.v1 import leases_pb2, leases_pb2_grpc
+from utils.containerd.grpc_ns import _AddNamespaceInterceptor
 from utils.containerd.models import ResourceSpec
 
 logger = LogKCld()
@@ -126,6 +127,14 @@ def ns_md(extra=None) -> Tuple[Tuple[str,str], ...]:
         md.extend(extra)
     return tuple(md)
 
+@log_to_file(logger)
+def rtns_md(namespace: str,extra=None) -> Tuple[Tuple[str,str], ...]:
+    md = [("containerd-namespace", namespace)]
+    if extra:
+        md.extend(extra)
+    return tuple(md)
+
+
 # ========== Utilities ==========
 @log_to_file(logger)
 def _candidates_for_ref(ref: str) -> List[str]:
@@ -145,7 +154,7 @@ def _candidates_for_ref(ref: str) -> List[str]:
 
 @log_to_file(logger)
 def _read_blob_json(content_stub, digest: str, extra_md=None) -> dict:
-    stream = content_stub.Read(content_pb2.ReadContentRequest(digest=digest), metadata=ns_md(extra_md))
+    stream = content_stub.Read(content_pb2.ReadContentRequest(digest=digest))
     data = b"".join(part.data for part in stream if part.data)
     return json.loads(data.decode("utf-8"))
 
@@ -202,40 +211,6 @@ def _mcores_to_shares(millicores: int) -> int:
     shares = int(1024 * (millicores / 1000.0))
     return max(2, shares)
 
-
-# ========== Data specs ==========
-# @dataclass
-# class ResourceSpec:
-#     """
-#     CPU/memory constraints for a container.
-#     - cpu_millicores: e.g., 500 -> ~0.5 CPU. Sets both shares and CFS quota.
-#     - memory: bytes OR a string like "256Mi"
-#     - cpuset_cpus: e.g., "0-1,3"
-#     """
-#     cpu_millicores: Optional[int] = None
-#     memory: Optional[str | int] = None
-#     cpuset_cpus: Optional[str] = None
-#
-#     @log_to_file(logger)
-#     def to_linux_resources_dict(self) -> Dict:
-#         cpu: Dict = {}
-#         mem: Dict = {}
-#         if self.cpu_millicores is not None:
-#             shares = _mcores_to_shares(self.cpu_millicores)
-#             quota, period = _mcores_to_quota_period(self.cpu_millicores, 100_000)
-#             cpu["shares"] = shares
-#             cpu["quota"] = quota
-#             cpu["period"] = period
-#         if self.cpuset_cpus:
-#             cpu["cpus"] = self.cpuset_cpus
-#         mem_bytes = _parse_bytes(self.memory) if self.memory is not None else None
-#         if mem_bytes is not None and mem_bytes > 0:
-#             mem["limit"] = mem_bytes
-#         res = {}
-#         if cpu: res["cpu"] = cpu
-#         if mem: res["memory"] = mem
-#         return res
-
 @dataclass
 class ContainerSpec:
     name: str
@@ -251,7 +226,7 @@ def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0
     # Use Content.Info which returns NOT_FOUND if the blob is absent under the current namespace.
     for i in range(retries + 1):
         try:
-            content_stub.Info(content_pb2.InfoRequest(digest=dgst), metadata=ns_md())
+            content_stub.Info(content_pb2.InfoRequest(digest=dgst))
             return True
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.NOT_FOUND:
@@ -297,17 +272,27 @@ class ContainerdClient:
     @log_to_file(logger)
     def __init__(self,
                  socket: str = CONTAINERD_SOCKET,
-                 namespace: str = NAMESPACE):
+                 namespace: str = None):
         self.socket = socket
         self.namespace = namespace
-        self.channel = grpc.insecure_channel(socket)
-        self.images = images_pb2_grpc.ImagesStub(self.channel)
-        self.content = content_pb2_grpc.ContentStub(self.channel)
-        self.snapshots = snapshots_pb2_grpc.SnapshotsStub(self.channel)
-        self.containers = containers_pb2_grpc.ContainersStub(self.channel)
-        self.tasks = tasks_pb2_grpc.TasksStub(self.channel)
-        self.diff = diff_pb2_grpc.DiffStub(self.channel)
-        self.leases = leases_pb2_grpc.LeasesStub(self.channel)
+        if socket.startswith("unix://"):
+            ch = grpc.insecure_channel(socket)
+        else:
+            ch = grpc.insecure_channel(socket)  # adjust if you truly have TLS
+
+        self._ich = grpc.intercept_channel(ch, _AddNamespaceInterceptor(namespace))
+
+        #self.channel = grpc.insecure_channel(socket)
+        self.images = images_pb2_grpc.ImagesStub(self._ich)
+        self.content = content_pb2_grpc.ContentStub(self._ich)
+        self.snapshots = snapshots_pb2_grpc.SnapshotsStub(self._ich)
+        self.containers = containers_pb2_grpc.ContainersStub(self._ich)
+        self.tasks = tasks_pb2_grpc.TasksStub(self._ich)
+        self.diff = diff_pb2_grpc.DiffStub(self._ich)
+        self.leases = leases_pb2_grpc.LeasesStub(self._ich)
+    def md(self, extra: tuple[tuple[str, str], ...] = ()) -> tuple[tuple[str, str], ...]:
+        base = (("containerd-namespace", self.namespace),)
+        return base + tuple(extra)
 
 # ========== Image Resolution ==========
 class ImageResolver:
@@ -319,7 +304,7 @@ class ImageResolver:
     def resolve_image_name(self, wanted: str) -> str:
         for cand in _candidates_for_ref(wanted):
             try:
-                self.c.images.Get(images_pb2.GetImageRequest(name=cand), metadata=ns_md())
+                self.c.images.Get(images_pb2.GetImageRequest(name=cand))
                 return cand
             except grpc.RpcError as e:
                 if e.code() != grpc.StatusCode.NOT_FOUND:
@@ -328,8 +313,7 @@ class ImageResolver:
 
     def resolve_manifest(self, image_ref: str, extra_md=None) -> descriptor_pb2.Descriptor:
         resolved = self.resolve_image_name(image_ref)
-        img = self.c.images.Get(images_pb2.GetImageRequest(name=resolved), metadata=ns_md(extra_md)
-).image
+        img = self.c.images.Get(images_pb2.GetImageRequest(name=resolved)).image
         tgt = img.target
         if _is_index(tgt.media_type):
             idx = _read_blob_json(self.c.content, tgt.digest, extra_md)
@@ -401,7 +385,7 @@ class SnapshotManager:
                     snapshotter=self._snapshotter_value_cache, key=key, parent=parent_chain_id,
                     labels={"containerd.io/gc.root": "true"},
                 )
-                resp = self.c.snapshots.Prepare(req, metadata=ns_md(extra_md))
+                resp = self.c.snapshots.Prepare(req)
                 print(f"Using snapshotter '{self._snapshotter_value_cache}'")
                 return list(resp.mounts), key
             except grpc.RpcError:
@@ -413,7 +397,7 @@ class SnapshotManager:
                     snapshotter=snap_val, key=key, parent=parent_chain_id,
                     labels={"containerd.io/gc.root": "true"},
                 )
-                resp = self.c.snapshots.Prepare(req, metadata=ns_md(extra_md))
+                resp = self.c.snapshots.Prepare(req)
                 self._snapshotter_value_cache = snap_val
                 print(f"Discovered snapshotter '{snap_val}'")
                 return list(resp.mounts), key
@@ -425,8 +409,7 @@ class SnapshotManager:
     def _snap_stat_exists(self, snapshotter: str, key_or_name: str, extra_md=None) -> bool:
         try:
             self.c.snapshots.Stat(
-                snapshots_pb2.StatSnapshotRequest(snapshotter=snapshotter, key=key_or_name),
-                metadata=ns_md(extra_md)
+                snapshots_pb2.StatSnapshotRequest(snapshotter=snapshotter, key=key_or_name)
             )
             return True
         except grpc.RpcError as e:
@@ -438,8 +421,7 @@ class SnapshotManager:
     def _snap_remove_active(self, snapshotter: str, key: str, extra_md=None):
         try:
             self.c.snapshots.Remove(
-                snapshots_pb2.RemoveSnapshotRequest(snapshotter=snapshotter, key=key),
-                metadata=ns_md(extra_md)
+                snapshots_pb2.RemoveSnapshotRequest(snapshotter=snapshotter, key=key)
             )
         except grpc.RpcError:
             pass
@@ -466,8 +448,7 @@ class SnapshotManager:
                     key=prep_key,
                     parent=parent_chain or "",
                     labels={"containerd.io/gc.root": "true"},
-                ),
-                metadata=ns_md()
+                )
             )
             mounts = list(prep.mounts)
 
@@ -479,15 +460,14 @@ class SnapshotManager:
                 "annotations": { ANNOTATION_UNCOMPRESSED: diff_ids[i] }
             }, d)
 
-            self.c.diff.Apply(diff_pb2.ApplyRequest(diff=d, mounts=mounts), metadata=ns_md())
+            self.c.diff.Apply(diff_pb2.ApplyRequest(diff=d, mounts=mounts))
 
             try:
                 self.c.snapshots.Commit(
                     snapshots_pb2.CommitSnapshotRequest(
                         snapshotter=snapshotter, name=cur_chain, key=prep_key,
                         labels={"containerd.io/gc.root": "true"},
-                    ),
-                    metadata=ns_md()
+                    )
                 )
             except grpc.RpcError as e:
                 if e.code() == grpc.StatusCode.ALREADY_EXISTS:
@@ -504,14 +484,13 @@ class SnapshotManager:
     def _new_lease(self, id_hint: str = "unpack") -> leases_pb2.Lease:
         lid = f"{id_hint}-{uuid.uuid4().hex[:8]}"
         resp = self.c.leases.Create(
-            leases_pb2.CreateRequest(id=lid, labels={"containerd.io/gc.root": "true"}),
-            metadata=ns_md())
+            leases_pb2.CreateRequest(id=lid, labels={"containerd.io/gc.root": "true"}))
         return resp.lease
 
     @log_to_file(logger)
     def _delete_lease(self, lease_id: str):
         try:
-            self.c.leases.Delete(leases_pb2.DeleteRequest(id=lease_id), metadata=ns_md())
+            self.c.leases.Delete(leases_pb2.DeleteRequest(id=lease_id))
         except grpc.RpcError:
             pass
 
@@ -808,8 +787,7 @@ class RuntimeManager:
                     runtime=containers_pb2.Container.Runtime(name="io.containerd.runc.v2"),
                     snapshotter=self.snapshots._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs",
                 )
-            ),
-            metadata=ns_md()
+            )
         )
 
     @log_to_file(logger)
@@ -819,9 +797,9 @@ class RuntimeManager:
             terminal=tty,
             rootfs=mounts
         )
-        self.c.tasks.Create(create_req, metadata=ns_md(), timeout=create_timeout)
+        self.c.tasks.Create(create_req, timeout=create_timeout)
         resp = self.c.tasks.Start(tasks_pb2.StartRequest(container_id=cid),
-                                  metadata=ns_md(), timeout=start_timeout)
+                                   timeout=start_timeout)
         return resp.pid
 
     @log_to_file(logger)
@@ -833,27 +811,27 @@ class RuntimeManager:
         """
         # Kill
         try:
-            self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=kill_signal), metadata=ns_md(), timeout=timeouts[0])
+            self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=kill_signal),  timeout=timeouts[0])
         except grpc.RpcError as e:
             # If already stopped or not found, we'll continue
             pass
 
         # Try delete task
         try:
-            self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), metadata=ns_md(), timeout=timeouts[1])
+            self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), timeout=timeouts[1])
         except grpc.RpcError:
             # Try a harder kill then delete again
             try:
-                self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9), metadata=ns_md(), timeout=timeouts
+                self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9),  timeout=timeouts
 [0])
-                self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), metadata=ns_md(), timeout=timeouts[1
+                self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid),  timeout=timeouts[1
 ])
             except grpc.RpcError:
                 pass
 
         # Delete container object
         try:
-            self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=cid), metadata=ns_md())
+            self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=cid))
         except grpc.RpcError:
             pass
 
@@ -869,8 +847,7 @@ class RuntimeManager:
         # --- Containers API ---
         try:
             resp = self.c.containers.Get(
-                containers_pb2.GetContainerRequest(id=cid),
-                metadata=ns_md()
+                containers_pb2.GetContainerRequest(id=cid)
             )
             c = resp.container
             info.update({
@@ -893,8 +870,7 @@ class RuntimeManager:
         # Try State
         try:
             st = self.c.tasks.State(
-                tasks_pb2.StateRequest(container_id=cid),
-                metadata=ns_md()
+                tasks_pb2.StateRequest(container_id=cid)
             )
             # StateResponse usually has pid and status enum/string
             if hasattr(st, "pid"):
@@ -906,8 +882,7 @@ class RuntimeManager:
             # Fallback: Get
             try:
                 gt = self.c.tasks.Get(
-                    tasks_pb2.GetRequest(container_id=cid),
-                    metadata=ns_md()
+                    tasks_pb2.GetRequest(container_id=cid)
                 )
                 if hasattr(gt, "task") and getattr(gt.task, "pid", 0):
                     task_pid = gt.task.pid

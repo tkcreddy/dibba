@@ -95,25 +95,7 @@ def create_pod_task(
             cni_ifname=cni_dev,
         )
 
-        # app_defs = []
-        # for c in containers:
-        #     rs = c.get("resources", {})
-        #     lr = linux_resources_from_spec(
-        #         cpu_millicores=rs.get("cpu_millicores", 0),
-        #         memory=rs.get("memory", "64Mi"),
-        #         cpuset_cpus=rs.get("cpuset_cpus"),
-        #     )
-        #     app_defs.append({
-        #         "name": c["name"],
-        #         "image": c["image"],
-        #         "args": c.get("args", []),
-        #         "env": c.get("env") or {},
-        #         "mounts": c.get("mounts") or [],
-        #         "linux_resources": lr,             # <- give builder what it needs
-        #     })
 
-        #containers = [ContainerSpec(**c) for c in (containers or [])]
-        #host_name = kwargs.get("host_name")  # avoid .get on strings
         container_specs = _rehydrate_containers(containers)
         # Create the application container in the pod
         apps = pods.add_containers(pod, container_specs)
