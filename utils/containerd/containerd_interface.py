@@ -27,19 +27,23 @@ from google.protobuf import any_pb2
 from google.protobuf.json_format import ParseDict
 
 # ----- containerd native gRPC stubs -----
+from generated.runtime.v1 import api_pb2, api_pb2_grpc
 from generated.api.services.images.v1 import images_pb2, images_pb2_grpc
 from generated.api.services.content.v1 import content_pb2, content_pb2_grpc
 from generated.api.services.snapshots.v1 import snapshots_pb2, snapshots_pb2_grpc
 from generated.api.services.containers.v1 import containers_pb2, containers_pb2_grpc
 from generated.api.services.tasks.v1 import tasks_pb2, tasks_pb2_grpc
-from generated.api.types import descriptor_pb2
-from generated.runtime.v1 import api_pb2, api_pb2_grpc
-
-# diff + leases for gRPC-only unpack
 from generated.api.services.diff.v1 import diff_pb2, diff_pb2_grpc
 from generated.api.services.leases.v1 import leases_pb2, leases_pb2_grpc
+from generated.api.services.namespaces.v1 import namespace_pb2, namespace_pb2_grpc   # <-- add this
+from generated.api.types import descriptor_pb2
+
+
+# diff + leases for gRPC-only unpack
+
 from utils.containerd.grpc_ns import _AddNamespaceInterceptor
 from utils.containerd.models import ResourceSpec
+from google.protobuf import empty_pb2
 
 logger = LogKCld()
 
@@ -47,6 +51,109 @@ read_conf = rc()
 
 
 # ---- add this helper near your imports ----
+
+# Map common containerd status ints (defensive; strings are left as-is)
+_STATUS_MAP = {
+    0: "UNKNOWN",
+    1: "CREATED",
+    2: "RUNNING",
+    3: "STOPPED",
+    4: "PAUSED",
+}
+
+@log_to_file(logger)
+def _status_to_str(v):
+    if v is None:
+        return "UNKNOWN"
+    if isinstance(v, int):
+        return _STATUS_MAP.get(v, str(v))
+    return str(v)
+
+@log_to_file(logger)
+def _read_pidfile(namespace: str, cid: str) -> int | None:
+    """
+    Fallback to containerd v2 runtime pidfile:
+      /run/containerd/io.containerd.runtime.v2.task/<ns>/<cid>/init.pid
+    """
+    base = "/run/containerd/io.containerd.runtime.v2.task"
+    path = os.path.join(base, namespace, cid, "init.pid")
+    try:
+        with open(path, "r") as f:
+            s = f.read().strip()
+        return int(s) if s else None
+    except Exception:
+        return None
+
+@log_to_file(logger)
+def _task_from_get_response(resp):
+    """
+    Some generated stubs return GetResponse{ task: Task }
+    Others effectively return Task. Normalize here.
+    """
+    if hasattr(resp, "task"):
+        return resp.task
+    return resp  # assume already a Task-like message
+
+@log_to_file(logger)
+def _pick_list_req(tasks_pb2):
+    """
+    Try to locate the right List request class across versions.
+    Known names: ListRequest, TasksListRequest, ListTasksRequest.
+    """
+    for name in ("ListRequest", "TasksListRequest", "ListTasksRequest"):
+        Req = getattr(tasks_pb2, name, None)
+        if Req is not None:
+            return Req
+    return None
+
+@log_to_file(logger)
+def _iter_list_tasks(client, tasks_pb2):
+    """
+    Yield Task-like items from Tasks.List(), coping with response shape differences.
+    """
+    Req = _pick_list_req(tasks_pb2)
+    if Req is None:
+        return  # give up on List path
+
+    try:
+        resp = client.tasks.List(Req())
+    except grpc.RpcError:
+        return
+
+    # Try common response field names
+    for field in ("tasks", "items", "list", "results"):
+        maybe = getattr(resp, field, None)
+        if maybe:
+            for t in maybe:
+                yield t
+            return
+
+    # Some stubs put the sequence directly on the response
+    # (very rare, but this keeps it resilient)
+    try:
+        for t in resp:
+            yield t
+    except TypeError:
+        pass
+
+@log_to_file(logger)
+def _task_id(t):
+    # common field name is "id"
+    return getattr(t, "id", None) or getattr(t, "container_id", None)
+
+@log_to_file(logger)
+def _task_pid(t):
+    return getattr(t, "pid", None)
+
+@log_to_file(logger)
+def _task_status(t):
+    # Common names: status, state
+    raw = getattr(t, "status", None)
+    if raw is None:
+        raw = getattr(t, "state", None)
+    return _status_to_str(raw)
+
+
 @log_to_file(logger)
 def _normalize_unix_target(sock: str) -> str:
     """
@@ -290,6 +397,8 @@ class ContainerdClient:
         self.tasks = tasks_pb2_grpc.TasksStub(self._ich)
         self.diff = diff_pb2_grpc.DiffStub(self._ich)
         self.leases = leases_pb2_grpc.LeasesStub(self._ich)
+        self.namespaces = namespace_pb2_grpc.NamespacesStub(self._ich)
+
     def md(self, extra: tuple[tuple[str, str], ...] = ()) -> tuple[tuple[str, str], ...]:
         base = (("containerd-namespace", self.namespace),)
         return base + tuple(extra)
@@ -774,6 +883,249 @@ class RuntimeManager:
         except Exception:
             return {}
 
+
+    # --- inside RuntimeManager ---
+
+    @log_to_file(logger)
+    def _client_for_ns(self, namespace: str) -> "ContainerdClient":
+        # new helper to open a namespaced client
+        return ContainerdClient(socket=self.c.socket, namespace=namespace)
+
+    @log_to_file(logger)
+    def list_all_namespaces(self) -> list[str]:
+        """Best-effort: try well-known namespaces by probing a simple call."""
+        guesses = ["k8s.io", "default", "moby", "testKCR"]
+        found = []
+        seen = set()
+        for ns in guesses:
+            try:
+                _ = self._client_for_ns(ns).containers.List(containers_pb2.ListContainersRequest())
+                if ns not in seen:
+                    found.append(ns);
+                    seen.add(ns)
+            except grpc.RpcError:
+                pass
+        return found
+
+    @log_to_file(logger)
+    def _build_tasks_index(self, client) -> dict[str, dict]:
+        """
+        Return {cid: {"pid": int|None, "status": "..."}} for the client's namespace.
+        Uses Tasks.List when available; falls back to one-by-one Get and pidfile.
+        """
+        index: dict[str, dict] = {}
+
+        # ---- Fast path: List ----
+        try:
+            from generated.api.services.tasks.v1 import tasks_pb2
+            any_list = False
+            for t in _iter_list_tasks(client, tasks_pb2):
+                any_list = True
+                cid = _task_id(t)
+                pid = _task_pid(t)
+                stat = _task_status(t)
+                index[cid] = {"pid": pid, "status": stat}
+            if any_list:
+                return index
+        except Exception:
+            pass
+
+        # ---- Fallback: Walk container ids; try Get; fallback to pidfile ----
+        try:
+            from generated.api.services.containers.v1 import containers_pb2
+        except Exception:
+            containers_pb2 = None
+
+        cids = []
+        if containers_pb2 is not None:
+            try:
+                clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
+                cids = [c.id for c in clist]
+            except Exception:
+                cids = []
+
+        # If we can’t list containers, nothing else to do here
+        for cid in cids:
+            pid = None
+            stat = "UNKNOWN"
+            try:
+                # Try Get
+                from generated.api.services.tasks.v1 import tasks_pb2 as tpb
+                greq = getattr(tpb, "GetRequest")(container_id=cid)
+                gresp = client.tasks.Get(greq)
+                task = _task_from_get_response(gresp)
+                pid = _task_pid(task)
+                stat = _task_status(task)
+            except grpc.RpcError as e:
+                # Not found -> try pidfile
+                if e.code().name == "NOT_FOUND":
+                    pid = _read_pidfile(client.namespace, cid)
+                    stat = "RUNNING" if (pid and os.path.exists(f"/proc/{pid}")) else "NOTFOUND"
+                else:
+                    # Unknown error -> still try pidfile
+                    pid = _read_pidfile(client.namespace, cid)
+                    stat = "RUNNING" if (pid and os.path.exists(f"/proc/{pid}")) else "UNKNOWN"
+            except Exception:
+                pid = _read_pidfile(client.namespace, cid)
+                stat = "RUNNING" if (pid and os.path.exists(f"/proc/{pid}")) else "UNKNOWN"
+
+            index[cid] = {"pid": pid, "status": stat}
+
+        return index
+
+    def _task_snapshot(self, client, cid: str) -> dict:
+        """
+        Robust single-task view. Uses the tasks index first; then a quick Get; then pidfile.
+        """
+        idx = getattr(self, "_last_tasks_index", None)
+        if not isinstance(idx, dict) or getattr(self, "_last_index_ns", None) != client.namespace:
+            idx = self._build_tasks_index(client)
+            self._last_tasks_index = idx
+            self._last_index_ns = client.namespace
+
+        snap = idx.get(cid)
+        if snap:
+            # if RUNNING but /proc/<pid> disappeared, downgrade to UNKNOWN
+            pid = snap.get("pid")
+            if snap.get("status") == "RUNNING" and (not pid or not os.path.exists(f"/proc/{pid}")):
+                return {"pid": pid, "status": "UNKNOWN"}
+            return {"pid": snap.get("pid"), "status": snap.get("status")}
+
+        # Fallback: try Get just for this one
+        try:
+            from generated.api.services.tasks.v1 import tasks_pb2 as tpb
+            g = client.tasks.Get(tpb.GetRequest(container_id=cid))
+            task = _task_from_get_response(g)
+            return {"pid": _task_pid(task), "status": _task_status(task)}
+        except grpc.RpcError as e:
+            if e.code().name == "NOT_FOUND":
+                pid = _read_pidfile(client.namespace, cid)
+                return {"pid": pid, "status": "RUNNING" if (pid and os.path.exists(f"/proc/{pid}")) else "NOTFOUND"}
+            return {"pid": None, "status": "UNKNOWN"}
+        except Exception:
+            pid = _read_pidfile(client.namespace, cid)
+            return {"pid": pid, "status": "RUNNING" if (pid and os.path.exists(f"/proc/{pid}")) else "UNKNOWN"}
+
+    @log_to_file(logger)
+    def list_pods_in_namespace(self, namespace: str) -> list[dict]:
+        """
+        Return a list of pause/pod summaries in a namespace.
+        We mark pause with labels {"pod": <name>, "role": "pause"} during creation.
+        """
+        client = self._client_for_ns(namespace)
+        try:
+            clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
+        except grpc.RpcError as e:
+            raise RuntimeError(f"ListContainers failed in ns={namespace}: {e}")
+
+        pods = []
+        for c in clist:
+            labels = dict(getattr(c, "labels", {}))
+            if labels.get("role") == "pause" and "pod" in labels:
+                cid = c.id
+                pod_name = labels["pod"]
+                snap = self._task_snapshot(client, cid)
+                pods.append({
+                    "name": pod_name,
+                    "pause_cid": cid,
+                    "image": c.image,
+                    "task": snap,
+                })
+        return pods
+
+    @log_to_file(logger)
+    def _container_brief(self, client: ContainerdClient, c) -> dict:
+        """Small, robust summary for any container c in a namespace."""
+        cid = getattr(c, "id", "")
+        img = getattr(c, "image", "")
+        # labels is a map<string,string> in proto; make a plain dict defensively
+        labels = {}
+        try:
+            labels = dict(getattr(c, "labels", {}) or {})
+        except Exception:
+            pass
+
+        name = labels.get("app") or labels.get("name") or cid
+        snap = self._task_snapshot(client, cid)  # {'pid':..., 'status':...}
+
+        return {
+            "id": cid,
+            "name": name,
+            "image": img,
+            "labels": labels,
+            "pid": snap.get("pid"),
+            "status": snap.get("status"),
+        }
+
+    @log_to_file(logger)
+    def list_pods_and_apps_in_namespace(self, namespace: str) -> list[dict]:
+        """
+        Return a list of pod summaries in the given namespace.
+        - If containers are labeled with role=pause + pod=<name>, we group apps under that pod.
+        - If a container lacks those labels (standalone), we emit a 'pseudo-pod' with that single app.
+        """
+        client = self._client_for_ns(namespace)
+
+        # enumerate all containers in the namespace
+        try:
+            clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
+        except grpc.RpcError as e:
+            logger.error(f"[{namespace}] containers.List error: {e}")
+            return []
+
+        pods: dict[str, dict] = {}
+        standalone: list[dict] = []
+
+        for c in clist:
+            info = self._container_brief(client, c)
+            labels = info["labels"]
+            cid = info["id"]
+
+            pod_label = labels.get("pod")
+            role = labels.get("role", "")
+
+            if pod_label:
+                # ensure pod bucket exists
+                p = pods.setdefault(pod_label, {
+                    "pod_id": pod_label,
+                    "pause": {"pid": None, "status": "NOTFOUND"},
+                    "apps": [],
+                })
+                if role == "pause":
+                    # pause container represents the pod
+                    p["pause"] = {"pid": info["pid"], "status": info["status"]}
+                    # If you prefer the literal pause container id as pod_id, uncomment:
+                    # p["pod_id"] = cid
+                else:
+                    p["apps"].append({
+                        "id": cid,
+                        "name": info["name"],
+                        "image": info["image"],
+                        "pid": info["pid"],
+                        "status": info["status"],
+                    })
+            else:
+                # No pod label: treat as a standalone pseudo-pod so it shows up (e.g., calico-node)
+                standalone.append({
+                    "pod_id": cid,  # pseudo-pod uses its own id
+                    "pause": {"pid": None, "status": "STANDALONE"},
+                    "apps": [{
+                        "id": cid,
+                        "name": info["name"],
+                        "image": info["image"],
+                        "pid": info["pid"],
+                        "status": info["status"],
+                    }],
+                })
+
+        # Build final list: real pods first (stable order), then standalone
+        out: list[dict] = []
+        for pod_id in sorted(pods.keys()):
+            out.append(pods[pod_id])
+        out.extend(sorted(standalone, key=lambda x: x["pod_id"]))
+
+        return out
+
     @log_to_file(logger)
     def create_container(self, cid: str, image_ref: str, spec_any: any_pb2.Any,
                          labels: Optional[Dict[str, str]] = None):
@@ -834,6 +1186,63 @@ class RuntimeManager:
             self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=cid))
         except grpc.RpcError:
             pass
+
+    # @log_to_file(logger)
+    # def list_all_namespaces(self) -> list[str]:
+    #     """
+    #     Returns all containerd namespaces present on this node.
+    #     """
+    #     # Namespaces service ignores the namespace interceptor; use a bare channel.
+    #     # target = _normalize_unix_target(socket)
+    #     # ch = grpc.insecure_channel(target)
+    #     ns_stub = self.c.namespaces
+    #     #ns_stub = namespaces_pb2_grpc.NamespacesStub(ch)
+    #
+    #     resp = ns_stub.List(namespace_pb2.ListNamespacesRequest())
+    #     # Each item has: name (str), labels (map<string,string>)
+    #     return [ns.name for ns in resp.namespaces]
+    #
+    # @log_to_file(logger)
+    # def list_pods_in_namespace(self, namespace: str) -> List[Dict]:
+    #     """
+    #     List 'pod' pause containers in a given containerd namespace.
+    #     A pod is identified by label role=pause (as set in create_pod()).
+    #     """
+    #     results: List[Dict] = []
+    #     try:
+    #         client = self._client_for_ns(namespace)
+    #         resp = client.containers.List(containers_pb2.ListContainersRequest())
+    #         clist = getattr(resp, "containers", []) if resp else []
+    #
+    #         if not clist:
+    #             return results
+    #
+    #         for c in clist:
+    #             labels = dict(c.labels)
+    #             if labels.get("role") == "pause":
+    #                 results.append({
+    #                     "namespace": namespace,
+    #                     "pod": labels.get("pod", c.id),
+    #                     "container_id": c.id,
+    #                     "image": c.image,
+    #                 })
+    #     except grpc.RpcError as e:
+    #         logger.error(f"Error listing pods in namespace {namespace}: {e}")
+    #     except Exception as e:
+    #         logger.error(f"Unexpected error listing pods in namespace {namespace}: {e}")
+    #     return results
+    #
+    # @log_to_file(logger)
+    # def list_tasks_in_namespace(self, namespace: str) -> List[Dict]:
+    #     results: List[Dict] = []
+    #     try:
+    #         client = self._client_for_ns(namespace)
+    #         tlist = client.tasks.List(tasks_pb2.ListTasksRequest()).tasks
+    #         for t in tlist:
+    #             results.append({"container_id": t.id, "pid": t.pid})
+    #     except grpc.RpcError as e:
+    #         logger.error(f"Error listing tasks in namespace {namespace}: {e}")
+    #     return results
 
     @log_to_file(logger)
     def get_container_info(self, cid: str) -> Dict:
@@ -1218,69 +1627,92 @@ class PodManager:
 #         "nginx": app
 #     }, indent=2))
 
+# if __name__ == "__main__":
+#     client = ContainerdClient()
+#     pods = PodManager(client)
+#
+#     # 1) Create the pod (pause sandbox + CNI)
+#     pause_resources = ResourceSpec(cpu_millicores=100, memory="64Mi")
+#     pod = pods.create_pod(
+#         "demo-pod",
+#         pause_image="registry.k8s.io/pause:3.9",
+#         resources=pause_resources,
+#         cni_network=os.environ.get("CNI_NET_NAME", DEFAULT_CNI_NET_NAME),
+#         cni_ifname=os.environ.get("CNI_IFNAME", DEFAULT_IFNAME),
+#     )
+#
+#     # 2) Define containers: one main app + two sidecars
+#     main_resources = ResourceSpec(cpu_millicores=500, memory="256Mi", cpuset_cpus="0-1")
+#     sidecar_small = ResourceSpec(cpu_millicores=100, memory="64Mi")
+#
+#     containers: List[ContainerSpec] = [
+#         # Main app (nginx) — listening on 8080 rather than 80
+#         ContainerSpec(
+#             name="nginx",
+#             image="docker.io/library/nginx:latest",
+#             args=[
+#                 "/bin/sh", "-c",
+#                 (
+#                     "rm -f /etc/nginx/conf.d/default.conf && "
+#                     "printf 'server { listen 8080; location / { root /usr/share/nginx/html; index index.html; } }' "
+#                     "> /etc/nginx/conf.d/custom.conf && "
+#                     "exec nginx -g \"daemon off;\""
+#                 )
+#             ],
+#             resources=main_resources
+#         ),
+#
+#         # Sidecar: simple log tailer (follows nginx access logs)
+#         ContainerSpec(
+#             name="log-tailer",
+#             image="docker.io/library/busybox:latest",
+#             args=["/bin/sh", "-c", "mkdir -p /var/log/nginx; touch /var/log/nginx/access.log; tail -F /var/log/nginx/access.log"],
+#             resources=sidecar_small,
+#             # If you want to share the log path from nginx rootfs you’d need a shared volume/mount;
+#             # for a pure demo we just tail an empty file.
+#         ),
+#
+#         # Sidecar: tiny “metrics” loop
+#         ContainerSpec(
+#             name="metrics",
+#             image="docker.io/library/alpine:latest",
+#             args=["/bin/sh", "-c", "while true; do echo metrics_ok $(date +%s); sleep 5; done"],
+#             env={"METRICS_PORT": "9090"},
+#             resources=sidecar_small
+#         ),
+#     ]
+#
+#     # 3) Launch them
+#     apps = pods.add_containers(pod, containers)
+#
+#     print("\nSummary:")
+#     print(json.dumps({
+#         "pause": pod["pause"],
+#         "apps": apps
+#     }, indent=2))
+#
+#     # Example: cleanup all (uncomment if you want auto-clean)
+#     # pods.delete_pod(pod, apps=list(apps.values()))
+
 if __name__ == "__main__":
     client = ContainerdClient()
-    pods = PodManager(client)
+    pod_mgr = PodManager(client)
 
-    # 1) Create the pod (pause sandbox + CNI)
-    pause_resources = ResourceSpec(cpu_millicores=100, memory="64Mi")
-    pod = pods.create_pod(
-        "demo-pod",
-        pause_image="registry.k8s.io/pause:3.9",
-        resources=pause_resources,
-        cni_network=os.environ.get("CNI_NET_NAME", DEFAULT_CNI_NET_NAME),
-        cni_ifname=os.environ.get("CNI_IFNAME", DEFAULT_IFNAME),
-    )
+    namespaces = pod_mgr.runtime.list_all_namespaces()
+    print("Namespaces:", namespaces)
 
-    # 2) Define containers: one main app + two sidecars
-    main_resources = ResourceSpec(cpu_millicores=500, memory="256Mi", cpuset_cpus="0-1")
-    sidecar_small = ResourceSpec(cpu_millicores=100, memory="64Mi")
+    for ns in namespaces:
+        summaries = pod_mgr.runtime.list_pods_and_apps_in_namespace(ns)
+        if not summaries:
+            print(f"\n== No pods in '{ns}' ==")
+            continue
 
-    containers: List[ContainerSpec] = [
-        # Main app (nginx) — listening on 8080 rather than 80
-        ContainerSpec(
-            name="nginx",
-            image="docker.io/library/nginx:latest",
-            args=[
-                "/bin/sh", "-c",
-                (
-                    "rm -f /etc/nginx/conf.d/default.conf && "
-                    "printf 'server { listen 8080; location / { root /usr/share/nginx/html; index index.html; } }' "
-                    "> /etc/nginx/conf.d/custom.conf && "
-                    "exec nginx -g \"daemon off;\""
-                )
-            ],
-            resources=main_resources
-        ),
-
-        # Sidecar: simple log tailer (follows nginx access logs)
-        ContainerSpec(
-            name="log-tailer",
-            image="docker.io/library/busybox:latest",
-            args=["/bin/sh", "-c", "mkdir -p /var/log/nginx; touch /var/log/nginx/access.log; tail -F /var/log/nginx/access.log"],
-            resources=sidecar_small,
-            # If you want to share the log path from nginx rootfs you’d need a shared volume/mount;
-            # for a pure demo we just tail an empty file.
-        ),
-
-        # Sidecar: tiny “metrics” loop
-        ContainerSpec(
-            name="metrics",
-            image="docker.io/library/alpine:latest",
-            args=["/bin/sh", "-c", "while true; do echo metrics_ok $(date +%s); sleep 5; done"],
-            env={"METRICS_PORT": "9090"},
-            resources=sidecar_small
-        ),
-    ]
-
-    # 3) Launch them
-    apps = pods.add_containers(pod, containers)
-
-    print("\nSummary:")
-    print(json.dumps({
-        "pause": pod["pause"],
-        "apps": apps
-    }, indent=2))
-
-    # Example: cleanup all (uncomment if you want auto-clean)
-    # pods.delete_pod(pod, apps=list(apps.values()))
+        print(f"\n== Pods in '{ns}' ==")
+        for s in summaries:
+            print(f"- pod: {s['pod_id']}")
+            print(f"  pause: pid={s['pause']['pid']} status={s['pause']['status']}")
+            if not s["apps"]:
+                print("  (no app containers)")
+            else:
+                for a in s["apps"]:
+                    print(f"  app: {a['name']: <16} id={a['id']}  pid={a['pid']}  status={a['status']}")
