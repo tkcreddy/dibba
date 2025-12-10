@@ -6,14 +6,18 @@ from utils.ReadConfig import ReadConfig as rc
 import uuid
 import json
 import subprocess
-
-#from utils.containerd.models import ResourceSpec
-
 from utils.containerd.schemas import ContainerSpec, ResourceSpec
 from utils.containerd.adapters import linux_resources_from_spec
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.singleton import Singleton
 import os
+
+logger = LogKCld()
+
+
+#from utils.containerd.models import ResourceSpec
+
+
 
 # Defaults (can be overridden by task args or env)
 DEFAULT_CONTAINERD_SOCKET = os.environ.get("CONTAINERD_SOCKET", "unix:///run/containerd/containerd.sock")
@@ -109,6 +113,21 @@ def _ipv4_from_netns(pid: int, ifname: str = "eth0") -> Optional[str]:
         pass
     return None
 
+@log_to_file(logger)
+def _safe_json(obj):
+    """Make sure the result is JSON-serializable (convert tuples/sets/bytes)."""
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, dict):
+        return {str(k): _safe_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_safe_json(v) for v in obj]
+    # Fallback to string
+    return str(obj)
 
 @celery_app.task
 @log_to_file(logger)
@@ -157,3 +176,64 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwa
     except Exception as err:
         return {"error": str(err), "namespace": ns, "socket": sock}
 
+@celery_app.task
+@log_to_file(logger)
+def list_namespaces_and_pods_task(
+    containerd_socket: Optional[str] = None,
+    bootstrap_namespace: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Enumerate all containerd namespaces and summarize their pods/containers.
+    Uses your RuntimeManager.list_all_namespaces() and list_pods_and_apps_in_namespace().
+
+    Returns:
+    {
+      "namespaces": ["k8s.io", "default", ...],
+      "inventory": {
+        "k8s.io": [
+          {
+            "pod_id": "efba31-demo-pod",
+            "pause": {"pid": 12345, "status": "RUNNING"},
+            "apps": [
+              {"id":"...-nginx", "name":"nginx", "image":"docker.io/library/nginx:latest", "pid": 23456, "status":"RUNNING"},
+              ...
+            ]
+          },
+          # Standalone containers (e.g., calico-node) appear as pseudo-pods:
+          {
+            "pod_id": "calico-node",
+            "pause": {"pid": null, "status": "STANDALONE"},
+            "apps": [{"id":"calico-node", "name":"calico-node", "image":"...", "pid": 1298, "status":"RUNNING"}]
+          }
+        ],
+        "default": [],
+        ...
+      }
+    }
+    """
+    sock = containerd_socket or DEFAULT_CONTAINERD_SOCKET
+    ns   = bootstrap_namespace or DEFAULT_NAMESPACE
+
+    try:
+        client = ContainerdClient(socket=sock)
+        pod_mgr = PodManager(client)
+
+        # discover namespaces via RuntimeManager helper
+        namespaces: List[str] = pod_mgr.runtime.list_all_namespaces()
+
+        inventory: Dict[str, Any] = {}
+        for n in namespaces:
+            try:
+                summaries = pod_mgr.runtime.list_pods_and_apps_in_namespace(n)
+                inventory[n] = _safe_json(summaries)
+            except Exception as e:
+                # keep going; record the error for that namespace
+                inventory[n] = {"error": str(e)}
+
+        return _safe_json({
+            "namespaces": namespaces,
+            "inventory": inventory
+        })
+
+    except Exception as err:
+        return {"error": str(err), "socket": sock}
