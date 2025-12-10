@@ -1426,7 +1426,7 @@ class PodManager:
         ns_base = f"/proc/{pid}/ns"
         ns_paths = {k: f"{ns_base}/{k}" for k in ["pid", "net", "ipc", "uts"]}
         print(f"✅ Pause pod up: cid={cid}, pid={pid}")
-
+        cni_result = {}
         # Attach Calico via CNI (prefers cnitool, falls back to direct first-plugin exec)
         try:
             cni_result = self.cni.add(network_name=cni_network, container_id=cid,
@@ -1437,7 +1437,7 @@ class PodManager:
 
         return {"name": name, "pause": {"cid": cid, "pid": pid}, "ns": ns_paths,
                 "cni": {"network": cni_network, "ifname": cni_ifname},
-                "snapshot_key": snap_key}
+                "snapshot_key": snap_key, "cni_result": cni_result }
 
     @log_to_file(logger)
     def add_container(self, pod: Dict, name: str,
