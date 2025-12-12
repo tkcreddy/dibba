@@ -142,47 +142,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 
 
 @log_to_file(logger)
-@app.post("/create-pods")
-@app.post("/create-pods/")
-async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current_user)):
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    logger.info(f"Inside create_pods")
-
-
-    #containers_payload = [c.model_dump(mode="json") for c in request.containers]
-    containers_payload = [c.model_dump() for c in request.containers]
-
-
-    extra_kwargs = {
-        k: v for k, v in request.model_dump().items()
-        if k not in CreatePodsRequest.__annotations__.keys()
-    } or {"host_name": request.host_name}
-    #containers_payload  =  containers_payload.to_dict()
-    namespace = request.namespace
-
-    try:
-        task = create_pod_task.apply_async(
-            args=(containers_payload, namespace),
-            kwargs={
-            "host_name": request.host_name,
-            # any extra kwargs you want to flow to the task (must be JSON-safe)
-            # "cni_network": "calico",
-            # "cni_ifname": "eth0",
-        },
-            **host_queue_info
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting get_usage task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
-
-
-@log_to_file(logger)
 @app.post("/create-instances/")
 async def create_instances(request: CreateInstanceRequest, user: str = Depends(get_current_user)):
     """
@@ -346,6 +305,48 @@ async def get_worker_usage_data(request: HostName, user: str = Depends(get_curre
     except Exception as e:
         logger.error(f"Error submitting get_usage task: {e}")
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+@log_to_file(logger)
+@app.post("/create-pods")
+@app.post("/create-pods/")
+async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current_user)):
+    host_queue_info = {
+        'exchange': Exchange('secure_exchange', type='direct'),
+        'queue': ue.encode_hostname_with_key(request.host_name),
+        'routing_key': ue.encode_hostname_with_key(request.host_name),
+        'delivery_mode': 2
+    }
+    logger.info(f"Inside create_pods")
+
+
+    #containers_payload = [c.model_dump(mode="json") for c in request.containers]
+    containers_payload = [c.model_dump() for c in request.containers]
+
+
+    extra_kwargs = {
+        k: v for k, v in request.model_dump().items()
+        if k not in CreatePodsRequest.__annotations__.keys()
+    } or {"host_name": request.host_name}
+    #containers_payload  =  containers_payload.to_dict()
+    namespace = request.namespace
+
+    try:
+        task = create_pod_task.apply_async(
+            args=(containers_payload, namespace),
+            kwargs={
+            "host_name": request.host_name,
+            # any extra kwargs you want to flow to the task (must be JSON-safe)
+            # "cni_network": "calico",
+            # "cni_ifname": "eth0",
+        },
+            **host_queue_info
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting get_usage task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
 
 
 @log_to_file(logger)

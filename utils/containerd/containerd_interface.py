@@ -18,7 +18,8 @@ import subprocess
 import time
 from shutil import which
 from dataclasses import dataclass,field
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple,Any
+import signal
 from utils.ReadConfig import ReadConfig as rc
 from logpkg.log_kcld import LogKCld, log_to_file
 from typing import Union
@@ -37,6 +38,9 @@ from generated.api.services.diff.v1 import diff_pb2, diff_pb2_grpc
 from generated.api.services.leases.v1 import leases_pb2, leases_pb2_grpc
 from generated.api.services.namespaces.v1 import namespace_pb2, namespace_pb2_grpc   # <-- add this
 from generated.api.types import descriptor_pb2
+from generated.api.types import mount_pb2
+
+from generated.api.services.tasks.v1 import tasks_pb2 as tpb
 
 
 # diff + leases for gRPC-only unpack
@@ -377,17 +381,14 @@ class _CRIImageClient:
 # ========== Client ==========
 class ContainerdClient:
     @log_to_file(logger)
-    def __init__(self,
-                 socket: str = CONTAINERD_SOCKET,
-                 namespace: str = None):
-        self.socket = socket
-        self.namespace = namespace
-        if socket.startswith("unix://"):
-            ch = grpc.insecure_channel(socket)
-        else:
-            ch = grpc.insecure_channel(socket)  # adjust if you truly have TLS
+    def __init__(self,socket: str = CONTAINERD_SOCKET,
+                 namespace: Optional[str] = None):
 
-        self._ich = grpc.intercept_channel(ch, _AddNamespaceInterceptor(namespace))
+        target = _normalize_unix_target(socket)
+        self.socket = target
+        self.namespace = namespace or NAMESPACE
+        ch = grpc.insecure_channel(target)
+        self._ich = grpc.intercept_channel(ch, _AddNamespaceInterceptor(self.namespace))
 
         #self.channel = grpc.insecure_channel(socket)
         self.images = images_pb2_grpc.ImagesStub(self._ich)
@@ -484,8 +485,7 @@ class SnapshotManager:
         return raw + full
 
     @log_to_file(logger)
-    def prepare_rw_snapshot(self, parent_chain_id: str, key_hint: str, extra_md=None) -> Tuple[List
-, str]:
+    def prepare_rw_snapshot(self, parent_chain_id: str, key_hint: str, extra_md=None) -> Tuple[List[Any], str]:
         key = f"{key_hint}-{uuid.uuid4().hex[:8]}"
 
         if self._snapshotter_value_cache:
@@ -615,15 +615,16 @@ class OciSpecBuilder:
               process_args: List[str],
               env: Optional[Dict[str, str]] = None,
               namespaces: Optional[List[Dict]] = None,
-              resources: Union[dict, "ResourceSpec"]= None,
+              resources: Optional[Union[dict, "ResourceSpec"]] = None,
               cwd: str = "/",
               root_readonly: bool = False) -> any_pb2.Any:
+
         if hasattr(resources, "to_linux_resources_dict"):
-            linux_res = resources.to_linux_resources_dict()           # ResourceSpec -> dict
+            linux_res = resources.to_linux_resources_dict()  # ResourceSpec -> dict
         elif isinstance(resources, dict):
             linux_res = resources
         else:
-            raise TypeError("resources must be ResourceSpec or dict")
+            linux_res = {}
 
         default_env = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -675,10 +676,8 @@ class OciSpecBuilder:
                     entry["path"] = ns["path"]
                 spec["linux"]["namespaces"].append(entry)
 
-        if resources:
-            res = resources.to_linux_resources_dict()
-            if res:
-                spec["linux"]["resources"].update(res)
+        if linux_res:
+            spec["linux"]["resources"].update(linux_res)
 
         a = any_pb2.Any()
         a.type_url = OCI_SPEC_TYPEURL
@@ -890,6 +889,31 @@ class RuntimeManager:
     def _client_for_ns(self, namespace: str) -> "ContainerdClient":
         # new helper to open a namespaced client
         return ContainerdClient(socket=self.c.socket, namespace=namespace)
+
+    @log_to_file(logger)
+    def _list_active_snapshot_keys(self, snapshotter: str) -> list[str]:
+        """
+        Best-effort enumerate active snapshot keys for a snapshotter.
+        Different stubs name this call slightly differently; we try common ones.
+        """
+        keys: list[str] = []
+        try:
+            # Preferred: List (returns .entries or .snapshots depending on stub)
+            req = snapshots_pb2.ListSnapshotsRequest(snapshotter=snapshotter)
+            resp = self.c.snapshots.List(req)
+            for field in ("entries", "snapshots", "items", "list", "results"):
+                seq = getattr(resp, field, None)
+                if seq:
+                    for it in seq:
+                        k = getattr(it, "key", "") or getattr(it, "name", "")
+                        if k:
+                            keys.append(k)
+                    return keys
+        except Exception:
+            pass
+
+        # Fallback: nothing available
+        return keys
 
     @log_to_file(logger)
     def list_all_namespaces(self) -> list[str]:
@@ -1164,6 +1188,7 @@ class RuntimeManager:
         # Kill
         try:
             self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=kill_signal),  timeout=timeouts[0])
+            time.sleep(0.15)
         except grpc.RpcError as e:
             # If already stopped or not found, we'll continue
             pass
@@ -1171,15 +1196,16 @@ class RuntimeManager:
         # Try delete task
         try:
             self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), timeout=timeouts[1])
-        except grpc.RpcError:
-            # Try a harder kill then delete again
-            try:
-                self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9),  timeout=timeouts
-[0])
-                self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid),  timeout=timeouts[1
-])
-            except grpc.RpcError:
-                pass
+        except grpc.RpcError as e:
+            if e.code().name not in ("NOT_FOUND",):
+                # Try a harder kill then delete again
+                try:
+                    self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9),  timeout=timeouts
+    [0])
+                    self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid),  timeout=timeouts[1
+    ])
+                except grpc.RpcError:
+                    pass
 
         # Delete container object
         try:
@@ -1187,62 +1213,127 @@ class RuntimeManager:
         except grpc.RpcError:
             pass
 
-    # @log_to_file(logger)
-    # def list_all_namespaces(self) -> list[str]:
-    #     """
-    #     Returns all containerd namespaces present on this node.
-    #     """
-    #     # Namespaces service ignores the namespace interceptor; use a bare channel.
-    #     # target = _normalize_unix_target(socket)
-    #     # ch = grpc.insecure_channel(target)
-    #     ns_stub = self.c.namespaces
-    #     #ns_stub = namespaces_pb2_grpc.NamespacesStub(ch)
-    #
-    #     resp = ns_stub.List(namespace_pb2.ListNamespacesRequest())
-    #     # Each item has: name (str), labels (map<string,string>)
-    #     return [ns.name for ns in resp.namespaces]
-    #
-    # @log_to_file(logger)
-    # def list_pods_in_namespace(self, namespace: str) -> List[Dict]:
-    #     """
-    #     List 'pod' pause containers in a given containerd namespace.
-    #     A pod is identified by label role=pause (as set in create_pod()).
-    #     """
-    #     results: List[Dict] = []
-    #     try:
-    #         client = self._client_for_ns(namespace)
-    #         resp = client.containers.List(containers_pb2.ListContainersRequest())
-    #         clist = getattr(resp, "containers", []) if resp else []
-    #
-    #         if not clist:
-    #             return results
-    #
-    #         for c in clist:
-    #             labels = dict(c.labels)
-    #             if labels.get("role") == "pause":
-    #                 results.append({
-    #                     "namespace": namespace,
-    #                     "pod": labels.get("pod", c.id),
-    #                     "container_id": c.id,
-    #                     "image": c.image,
-    #                 })
-    #     except grpc.RpcError as e:
-    #         logger.error(f"Error listing pods in namespace {namespace}: {e}")
-    #     except Exception as e:
-    #         logger.error(f"Unexpected error listing pods in namespace {namespace}: {e}")
-    #     return results
-    #
-    # @log_to_file(logger)
-    # def list_tasks_in_namespace(self, namespace: str) -> List[Dict]:
-    #     results: List[Dict] = []
-    #     try:
-    #         client = self._client_for_ns(namespace)
-    #         tlist = client.tasks.List(tasks_pb2.ListTasksRequest()).tasks
-    #         for t in tlist:
-    #             results.append({"container_id": t.id, "pid": t.pid})
-    #     except grpc.RpcError as e:
-    #         logger.error(f"Error listing tasks in namespace {namespace}: {e}")
-    #     return results
+    @log_to_file(logger)
+    def delete_task_only(self, cid: str, timeouts: tuple[float, float] = (3.0, 10.0)) -> None:
+        """
+        Delete a task even if its container object no longer exists.
+        Try the common DeleteTaskRequest; fall back to DeleteRequest if needed.
+        """
+        try:
+            # Prefer DeleteTaskRequest if present
+            from generated.api.services.tasks.v1 import tasks_pb2 as tpb
+            req_cls = getattr(tpb, "DeleteTaskRequest", None) or getattr(tpb, "DeleteRequest")
+            if req_cls is None:
+                return
+            self.c.tasks.Delete(req_cls(container_id=cid), timeout=timeouts[1])
+        except grpc.RpcError:
+            # If it fails, try a last-chance Kill then Delete again
+            try:
+                from generated.api.services.tasks.v1 import tasks_pb2 as tpb
+                self.c.tasks.Kill(tpb.KillRequest(container_id=cid, signal=9), timeout=timeouts[0])
+                req_cls = getattr(tpb, "DeleteTaskRequest", None) or getattr(tpb, "DeleteRequest")
+                self.c.tasks.Delete(req_cls(container_id=cid), timeout=timeouts[1])
+            except grpc.RpcError:
+                pass
+
+    def prune_orphan_tasks(self, namespace: str, aggressive: bool = False) -> dict:
+        """
+        Remove tasks that have no container or are STOPPED.
+        aggressive=True also force-cleans shim dirs if Delete doesn't clear them.
+        """
+        client = self._client_for_ns(namespace)
+        tstub = client.tasks
+        cstub = client.containers
+
+        removed, kept = [], []
+
+        # list tasks (streaming or simple list depending on your _iter_list_tasks helper)
+        from generated.api.services.tasks.v1 import tasks_pb2 as _tpb
+        for t in _iter_list_tasks(client, _tpb):
+            tid = _task_id(t)
+            # 1) Is there a container?
+            container_exists = True
+            try:
+                cstub.Get(containers_pb2.GetContainerRequest(id=tid))
+            except grpc.RpcError as e:
+                if e.code().name in ("NOT_FOUND", "INVALID_ARGUMENT"):
+                    container_exists = False
+                else:
+                    # Unknown error: keep it for safety.
+                    kept.append({"id": tid, "reason": f"containers.Get error: {e.code().name}"})
+                    continue
+
+            # 2) Decide if we should remove the task
+            #should_remove = (not container_exists) or (t.status == tasks_pb2.STOPPED)
+            status_val = getattr(t, "status", None)
+            is_stopped = (status_val == getattr(_tpb, "STOPPED", None)) or (
+                        str(status_val).upper() == "STOPPED")
+            should_remove = (not container_exists) or is_stopped
+
+
+            if not should_remove:
+                kept.append({"id": tid, "reason": "running and has container"})
+                continue
+
+            # 3) Best-effort kill -> wait -> delete
+            try:
+                try:
+                    tstub.Kill(_tpb.KillRequest(container_id=tid, signal=signal.SIGKILL))
+                    #tstub.Kill(tasks_pb2.KillRequest(container_id=tid, signal=signal.SIGKILL))
+                except grpc.RpcError as e:
+                    print(f"Kill failed: {e}")
+                    pass  # It may already be stopped
+
+                # Short wait so exit is recorded
+                try:
+                    #tstub.Wait(tasks_pb2.WaitRequest(container_id=tid), timeout=1)
+                    tstub.Wait(_tpb.WaitRequest(container_id=tid), timeout=1)
+                except Exception:
+                    pass
+
+                # Delete the task (this should remove the shim)
+                #tstub.Delete(tasks_pb2.DeleteTaskRequest(container_id=tid))
+                del_req = getattr(_tpb, "DeleteTaskRequest", None)
+                if del_req is None:
+                    del_req = getattr(_tpb, "DeleteRequest")  # older stubs
+                tstub.Delete(del_req(container_id=tid))
+                removed.append({"id": tid, "action": "Tasks.Delete"})
+            except grpc.RpcError as e:
+                # Last resort: shim dir cleanup if requested
+                if aggressive:
+                    shim = f"/run/containerd/io.containerd.runtime.v2.task/{namespace}/{tid}"
+                    try:
+                        # only remove empty or obviously stale dirs; be cautious
+                        if os.path.isdir(shim):
+                            for root, dirs, files in os.walk(shim, topdown=False):
+                                for name in files:
+                                    try:
+                                        os.remove(os.path.join(root, name))
+                                    except Exception:
+                                        pass
+                                for name in dirs:
+                                    try:
+                                        os.rmdir(os.path.join(root, name))
+                                    except Exception:
+                                        pass
+                            os.rmdir(shim)
+                        removed.append({"id": tid, "action": f"shim_dir_rm ({shim})"})
+                    except Exception as ee:
+                        kept.append({"id": tid, "reason": f"Delete failed: {e.code().name}, shim rm err: {ee}"})
+                else:
+                    kept.append({"id": tid, "reason": f"Delete failed: {e.code().name}"})
+
+        return {"removed": removed, "kept": kept}
+
+    def prune_namespace(self, namespace: str) -> dict:
+        """
+        Convenience: remove STOPPED/orphan tasks, then you can also call your snapshot cleanup.
+        """
+        res = self.prune_orphan_tasks(namespace, aggressive=True)
+        # optionally call your existing _snap_remove_active(...) patterns after:
+        # self.snapshot_mgr._snap_remove_active(self._snapshotter_name(), "<prefix>")
+        return res
+
 
     @log_to_file(logger)
     def get_container_info(self, cid: str) -> Dict:
@@ -1588,6 +1679,332 @@ class PodManager:
             except Exception as e:
                 print(f"[cleanup] pause snapshot remove warning ({snap_key}): {e}")
 
+    def _build_runtime_pod_struct(self, namespace: str, pod_name: str,
+                                  cni_network: str = DEFAULT_CNI_NET_NAME,
+                                  ifname: str = DEFAULT_IFNAME) -> tuple[Optional[Dict], List[Dict]]:
+        """
+        Inspect the namespace to reconstruct a minimal 'pod' dict (as expected by PodManager.delete_pod)
+        and the list of app dicts for that pod.
+
+        Returns: (pod_dict | None, apps_list)
+        """
+        # namespaced client for queries
+        client = self.runtime._client_for_ns(namespace)
+
+        try:
+            clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
+        except Exception as e:
+            print(f"[{namespace}] containers.List error: {e}")
+            return None, []
+
+        pause_cid = None
+        pause_pid = None
+
+        apps: List[Dict] = []
+        # First pass: find pause container for this pod
+        for c in clist:
+            labels = dict(getattr(c, "labels", {}) or {})
+            if labels.get("pod") == pod_name and labels.get("role") == "pause":
+                pause_cid = c.id
+                snap = self.runtime._task_snapshot(client, pause_cid)
+                pause_pid = snap.get("pid")
+                break
+
+        if not pause_cid:
+            # Pod not present (or never labeled as pause)
+            return None, []
+
+        # Build ns paths if we have a live pid
+        ns_paths = {}
+        if pause_pid and os.path.exists(f"/proc/{pause_pid}"):
+            ns_base = f"/proc/{pause_pid}/ns"
+            ns_paths = {
+                "pid": f"{ns_base}/pid",
+                "net": f"{ns_base}/net",
+                "ipc": f"{ns_base}/ipc",
+                "uts": f"{ns_base}/uts",
+            }
+        else:
+            # delete_pod() will gracefully handle missing netns by using "" for DEL
+            ns_paths = {"pid": "", "net": "", "ipc": "", "uts": ""}
+
+        pod = {
+            "name": pod_name,
+            "pause": {"cid": pause_cid, "pid": pause_pid},
+            "ns": ns_paths,
+            "cni": {"network": cni_network, "ifname": ifname},
+            # snapshot_key is optional; if unknown we omit and cleanup will skip removing it
+        }
+
+        # Second pass: collect app containers for this pod
+        for c in clist:
+            labels = dict(getattr(c, "labels", {}) or {})
+            if labels.get("pod") == pod_name and labels.get("role") != "pause":
+                apps.append({
+                    "cid": c.id,
+                    # pid/snapshot_key optional; delete_container() handles missing keys safely
+                })
+
+        return pod, apps
+
+    @log_to_file(logger)
+    def _tasks_with_prefix(self, namespace: str, prefix: str) -> list[str]:
+        """
+        Return task IDs starting with <prefix> (e.g., pauseCID-).
+        Works even if container objects are gone.
+        """
+        client = self.runtime._client_for_ns(namespace)
+        ids = []
+        try:
+            from generated.api.services.tasks.v1 import tasks_pb2
+            for t in _iter_list_tasks(client, tasks_pb2):
+                tid = _task_id(t)
+                if isinstance(tid, str) and tid.startswith(prefix):
+                    ids.append(tid)
+        except Exception:
+            pass
+        return ids
+
+    @log_to_file(logger)
+    def _guess_apps_by_prefix(self, namespace: str, pause_cid: str) -> list[str]:
+        """
+        First try by container labels; if none found, fall back to task prefix scan.
+        """
+        client = self.runtime._client_for_ns(namespace)
+        app_ids = []
+        try:
+            clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
+            for c in clist:
+                labels = dict(getattr(c, "labels", {}) or {})
+                if labels.get("pod") == pause_cid or (labels.get("pod") and pause_cid in labels.get("pod", "")):
+                    # your previous heuristic; keep if you need it
+                    pass
+                # common pattern: <pauseCID>-<appname>
+                if getattr(c, "id", "").startswith(pause_cid + "-"):
+                    app_ids.append(c.id)
+        except Exception:
+            pass
+
+        if not app_ids:
+            app_ids = self._tasks_with_prefix(namespace, pause_cid + "-")
+        return app_ids
+
+
+    @log_to_file(logger)
+    def _cni_del_best_effort(self, pause_cid: str, pause_pid: int | None,
+                             network_name: str, ifname: str):
+        netns_path = f"/proc/{pause_pid}/ns/net" if pause_pid and os.path.exists(f"/proc/{pause_pid}/ns/net") else ""
+        try:
+            print(
+                f"[cleanup] CNI DEL network={network_name} ifname={ifname} netns={'present' if netns_path else 'missing'}")
+            self.cni.delete(network_name=network_name, container_id=pause_cid,
+                            netns_path=netns_path, ifname=ifname)
+        except Exception as e:
+            print(f"[cleanup] CNI DEL warning: {e}")
+
+    @log_to_file(logger)
+    def _remove_active_snapshots_matching(self, namespace: str, candidates: list[str]):
+        """
+        Try to remove any active snapshot keys that look like they belong to these containers.
+        We remove any key that starts with one of the candidate prefixes.
+        """
+        snap = self._snapshotter_name()
+        # enumerate keys if possible
+        keys = self.runtime._list_active_snapshot_keys(snap)
+        if not keys:
+            # Blind attempts using common patterns
+            for cid in candidates:
+                for prefix in (f"{cid}-", f"{cid}"):
+                    try:
+                        self.snaps._snap_remove_active(snap, prefix)  # if exact match
+                    except Exception:
+                        pass
+            return
+
+        for key in keys:
+            for cid in candidates:
+                if key.startswith(cid):
+                    try:
+                        self.snaps._snap_remove_active(snap, key)
+                        print(f"[cleanup] removed snapshot key: {key}")
+                    except Exception as e:
+                        print(f"[cleanup] snapshot remove warning ({key}): {e}")
+
+    @log_to_file(logger)
+    def terminate_pod_by_cid(self, namespace: str, pause_cid: str,
+                             cni_network: str = DEFAULT_CNI_NET_NAME,
+                             ifname: str = DEFAULT_IFNAME) -> dict:
+        """
+        Hard-destroy a pod when you know the pause CID.
+        - CNI DEL best-effort (even if netns is gone)
+        - Stop/Delete app tasks (by labels or prefix fallback)
+        - Stop/Delete pause task/container
+        - Remove active snapshot keys that match the IDs
+        """
+        client = self.runtime._client_for_ns(namespace)
+
+        # read pause pid from pidfile if task is gone
+        pause_pid = _read_pidfile(namespace, pause_cid)
+
+        # 1) CNI DEL (best-effort)
+        try:
+            netns = f"/proc/{pause_pid}/ns/net" if (pause_pid and os.path.exists(f"/proc/{pause_pid}")) else ""
+            print(f"[cleanup] CNI DEL network={cni_network} ifname={ifname} netns={'present' if netns else 'missing'}")
+            self.cni.delete(network_name=cni_network, container_id=pause_cid, netns_path=netns, ifname=ifname)
+        except Exception as e:
+            print(f"[cleanup] CNI DEL warning: {e}")
+
+        # 2) Delete app containers/tasks first
+        app_ids = self._guess_apps_by_prefix(namespace, pause_cid)
+        apps_terminated = []
+        for aid in app_ids:
+            # Try full path: stop+delete (task + container), then fall back to task-only
+            try:
+                self.runtime.stop_and_delete_task(aid)
+            except Exception:
+                pass
+            # Always try task-only delete too (covers “task without container”)
+            self.runtime.delete_task_only(aid)
+            # Best-effort container object delete
+            try:
+                self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=aid))
+            except grpc.RpcError:
+                pass
+            apps_terminated.append(aid)
+
+        # 3) Stop & delete pause task/container
+        try:
+            self.runtime.stop_and_delete_task(pause_cid)
+        finally:
+            # task-only delete in case the first call hit a proto mismatch
+            self.runtime.delete_task_only(pause_cid)
+            try:
+                self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=pause_cid))
+            except grpc.RpcError:
+                pass
+
+        # 4) Remove active snapshot keys that look like these CIDs
+        try:
+            snap = self._snapshotter_name()
+            # try both exact keys and common suffixes
+            for k in (pause_cid, pause_cid + "-", *(aid for aid in apps_terminated),
+                      *(aid + "-" for aid in apps_terminated)):
+                try:
+                    self.snaps._snap_remove_active(snap, k)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "message": f"terminated (by cid) in ns='{namespace}'",
+            "pause": {"cid": pause_cid, "pid": pause_pid},
+            "apps_terminated": apps_terminated,
+        }
+
+    def terminate_pod(self,namespace: str, pod_name: str,
+                      cni_network: str = DEFAULT_CNI_NET_NAME,
+                      ifname: str = DEFAULT_IFNAME) -> dict:
+        """
+        Gracefully terminate a pod (pause + its apps) in the given containerd namespace.
+        """
+        client = ContainerdClient( namespace=namespace)
+        pm = PodManager(client)
+
+        pod, apps = self._build_runtime_pod_struct(namespace, pod_name, cni_network, ifname)
+
+        if not pod:
+            return {"ok": False, "message": f"pod '{pod_name}' not found in ns='{namespace}'"}
+
+        try:
+            pm.delete_pod(pod, apps=apps)
+            return {
+                "ok": True,
+                "message": f"terminated pod '{pod_name}' in ns='{namespace}'",
+                "apps_terminated": [a["cid"] for a in apps],
+                "pause": pod.get("pause", {}),
+            }
+        except Exception as e:
+            return {"ok": False, "message": f"delete_pod failed: {e}"}
+
+    def terminate_pods_in_namespace(self,namespace: str) -> dict:
+        """
+        Convenience: terminate ALL labeled pods in a namespace.
+        """
+        client = ContainerdClient(namespace=namespace)
+        pm = PodManager(client)
+        summaries = pm.runtime.list_pods_and_apps_in_namespace(namespace)
+
+        results = []
+        for s in summaries:
+            # We only terminate "real" pods that came from pause/app labeling
+            # (skip STANDALONE pseudo-pods like calico-node)
+            is_real_pod = s["pause"]["status"] != "STANDALONE" and "pod_id" in s
+            if not is_real_pod:
+                continue
+            pod_name = s["pod_id"]
+            res = self.terminate_pod(namespace, pod_name)
+            results.append(res)
+
+        return {"namespace": namespace, "results": results}
+
+    # Add these near the bottom of PodManager
+
+    def destroy_pod(self, namespace: str, pod_name: str) -> dict:
+        """
+        Alias for terminate_pod(); kept for readability with 'destroy' wording.
+        """
+        return self.terminate_pod(namespace, pod_name)
+
+    def destroy_all_pods(self, namespace: str) -> dict:
+        """
+        Alias for terminate_pods_in_namespace(); destroys all labeled pods.
+        """
+        return self.terminate_pods_in_namespace(namespace)
+
+    def destroy_container_by_id(self, namespace: str, cid: str) -> dict:
+        """
+        Stop/delete a single container by id in a namespace.
+        Removes its active snapshot key only if we can infer it (not always known).
+        """
+        client = self.runtime._client_for_ns(namespace)
+        # Try to stop task + delete container
+        try:
+            self.runtime.c = client
+            self.runtime.stop_and_delete_task(cid)
+            # We usually don't know the active snapshot key for arbitrary cids here,
+            # so we leave snapshot GC to containerd (the committed chain is shared).
+            return {"ok": True, "message": f"container {cid} removed from ns='{namespace}'"}
+        except Exception as e:
+            return {"ok": False, "message": f"failed to remove {cid}: {e}"}
+
+    @log_to_file(logger)
+    def purge_stopped_tasks_and_containers(self, namespace: str) -> dict:
+        """
+        Remove any lingering STOPPED tasks and their containers in a namespace.
+        """
+        client = self.runtime._client_for_ns(namespace)
+        purged = []
+        try:
+            from generated.api.services.tasks.v1 import tasks_pb2
+            stopped = []
+            for t in _iter_list_tasks(client, tasks_pb2):
+                tid = _task_id(t)
+                status = _task_status(t)
+                if tid and status and str(status).upper() == "STOPPED":
+                    stopped.append(tid)
+            for tid in stopped:
+                self.runtime.delete_task_only(tid)
+                try:
+                    self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=tid))
+                except grpc.RpcError:
+                    pass
+                purged.append(tid)
+        except Exception as e:
+            return {"ok": False, "error": f"purge failed: {e}", "purged": purged}
+        return {"ok": True, "purged": purged}
+
 
 # -------------------- Demo / Example --------------------
 # if __name__ == "__main__":
@@ -1698,21 +2115,6 @@ if __name__ == "__main__":
     client = ContainerdClient()
     pod_mgr = PodManager(client)
 
-    namespaces = pod_mgr.runtime.list_all_namespaces()
-    print("Namespaces:", namespaces)
-
-    for ns in namespaces:
-        summaries = pod_mgr.runtime.list_pods_and_apps_in_namespace(ns)
-        if not summaries:
-            print(f"\n== No pods in '{ns}' ==")
-            continue
-
-        print(f"\n== Pods in '{ns}' ==")
-        for s in summaries:
-            print(f"- pod: {s['pod_id']}")
-            print(f"  pause: pid={s['pause']['pid']} status={s['pause']['status']}")
-            if not s["apps"]:
-                print("  (no app containers)")
-            else:
-                for a in s["apps"]:
-                    print(f"  app: {a['name']: <16} id={a['id']}  pid={a['pid']}  status={a['status']}")
+    status = pod_mgr.terminate_pod_by_cid("testKCR", "ed726e5104bd4a32")
+    print(f"Print the status {status}")
+    check_status = pod_mgr.runtime.prune_namespace("testKCR")
