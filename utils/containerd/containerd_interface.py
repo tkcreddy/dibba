@@ -474,6 +474,19 @@ class SnapshotManager:
         self._snapshotter_value_cache: Optional[str] = None
         self.default_snapshotter = default_snapshotter
 
+    # --- helper (top-level or inside SnapshotManager) ---
+    def _lazy_umount_mounts_under(path: str):
+        try:
+            import subprocess, shlex
+            # leaf-first unmount; findmnt is present on most distros
+            cmd = f"findmnt -Rno TARGET {shlex.quote(path)} | tac"
+            out = subprocess.check_output(cmd, shell=True, text=True).strip().splitlines()
+            for tgt in out:
+                if tgt:
+                    subprocess.run(["umount", "-l", tgt], check=False)
+        except Exception:
+            pass
+
     @log_to_file(logger)
     def _snapshotter_candidates(self) -> List[str]:
         raw = []
@@ -483,36 +496,6 @@ class SnapshotManager:
         seen = set(); raw = [x for x in raw if not (x in seen or seen.add(x))]
         full = [f"io.containerd.snapshotter.v1.{name}" for name in raw]
         return raw + full
-
-    @log_to_file(logger)
-    def prepare_rw_snapshot(self, parent_chain_id: str, key_hint: str, extra_md=None) -> Tuple[List[Any], str]:
-        key = f"{key_hint}-{uuid.uuid4().hex[:8]}"
-
-        if self._snapshotter_value_cache:
-            try:
-                req = snapshots_pb2.PrepareSnapshotRequest(
-                    snapshotter=self._snapshotter_value_cache, key=key, parent=parent_chain_id,
-                    labels={"containerd.io/gc.root": "true"},
-                )
-                resp = self.c.snapshots.Prepare(req)
-                print(f"Using snapshotter '{self._snapshotter_value_cache}'")
-                return list(resp.mounts), key
-            except grpc.RpcError:
-                pass
-
-        for snap_val in self._snapshotter_candidates():
-            try:
-                req = snapshots_pb2.PrepareSnapshotRequest(
-                    snapshotter=snap_val, key=key, parent=parent_chain_id,
-                    labels={"containerd.io/gc.root": "true"},
-                )
-                resp = self.c.snapshots.Prepare(req)
-                self._snapshotter_value_cache = snap_val
-                print(f"Discovered snapshotter '{snap_val}'")
-                return list(resp.mounts), key
-            except grpc.RpcError:
-                continue
-        raise RuntimeError("Unable to select snapshotter for containerd Snapshots API.")
 
     @log_to_file(logger)
     def _snap_stat_exists(self, snapshotter: str, key_or_name: str, extra_md=None) -> bool:
@@ -534,6 +517,67 @@ class SnapshotManager:
             )
         except grpc.RpcError:
             pass
+
+    @log_to_file(logger)
+    def _new_lease(self, id_hint: str = "unpack") -> leases_pb2.Lease:
+        lid = f"{id_hint}-{uuid.uuid4().hex[:8]}"
+        resp = self.c.leases.Create(
+            leases_pb2.CreateRequest(id=lid, labels={"containerd.io/gc.root": "true"}))
+        return resp.lease
+
+    @log_to_file(logger)
+    def _delete_lease(self, lease_id: str):
+        try:
+            self.c.leases.Delete(leases_pb2.DeleteRequest(id=lease_id))
+        except grpc.RpcError:
+            pass
+
+    @log_to_file(logger)
+    def prepare_rw_snapshot(
+            self,
+            parent_chain_id: str,
+            key_hint: str,
+            extra_md=None,
+            labels: Optional[Dict[str, str]] = None,  # <--- add
+    ) -> Tuple[List[Any], str]:
+        key = f"{key_hint}-{uuid.uuid4().hex[:8]}"
+        snap_labels = {"containerd.io/gc.root": "true"}
+        if labels:
+            snap_labels.update(labels)
+
+        # cached snapshotter path
+        if self._snapshotter_value_cache:
+            try:
+                req = snapshots_pb2.PrepareSnapshotRequest(
+                    snapshotter=self._snapshotter_value_cache,
+                    key=key,
+                    parent=parent_chain_id,
+                    labels=snap_labels,  # <--- use labels
+                )
+                resp = self.c.snapshots.Prepare(req)
+                print(f"Using snapshotter '{self._snapshotter_value_cache}'")
+                return list(resp.mounts), key
+            except grpc.RpcError:
+                pass
+
+        # discovery loop
+        for snap_val in self._snapshotter_candidates():
+            try:
+                req = snapshots_pb2.PrepareSnapshotRequest(
+                    snapshotter=snap_val,
+                    key=key,
+                    parent=parent_chain_id,
+                    labels=snap_labels,  # <--- use labels
+                )
+                resp = self.c.snapshots.Prepare(req)
+                self._snapshotter_value_cache = snap_val
+                print(f"Discovered snapshotter '{snap_val}'")
+                return list(resp.mounts), key
+            except grpc.RpcError:
+                continue
+        raise RuntimeError("Unable to select snapshotter for containerd Snapshots API.")
+
+
 
     @log_to_file(logger)
     def grpc_unpack(self, image_ref: str, manifest: dict, cfg: dict, snapshotter: str):
@@ -589,19 +633,79 @@ class SnapshotManager:
 
         return parent_chain
 
-    @log_to_file(logger)
-    def _new_lease(self, id_hint: str = "unpack") -> leases_pb2.Lease:
-        lid = f"{id_hint}-{uuid.uuid4().hex[:8]}"
-        resp = self.c.leases.Create(
-            leases_pb2.CreateRequest(id=lid, labels={"containerd.io/gc.root": "true"}))
-        return resp.lease
+
 
     @log_to_file(logger)
-    def _delete_lease(self, lease_id: str):
-        try:
-            self.c.leases.Delete(leases_pb2.DeleteRequest(id=lease_id))
-        except grpc.RpcError:
-            pass
+    def list_infos(self, snapshotter: Optional[str] = None) -> List[snapshots_pb2.Info]:
+        """Return snapshot infos (both committed names and active keys)."""
+        snap = snapshotter or self._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
+        resp = self.c.snapshots.List(snapshots_pb2.ListSnapshotsRequest(snapshotter=snap))
+        # stubs vary: entries/snapshots/items...
+        for field in ("entries", "snapshots", "items", "list", "results"):
+            seq = getattr(resp, field, None)
+            if seq:
+                return list(seq)
+        return []
+
+    @log_to_file(logger)
+    def remove_active_by_label(self, match: Dict[str, str], snapshotter: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Remove active snapshots whose labels include all key=val in 'match'.
+        Deletes leaf-first if there is a parent/child relation among the matches.
+        """
+        snap = snapshotter or self._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
+
+        def _match_labels(labels: Dict[str, str]) -> bool:
+            for k, v in (match or {}).items():
+                if labels.get(k) != v:
+                    return False
+            return True
+
+        removed, kept = [], []
+        while True:
+            infos = self.list_infos(snap)
+            # Filter to our label set
+            mine = []
+            name_to_parent = {}
+            for i in infos:
+                # info fields vary: prefer .labels, .name (committed) or .key (active)
+                labels = dict(getattr(i, "labels", {}) or {})
+                ident = getattr(i, "key", "") or getattr(i, "name", "")
+                parent = getattr(i, "parent", "")
+                if not ident:
+                    continue
+                if _match_labels(labels):
+                    mine.append((ident, parent))
+                    name_to_parent[ident] = parent
+
+            if not mine:
+                break
+
+            # Compute leaves within our filtered set
+            names = {n for (n, _) in mine}
+            parents = {p for (_, p) in mine if p}
+            leaves = [n for (n, p) in mine if n not in parents]
+
+            if not leaves:
+                # nothing removable; likely pinned or selection includes only parents
+                kept = list(names)
+                break
+
+            # Try to remove leaves
+            progress = False
+            for ident in leaves:
+                try:
+                    self.c.snapshots.Remove(
+                        snapshots_pb2.RemoveSnapshotRequest(snapshotter=snap, key=ident)
+                    )
+                    removed.append(ident)
+                    progress = True
+                except grpc.RpcError as e:
+                    kept.append(f"{ident} ({e.code().name})")
+            if not progress:
+                break
+
+        return {"removed": removed, "kept": kept}
 
 
 # ========== OCI Spec Builder ==========
@@ -1489,7 +1593,7 @@ class PodManager:
         self._ensure_unpacked(pause_image)
 
         chain_id = self.images.chain_id_for_image(pause_image)
-        mounts, snap_key = self.snaps.prepare_rw_snapshot(chain_id, f"{name}-pause-rootfs")
+        mounts, snap_key = self.snaps.prepare_rw_snapshot(chain_id, f"{name}-pause-rootfs",labels={"pod": name, "role": "pause"})
 
         mdesc = self.images.resolve_manifest(pause_image)
         _, cfg = self.images.load_manifest_and_config(mdesc)
@@ -1543,7 +1647,7 @@ class PodManager:
         self._ensure_unpacked(image)
 
         chain_id = self.images.chain_id_for_image(image)
-        mounts, snap_key = self.snaps.prepare_rw_snapshot(chain_id, f"{pod_name}-{name}-rootfs")
+        mounts, snap_key = self.snaps.prepare_rw_snapshot(chain_id, f"{pod_name}-{name}-rootfs",labels={"pod": pod_name, "app": name})
 
         if args is None:
             mdesc = self.images.resolve_manifest(image)
@@ -1568,7 +1672,7 @@ class PodManager:
             resources=resources
         )
         cid = f"{pod_name}-{name}"
-        self.runtime.create_container(cid, image, spec_any, labels={"pod": pod_name, "app": name})
+        self.runtime.create_container(cid, image, spec_any, labels={"pod": pod_name, "app": name,"role": "app"})
         pid = self.runtime.start_task(cid, mounts)
         print(f"🚀 App started: cid={cid}, pid={pid}, image={image}")
         return {"cid": cid, "pid": pid, "snapshot_key": snap_key}
@@ -1619,6 +1723,15 @@ class PodManager:
                 print(f"[cleanup] removed snapshot key: {snap_key}")
             except Exception as e:
                 print(f"[cleanup] snapshot remove warning ({snap_key}): {e}")
+
+        # --- in PodManager.delete_container(...) (end of method), after stop/delete:
+        # we already remove the explicit 'snap_key' if present; now also sweep any other matching actives
+        try:
+            _ = self.snaps.remove_active_by_label(
+                {"pod": app.get("cid", "").split("-")[0], "app": app.get("cid", "").split("-", 1)[-1]})
+        except Exception:
+            pass
+
 
     @log_to_file(logger)
     def delete_pod(self, pod: Dict, apps: Optional[List[Dict]] = None) -> None:
@@ -1678,6 +1791,16 @@ class PodManager:
                 print(f"[cleanup] removed pause snapshot key: {snap_key}")
             except Exception as e:
                 print(f"[cleanup] pause snapshot remove warning ({snap_key}): {e}")
+
+        # 5) Sweep any remaining active snapshots for this pod (even if we lost individual keys)
+        try:
+            res = self.snaps.remove_active_by_label({"pod": pod["name"]})
+            if res["removed"]:
+                print(f"[cleanup] removed active snapshots by label pod={pod['name']}: {res['removed']}")
+            if res["kept"]:
+                print(f"[cleanup] could not remove some snapshots (likely parents/pinned): {res['kept']}")
+        except Exception as e:
+            print(f"[cleanup] snapshot label sweep warning: {e}")
 
     def _build_runtime_pod_struct(self, namespace: str, pod_name: str,
                                   cni_network: str = DEFAULT_CNI_NET_NAME,
@@ -2115,6 +2238,6 @@ if __name__ == "__main__":
     client = ContainerdClient()
     pod_mgr = PodManager(client)
 
-    status = pod_mgr.terminate_pod_by_cid("testKCR", "ed726e5104bd4a32")
+    status = pod_mgr.destroy_pod("testKCR", "ed726e5104bd4a32")
     print(f"Print the status {status}")
     check_status = pod_mgr.runtime.prune_namespace("testKCR")
