@@ -1292,7 +1292,7 @@ class RuntimeManager:
         # Kill
         try:
             self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=kill_signal),  timeout=timeouts[0])
-            time.sleep(0.15)
+            time.sleep(0.5)
         except grpc.RpcError as e:
             # If already stopped or not found, we'll continue
             pass
@@ -1381,12 +1381,13 @@ class RuntimeManager:
 
             # 3) Best-effort kill -> wait -> delete
             try:
-                try:
-                    tstub.Kill(_tpb.KillRequest(container_id=tid, signal=signal.SIGKILL))
-                    #tstub.Kill(tasks_pb2.KillRequest(container_id=tid, signal=signal.SIGKILL))
-                except grpc.RpcError as e:
-                    print(f"Kill failed: {e}")
-                    pass  # It may already be stopped
+                # If container doesn't exist, Kill will always be NOT_FOUND — skip it.
+                if container_exists:
+                    try:
+                        tstub.Kill(_tpb.KillRequest(container_id=tid, signal=signal.SIGKILL))
+                    except grpc.RpcError:
+                        pass
+
 
                 # Short wait so exit is recorded
                 try:
@@ -1583,6 +1584,156 @@ class PodManager:
             image, manifest, cfg,
             self.snaps._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
         )
+
+    def _build_runtime_pod_struct(self, namespace: str, pod_name: str,
+                                  cni_network: str = DEFAULT_CNI_NET_NAME,
+                                  ifname: str = DEFAULT_IFNAME) -> tuple[Optional[Dict], List[Dict]]:
+        """
+        Inspect the namespace to reconstruct a minimal 'pod' dict (as expected by PodManager.delete_pod)
+        and the list of app dicts for that pod.
+
+        Returns: (pod_dict | None, apps_list)
+        """
+        # namespaced client for queries
+        client = self.runtime._client_for_ns(namespace)
+
+        try:
+            clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
+        except Exception as e:
+            print(f"[{namespace}] containers.List error: {e}")
+            return None, []
+
+        pause_cid = None
+        pause_pid = None
+
+        apps: List[Dict] = []
+        # First pass: find pause container for this pod
+        for c in clist:
+            labels = dict(getattr(c, "labels", {}) or {})
+            if labels.get("pod") == pod_name and labels.get("role") == "pause":
+                pause_cid = c.id
+                snap = self.runtime._task_snapshot(client, pause_cid)
+                pause_pid = snap.get("pid")
+                break
+
+        if not pause_cid:
+            # Pod not present (or never labeled as pause)
+            return None, []
+
+        # Build ns paths if we have a live pid
+        ns_paths = {}
+        if pause_pid and os.path.exists(f"/proc/{pause_pid}"):
+            ns_base = f"/proc/{pause_pid}/ns"
+            ns_paths = {
+                "pid": f"{ns_base}/pid",
+                "net": f"{ns_base}/net",
+                "ipc": f"{ns_base}/ipc",
+                "uts": f"{ns_base}/uts",
+            }
+        else:
+            # delete_pod() will gracefully handle missing netns by using "" for DEL
+            ns_paths = {"pid": "", "net": "", "ipc": "", "uts": ""}
+
+        pod = {
+            "name": pod_name,
+            "pause": {"cid": pause_cid, "pid": pause_pid},
+            "ns": ns_paths,
+            "cni": {"network": cni_network, "ifname": ifname},
+            # snapshot_key is optional; if unknown we omit and cleanup will skip removing it
+        }
+
+        # Second pass: collect app containers for this pod
+        for c in clist:
+            labels = dict(getattr(c, "labels", {}) or {})
+            if labels.get("pod") == pod_name and labels.get("role") != "pause":
+                apps.append({
+                    "cid": c.id,
+                    # pid/snapshot_key optional; delete_container() handles missing keys safely
+                })
+
+        return pod, apps
+
+    @log_to_file(logger)
+    def _tasks_with_prefix(self, namespace: str, prefix: str) -> list[str]:
+        """
+        Return task IDs starting with <prefix> (e.g., pauseCID-).
+        Works even if container objects are gone.
+        """
+        client = self.runtime._client_for_ns(namespace)
+        ids = []
+        try:
+            from generated.api.services.tasks.v1 import tasks_pb2
+            for t in _iter_list_tasks(client, tasks_pb2):
+                tid = _task_id(t)
+                if isinstance(tid, str) and tid.startswith(prefix):
+                    ids.append(tid)
+        except Exception:
+            pass
+        return ids
+
+    @log_to_file(logger)
+    def _guess_apps_by_prefix(self, namespace: str, pause_cid: str) -> list[str]:
+        """
+        First try by container labels; if none found, fall back to task prefix scan.
+        """
+        client = self.runtime._client_for_ns(namespace)
+        app_ids = []
+        try:
+            clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
+            for c in clist:
+                labels = dict(getattr(c, "labels", {}) or {})
+                if labels.get("pod") == pause_cid or (labels.get("pod") and pause_cid in labels.get("pod", "")):
+                    # your previous heuristic; keep if you need it
+                    pass
+                # common pattern: <pauseCID>-<appname>
+                if getattr(c, "id", "").startswith(pause_cid + "-"):
+                    app_ids.append(c.id)
+        except Exception:
+            pass
+
+        if not app_ids:
+            app_ids = self._tasks_with_prefix(namespace, pause_cid + "-")
+        return app_ids
+
+    @log_to_file(logger)
+    def _cni_del_best_effort(self, pause_cid: str, pause_pid: int | None,
+                             network_name: str, ifname: str):
+        netns_path = f"/proc/{pause_pid}/ns/net" if pause_pid and os.path.exists(f"/proc/{pause_pid}/ns/net") else ""
+        try:
+            print(
+                f"[cleanup] CNI DEL network={network_name} ifname={ifname} netns={'present' if netns_path else 'missing'}")
+            self.cni.delete(network_name=network_name, container_id=pause_cid,
+                            netns_path=netns_path, ifname=ifname)
+        except Exception as e:
+            print(f"[cleanup] CNI DEL warning: {e}")
+
+    @log_to_file(logger)
+    def _remove_active_snapshots_matching(self, namespace: str, candidates: list[str]):
+        """
+        Try to remove any active snapshot keys that look like they belong to these containers.
+        We remove any key that starts with one of the candidate prefixes.
+        """
+        snap = self._snapshotter_name()
+        # enumerate keys if possible
+        keys = self.runtime._list_active_snapshot_keys(snap)
+        if not keys:
+            # Blind attempts using common patterns
+            for cid in candidates:
+                for prefix in (f"{cid}-", f"{cid}"):
+                    try:
+                        self.snaps._snap_remove_active(snap, prefix)  # if exact match
+                    except Exception:
+                        pass
+            return
+
+        for key in keys:
+            for cid in candidates:
+                if key.startswith(cid):
+                    try:
+                        self.snaps._snap_remove_active(snap, key)
+                        print(f"[cleanup] removed snapshot key: {key}")
+                    except Exception as e:
+                        print(f"[cleanup] snapshot remove warning ({key}): {e}")
 
     @log_to_file(logger)
     def create_pod(self, name: str, pause_image: str = "registry.k8s.io/pause:3.9",
@@ -1802,156 +1953,7 @@ class PodManager:
         except Exception as e:
             print(f"[cleanup] snapshot label sweep warning: {e}")
 
-    def _build_runtime_pod_struct(self, namespace: str, pod_name: str,
-                                  cni_network: str = DEFAULT_CNI_NET_NAME,
-                                  ifname: str = DEFAULT_IFNAME) -> tuple[Optional[Dict], List[Dict]]:
-        """
-        Inspect the namespace to reconstruct a minimal 'pod' dict (as expected by PodManager.delete_pod)
-        and the list of app dicts for that pod.
 
-        Returns: (pod_dict | None, apps_list)
-        """
-        # namespaced client for queries
-        client = self.runtime._client_for_ns(namespace)
-
-        try:
-            clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
-        except Exception as e:
-            print(f"[{namespace}] containers.List error: {e}")
-            return None, []
-
-        pause_cid = None
-        pause_pid = None
-
-        apps: List[Dict] = []
-        # First pass: find pause container for this pod
-        for c in clist:
-            labels = dict(getattr(c, "labels", {}) or {})
-            if labels.get("pod") == pod_name and labels.get("role") == "pause":
-                pause_cid = c.id
-                snap = self.runtime._task_snapshot(client, pause_cid)
-                pause_pid = snap.get("pid")
-                break
-
-        if not pause_cid:
-            # Pod not present (or never labeled as pause)
-            return None, []
-
-        # Build ns paths if we have a live pid
-        ns_paths = {}
-        if pause_pid and os.path.exists(f"/proc/{pause_pid}"):
-            ns_base = f"/proc/{pause_pid}/ns"
-            ns_paths = {
-                "pid": f"{ns_base}/pid",
-                "net": f"{ns_base}/net",
-                "ipc": f"{ns_base}/ipc",
-                "uts": f"{ns_base}/uts",
-            }
-        else:
-            # delete_pod() will gracefully handle missing netns by using "" for DEL
-            ns_paths = {"pid": "", "net": "", "ipc": "", "uts": ""}
-
-        pod = {
-            "name": pod_name,
-            "pause": {"cid": pause_cid, "pid": pause_pid},
-            "ns": ns_paths,
-            "cni": {"network": cni_network, "ifname": ifname},
-            # snapshot_key is optional; if unknown we omit and cleanup will skip removing it
-        }
-
-        # Second pass: collect app containers for this pod
-        for c in clist:
-            labels = dict(getattr(c, "labels", {}) or {})
-            if labels.get("pod") == pod_name and labels.get("role") != "pause":
-                apps.append({
-                    "cid": c.id,
-                    # pid/snapshot_key optional; delete_container() handles missing keys safely
-                })
-
-        return pod, apps
-
-    @log_to_file(logger)
-    def _tasks_with_prefix(self, namespace: str, prefix: str) -> list[str]:
-        """
-        Return task IDs starting with <prefix> (e.g., pauseCID-).
-        Works even if container objects are gone.
-        """
-        client = self.runtime._client_for_ns(namespace)
-        ids = []
-        try:
-            from generated.api.services.tasks.v1 import tasks_pb2
-            for t in _iter_list_tasks(client, tasks_pb2):
-                tid = _task_id(t)
-                if isinstance(tid, str) and tid.startswith(prefix):
-                    ids.append(tid)
-        except Exception:
-            pass
-        return ids
-
-    @log_to_file(logger)
-    def _guess_apps_by_prefix(self, namespace: str, pause_cid: str) -> list[str]:
-        """
-        First try by container labels; if none found, fall back to task prefix scan.
-        """
-        client = self.runtime._client_for_ns(namespace)
-        app_ids = []
-        try:
-            clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
-            for c in clist:
-                labels = dict(getattr(c, "labels", {}) or {})
-                if labels.get("pod") == pause_cid or (labels.get("pod") and pause_cid in labels.get("pod", "")):
-                    # your previous heuristic; keep if you need it
-                    pass
-                # common pattern: <pauseCID>-<appname>
-                if getattr(c, "id", "").startswith(pause_cid + "-"):
-                    app_ids.append(c.id)
-        except Exception:
-            pass
-
-        if not app_ids:
-            app_ids = self._tasks_with_prefix(namespace, pause_cid + "-")
-        return app_ids
-
-
-    @log_to_file(logger)
-    def _cni_del_best_effort(self, pause_cid: str, pause_pid: int | None,
-                             network_name: str, ifname: str):
-        netns_path = f"/proc/{pause_pid}/ns/net" if pause_pid and os.path.exists(f"/proc/{pause_pid}/ns/net") else ""
-        try:
-            print(
-                f"[cleanup] CNI DEL network={network_name} ifname={ifname} netns={'present' if netns_path else 'missing'}")
-            self.cni.delete(network_name=network_name, container_id=pause_cid,
-                            netns_path=netns_path, ifname=ifname)
-        except Exception as e:
-            print(f"[cleanup] CNI DEL warning: {e}")
-
-    @log_to_file(logger)
-    def _remove_active_snapshots_matching(self, namespace: str, candidates: list[str]):
-        """
-        Try to remove any active snapshot keys that look like they belong to these containers.
-        We remove any key that starts with one of the candidate prefixes.
-        """
-        snap = self._snapshotter_name()
-        # enumerate keys if possible
-        keys = self.runtime._list_active_snapshot_keys(snap)
-        if not keys:
-            # Blind attempts using common patterns
-            for cid in candidates:
-                for prefix in (f"{cid}-", f"{cid}"):
-                    try:
-                        self.snaps._snap_remove_active(snap, prefix)  # if exact match
-                    except Exception:
-                        pass
-            return
-
-        for key in keys:
-            for cid in candidates:
-                if key.startswith(cid):
-                    try:
-                        self.snaps._snap_remove_active(snap, key)
-                        print(f"[cleanup] removed snapshot key: {key}")
-                    except Exception as e:
-                        print(f"[cleanup] snapshot remove warning ({key}): {e}")
 
     @log_to_file(logger)
     def terminate_pod_by_cid(self, namespace: str, pause_cid: str,
@@ -2240,4 +2242,4 @@ if __name__ == "__main__":
 
     status = pod_mgr.destroy_pod("testKCR", "ed726e5104bd4a32")
     print(f"Print the status {status}")
-    check_status = pod_mgr.runtime.prune_namespace("testKCR")
+    #check_status = pod_mgr.runtime.prune_namespace("testKCR")

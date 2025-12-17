@@ -76,6 +76,85 @@ class TaskId(BaseModel):
 class HostName(BaseModel):
     host_name: str
 
+class ContainerdHostRequest(BaseModel):
+    host_name: str
+    model_config = ConfigDict(extra='allow')
+
+class PodNamespaceHostRequest(BaseModel):
+    host_name: str
+    namespace: str
+    model_config = ConfigDict(extra='allow')
+
+class TerminatePodRequest(BaseModel):
+    host_name: str
+    namespace: str
+    pod_name: str
+    cni_network: Optional[str] = None
+    ifname: Optional[str] = None
+    model_config = ConfigDict(extra='allow')
+
+
+class TerminatePodByCidRequest(BaseModel):
+    host_name: str
+    namespace: str
+    pause_cid: str
+    cni_network: Optional[str] = None
+    ifname: Optional[str] = None
+    model_config = ConfigDict(extra='allow')
+
+
+class DestroyAllPodsRequest(BaseModel):
+    host_name: str
+    namespace: str
+    cni_network: Optional[str] = None
+    ifname: Optional[str] = None
+    model_config = ConfigDict(extra='allow')
+
+
+class DestroyContainerRequest(BaseModel):
+    host_name: str
+    namespace: str
+    cid: str
+    model_config = ConfigDict(extra='allow')
+
+
+class PruneNamespaceRequest(BaseModel):
+    host_name: str
+    namespace: str
+    aggressive: bool = True
+    model_config = ConfigDict(extra='allow')
+
+
+class PurgeStoppedRequest(BaseModel):
+    host_name: str
+    namespace: str
+    model_config = ConfigDict(extra='allow')
+
+
+class ContainerInfoRequest(BaseModel):
+    host_name: str
+    namespace: str
+    cid: str
+    model_config = ConfigDict(extra='allow')
+
+
+class CleanupTasksByPodPrefixRequest(BaseModel):
+    host_name: str
+    namespace: str
+    pod_id: str          # e.g. cd83c6a7ac0f47c6
+    prefer_grpc: bool = True
+    model_config = ConfigDict(extra='allow')
+
+@log_to_file(logger)
+def _host_queue(host_name: str) -> dict:
+    return {
+        'exchange': Exchange('secure_exchange', type='direct'),
+        'queue': ue.encode_hostname_with_key(host_name),
+        'routing_key': ue.encode_hostname_with_key(host_name),
+        'delivery_mode': 2
+    }
+
+
 
 @log_to_file(logger)
 def authenticate_user(username: str, password: str):
@@ -308,8 +387,8 @@ async def get_worker_usage_data(request: HostName, user: str = Depends(get_curre
 
 
 @log_to_file(logger)
-@app.post("/create-pods")
-@app.post("/create-pods/")
+@app.post("/containerd/create-pods")
+@app.post("/containerd/create-pods/")
 async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current_user)):
     host_queue_info = {
         'exchange': Exchange('secure_exchange', type='direct'),
@@ -348,25 +427,187 @@ async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 
-
 @log_to_file(logger)
-@app.get("/list_namespaces_and_pods/")
-async def list_namespaces_and_pods(request: HostName, user: str = Depends(get_current_user)):
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
+@app.post("/containerd/list_namespaces_and_pods/")
+async def list_namespaces_and_pods_api(request: ContainerdHostRequest, user: str = Depends(get_current_user)):
     try:
-        task = list_namespaces_and_pods.apply_async(
+        task = list_namespaces_and_pods_task.apply_async(
             args=(),
-            **host_queue_info
+            **_host_queue(request.host_name)
         )
         return {"message": "Task submitted successfully", "task_id": task.id}
     except Exception as e:
-        logger.error(f"Error submitting get_usage task: {e}")
+        logger.error(f"Error submitting list_namespaces_and_pods_task: {e}")
         raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+@log_to_file(logger)
+@app.post("/containerd/list_pods_by_namespace/")
+async def list_namespaces_and_pods_api(request: PodNamespaceHostRequest, user: str = Depends(get_current_user)):
+    try:
+        task = list_pods_by_namespace_task.apply_async(
+            args=([request.namespace]),
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting list_namespaces_and_pods_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+
+@log_to_file(logger)
+@app.post("/containerd/terminate_pod/")
+async def terminate_pod_api(request: TerminatePodRequest, user: str = Depends(get_current_user)):
+    try:
+        task = terminate_pod_task.apply_async(
+            args=(request.namespace, request.pod_name),
+            kwargs={
+                "cni_network": request.cni_network,
+                "ifname": request.ifname,
+            },
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting terminate_pod_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+@log_to_file(logger)
+@app.post("/containerd/terminate_pod_by_pause_cid/")
+async def terminate_pod_by_pause_cid_api(request: TerminatePodByCidRequest, user: str = Depends(get_current_user)):
+    try:
+        task = terminate_pod_by_pause_cid_task.apply_async(
+            args=(request.namespace, request.pause_cid),
+            kwargs={
+                "cni_network": request.cni_network,
+                "ifname": request.ifname,
+            },
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting terminate_pod_by_pause_cid_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+@log_to_file(logger)
+@app.post("/containerd/destroy_all_pods/")
+async def destroy_all_pods_api(request: DestroyAllPodsRequest, user: str = Depends(get_current_user)):
+    try:
+        task = destroy_all_pods_task.apply_async(
+            args=(request.namespace,),
+            kwargs={
+                "cni_network": request.cni_network,
+                "ifname": request.ifname,
+            },
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting destroy_all_pods_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+@log_to_file(logger)
+@app.post("/containerd/destroy_container/")
+async def destroy_container_api(request: DestroyContainerRequest, user: str = Depends(get_current_user)):
+    try:
+        task = destroy_container_by_id_task.apply_async(
+            args=(request.namespace, request.cid),
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting destroy_container_by_id_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+@log_to_file(logger)
+@app.post("/containerd/purge_stopped/")
+async def purge_stopped_api(request: PurgeStoppedRequest, user: str = Depends(get_current_user)):
+    try:
+        task = purge_stopped_tasks_and_containers_task.apply_async(
+            args=(request.namespace,),
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting purge_stopped_tasks_and_containers_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+@log_to_file(logger)
+@app.post("/containerd/prune_namespace/")
+async def prune_namespace_api(request: PruneNamespaceRequest, user: str = Depends(get_current_user)):
+    try:
+        task = prune_namespace_task.apply_async(
+            args=(request.namespace,),
+            kwargs={"aggressive": request.aggressive},
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting prune_namespace_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+@log_to_file(logger)
+@app.post("/containerd/get_container_info/")
+async def get_container_info_api(request: ContainerInfoRequest, user: str = Depends(get_current_user)):
+    try:
+        task = get_container_info_task.apply_async(
+            args=(request.namespace, request.cid),
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting get_container_info_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+@log_to_file(logger)
+@app.post("/containerd/cleanup_tasks_by_pod_prefix/")
+async def cleanup_tasks_by_pod_prefix_api(request: CleanupTasksByPodPrefixRequest, user: str = Depends(get_current_user)):
+    """
+    This is the one you want for:
+      ctr -n <ns> task list  -> STOPPED leftovers
+    Example: pod_id="cd83c6a7ac0f47c6" removes:
+      cd83c6a7ac0f47c6-*
+      cd83c6a7ac0f47c6 (if exists)
+    """
+    try:
+        task = cleanup_tasks_by_pod_prefix_task.apply_async(
+            args=(request.namespace, request.pod_id),
+            kwargs={"prefer_grpc": request.prefer_grpc},
+            **_host_queue(request.host_name)
+        )
+        return {"message": "Task submitted successfully", "task_id": task.id}
+    except Exception as e:
+        logger.error(f"Error submitting cleanup_tasks_by_pod_prefix_task: {e}")
+        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+
+
+#
+# @log_to_file(logger)
+# @app.get("/list_namespaces_and_pods/")
+# async def list_namespaces_and_pods(request: HostName, user: str = Depends(get_current_user)):
+#     host_queue_info = {
+#         'exchange': Exchange('secure_exchange', type='direct'),
+#         'queue': ue.encode_hostname_with_key(request.host_name),
+#         'routing_key': ue.encode_hostname_with_key(request.host_name),
+#         'delivery_mode': 2
+#     }
+#     try:
+#         task = list_namespaces_and_pods.apply_async(
+#             args=(),
+#             **host_queue_info
+#         )
+#         return {"message": "Task submitted successfully", "task_id": task.id}
+#     except Exception as e:
+#         logger.error(f"Error submitting get_usage task: {e}")
+#         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
 if __name__ == "__main__":
     import uvicorn
