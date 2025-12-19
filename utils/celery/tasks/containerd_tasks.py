@@ -161,15 +161,53 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwa
         client = ContainerdClient(socket=sock, namespace=ns)
         pods = PodManager(client)
 
+        # -------------------------------------------------
+        # 1) Pre-pull pause image via CRI (idempotent)
+        # -------------------------------------------------
+        pause_image = "registry.k8s.io/pause:3.9"
+        pause_pull = pods.pull_image(pause_image)
+        if not pause_pull.get("ok"):
+            return {
+                "error": pause_pull.get("message", f"Failed to pull pause image: {pause_image}"),
+                "namespace": ns,
+                "socket": sock,
+            }
+
+        # -------------------------------------------------
+        # 2) Rehydrate container specs and pre-pull app images
+        # -------------------------------------------------
+        container_specs = _rehydrate_containers(containers)
+
+        for spec in container_specs:
+            img = getattr(spec, "image", None)
+            if not img:
+                continue
+            img_pull = pods.pull_image(img)
+            if not img_pull.get("ok"):
+                return {
+                    "error": img_pull.get("message", f"Failed to pull app image: {img}"),
+                    "namespace": ns,
+                    "socket": sock,
+                    "failing_image": img,
+                }
+
+        # -------------------------------------------------
+        # 3) Create pod (pause container + CNI attach)
+        #    create_pod() will still call _ensure_unpacked(),
+        #    which uses the same CRI pull path as a safety net.
+        # -------------------------------------------------
         pause_resources = ResourceSpec(cpu_millicores=100, memory="64Mi")
         pod = pods.create_pod(
             name=f"{uuid.uuid4().hex[:16]}",
-            pause_image="registry.k8s.io/pause:3.9",
+            pause_image=pause_image,
             resources=pause_resources,
             cni_network=cni_net,
             cni_ifname=cni_dev,
         )
 
+        # -------------------------------------------------
+        # 4) Extract pod IPv4 (from CNI result or via netns)
+        # -------------------------------------------------
         pod_ipv4 = _extract_ipv4_from_cni_result(pod.get("cni_result"), cni_dev)
         if not pod_ipv4:
             pause = pod.get("pause") or {}
@@ -177,7 +215,9 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwa
             if isinstance(pause_pid, int) and pause_pid > 0:
                 pod_ipv4 = _ipv4_from_netns(pause_pid, cni_dev)
 
-        container_specs = _rehydrate_containers(containers)
+        # -------------------------------------------------
+        # 5) Add app containers into the same pod namespaces
+        # -------------------------------------------------
         apps = pods.add_containers(pod, container_specs)
 
         return _safe_json({
@@ -186,11 +226,16 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwa
             "cni": {"network": cni_net, "ifname": cni_dev},
             "pod": pod,
             "pod_ipv4": pod_ipv4,
-            "apps": apps
+            "apps": apps,
         })
 
     except Exception as err:
-        return {"error": str(err), "namespace": ns, "socket": sock}
+        return {
+            "error": str(err),
+            "namespace": ns,
+            "socket": sock,
+        }
+
 
 
 @celery_app.task

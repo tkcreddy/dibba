@@ -65,6 +65,25 @@ _STATUS_MAP = {
     4: "PAUSED",
 }
 
+# ---------- Config ----------
+CONTAINERD_SOCKET = "unix:///run/containerd/containerd.sock"
+NAMESPACE = os.environ.get("CONTAINERD_NAMESPACE", "k8s.io")
+DEFAULT_SNAPSHOTTER = os.environ.get("CONTAINERD_SNAPSHOTTER", "overlayfs")
+OCI_SPEC_TYPEURL = "types.containerd.io/opencontainers/runtime-spec/1/Spec"
+
+# CNI defaults (override via env as needed)
+CNI_BIN_DIR = os.environ.get("CNI_PATH", "/opt/cni/bin")
+CNI_CONF_DIR = os.environ.get("CNI_CONF_DIR", "/etc/cni/net.d")
+DEFAULT_CNI_NET_NAME = os.environ.get("CNI_NET_NAME", "calico")  # must match conflist "name"
+DEFAULT_IFNAME = os.environ.get("CNI_IFNAME", "eth0")
+
+# ----- Media types -----
+OCI_INDEX   = "application/vnd.oci.image.index.v1+json"
+OCI_MANIF   = "application/vnd.oci.image.manifest.v1+json"
+DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
+DOCKER_MAN  = "application/vnd.docker.distribution.manifest.v2+json"
+ANNOTATION_UNCOMPRESSED = "containerd.io/uncompressed"
+
 @log_to_file(logger)
 def _status_to_str(v):
     if v is None:
@@ -185,17 +204,7 @@ def _normalize_unix_target(sock: str) -> str:
         return "unix://" + sock  # will yield 'unix:///...'
 
 
-# ---------- Config ----------
-CONTAINERD_SOCKET = "unix:///run/containerd/containerd.sock"
-NAMESPACE = os.environ.get("CONTAINERD_NAMESPACE", "k8s.io")
-DEFAULT_SNAPSHOTTER = os.environ.get("CONTAINERD_SNAPSHOTTER", "overlayfs")
-OCI_SPEC_TYPEURL = "types.containerd.io/opencontainers/runtime-spec/1/Spec"
 
-# CNI defaults (override via env as needed)
-CNI_BIN_DIR = os.environ.get("CNI_PATH", "/opt/cni/bin")
-CNI_CONF_DIR = os.environ.get("CNI_CONF_DIR", "/etc/cni/net.d")
-DEFAULT_CNI_NET_NAME = os.environ.get("CNI_NET_NAME", "calico")  # must match conflist "name"
-DEFAULT_IFNAME = os.environ.get("CNI_IFNAME", "eth0")
 
 # --- platform auto-detect (overridden if FORCE_PLATFORM is set) ---
 @log_to_file(logger)
@@ -216,12 +225,7 @@ PLATFORM_OS, PLATFORM_ARCH = (
 if not PLATFORM_OS or not PLATFORM_ARCH:
     PLATFORM_OS, PLATFORM_ARCH = _detect_platform()
 
-# ----- Media types -----
-OCI_INDEX   = "application/vnd.oci.image.index.v1+json"
-OCI_MANIF   = "application/vnd.oci.image.manifest.v1+json"
-DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
-DOCKER_MAN  = "application/vnd.docker.distribution.manifest.v2+json"
-ANNOTATION_UNCOMPRESSED = "containerd.io/uncompressed"
+
 
 @log_to_file(logger)
 def _is_index(mt: str) -> bool:
@@ -348,6 +352,37 @@ def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0
             # for other errors, surface them
             raise
 
+# class _CRIImageClient:
+#     @log_to_file(logger)
+#     def __init__(self, socket_target="/run/containerd/containerd.sock"):
+#         # Accept either a path or a 'unix://...' target
+#         target = _normalize_unix_target(socket_target)
+#         self.channel = grpc.insecure_channel(target)
+#         self.stub = api_pb2_grpc.ImageServiceStub(self.channel)
+#
+#     @log_to_file(logger)
+#     def pull(self, image_ref: str) -> str | None:
+#         try:
+#             resp = self.stub.PullImage(api_pb2.PullImageRequest(
+#                 image=api_pb2.ImageSpec(image=image_ref)
+#             ))
+#             return resp.image_ref
+#         except grpc.RpcError as e:
+#             print(f"[cri] PullImage error: {e.code().name}: {e.details()}")
+#             return None
+#
+#     @log_to_file(logger)
+#     def image_status(self, image_ref: str) -> str | None:
+#         try:
+#             st = self.stub.ImageStatus(api_pb2.ImageStatusRequest(
+#                 image=api_pb2.ImageSpec(image=image_ref)
+#             ))
+#             if st.image and st.image.id:
+#                 return st.image.id
+#         except grpc.RpcError as e:
+#             print(f"[cri] ImageStatus error: {e.code().name}: {e.details()}")
+#         return None
+
 class _CRIImageClient:
     @log_to_file(logger)
     def __init__(self, socket_target="/run/containerd/containerd.sock"):
@@ -357,18 +392,55 @@ class _CRIImageClient:
         self.stub = api_pb2_grpc.ImageServiceStub(self.channel)
 
     @log_to_file(logger)
-    def pull(self, image_ref: str) -> str | None:
+    def image_exists(self, image_ref: str) -> bool:
+        """
+        Check if an image already exists in containerd via CRI ImageService.ListImages.
+        Matches against repo_tags and repo_digests.
+        """
         try:
-            resp = self.stub.PullImage(api_pb2.PullImageRequest(
-                image=api_pb2.ImageSpec(image=image_ref)
-            ))
-            return resp.image_ref
+            list_response = self.stub.ListImages(api_pb2.ListImagesRequest())
+            for img in list_response.images:
+                # tags like 'docker.io/library/alpine:latest'
+                if img.repo_tags and image_ref in img.repo_tags:
+                    print(f"✅ Image already exists: {image_ref}")
+                    return True
+                # digests like 'sha256:abcd...'
+                if img.repo_digests and image_ref in img.repo_digests:
+                    print(f"✅ Image already exists by digest: {image_ref}")
+                    return True
+            print(f"❌ Image not found locally: {image_ref}")
+            return False
         except grpc.RpcError as e:
-            print(f"[cri] PullImage error: {e.code().name}: {e.details()}")
+            print(f"⚠️ Error checking image existence: {e.code().name} - {e.details()}")
+            return False
+
+    @log_to_file(logger)
+    def pull(self, image_ref: str) -> str | None:
+        """
+        Pull an image via CRI if it doesn't already exist.
+        Returns the final image_ref (tag or digest) on success.
+        """
+        # Short-circuit if already present
+        if self.image_exists(image_ref):
+            return image_ref
+
+        print(f"📦 Pulling image: {image_ref}")
+        request = api_pb2.PullImageRequest(
+            image=api_pb2.ImageSpec(image=image_ref)
+        )
+        try:
+            response = self.stub.PullImage(request)
+            print(f"✅ Pulled image: {response.image_ref}")
+            return response.image_ref
+        except grpc.RpcError as e:
+            print(f"❌ Pull failed: {e.code().name} - {e.details()}")
             return None
 
     @log_to_file(logger)
     def image_status(self, image_ref: str) -> str | None:
+        """
+        Return the resolved image ID/digest for the given ref, if known.
+        """
         try:
             st = self.stub.ImageStatus(api_pb2.ImageStatusRequest(
                 image=api_pb2.ImageSpec(image=image_ref)
@@ -378,6 +450,8 @@ class _CRIImageClient:
         except grpc.RpcError as e:
             print(f"[cri] ImageStatus error: {e.code().name}: {e.details()}")
         return None
+
+
 # ========== Client ==========
 class ContainerdClient:
     @log_to_file(logger)
@@ -400,6 +474,7 @@ class ContainerdClient:
         self.leases = leases_pb2_grpc.LeasesStub(self._ich)
         self.namespaces = namespace_pb2_grpc.NamespacesStub(self._ich)
 
+    @log_to_file(logger)
     def md(self, extra: tuple[tuple[str, str], ...] = ()) -> tuple[tuple[str, str], ...]:
         base = (("containerd-namespace", self.namespace),)
         return base + tuple(extra)
@@ -421,6 +496,7 @@ class ImageResolver:
                     raise
         raise RuntimeError(f"Image {wanted} not found in namespace {NAMESPACE}")
 
+    @log_to_file(logger)
     def resolve_manifest(self, image_ref: str, extra_md=None) -> descriptor_pb2.Descriptor:
         resolved = self.resolve_image_name(image_ref)
         img = self.c.images.Get(images_pb2.GetImageRequest(name=resolved)).image
@@ -475,6 +551,7 @@ class SnapshotManager:
         self.default_snapshotter = default_snapshotter
 
     # --- helper (top-level or inside SnapshotManager) ---
+    @log_to_file(logger)
     def _lazy_umount_mounts_under(path: str):
         try:
             import subprocess, shlex
@@ -1101,6 +1178,7 @@ class RuntimeManager:
 
         return index
 
+    @log_to_file(logger)
     def _task_snapshot(self, client, cid: str) -> dict:
         """
         Robust single-task view. Uses the tasks index first; then a quick Get; then pidfile.
@@ -1340,6 +1418,7 @@ class RuntimeManager:
             except grpc.RpcError:
                 pass
 
+    @log_to_file(logger)
     def prune_orphan_tasks(self, namespace: str, aggressive: bool = False) -> dict:
         """
         Remove tasks that have no container or are STOPPED.
@@ -1514,6 +1593,72 @@ class PodManager:
         self.cni = CniManager()
 
     @log_to_file(logger)
+    def pull_image(self, image_ref: str) -> dict:
+        """
+        Ensure an image is available for this namespace.
+
+        1) First check containerd's native Images service (namespaced).
+        2) Only if not found, use CRI PullImage as a fallback.
+        """
+
+        # ----- 1) Native containerd check in this namespace -----
+        try:
+            resolved = self.images.resolve_image_name(image_ref)
+            # If this didn't raise NOT_FOUND, the image is already present in this ns.
+            msg = f"Image available in containerd namespace '{self.c.namespace}': {resolved}"
+            print(f"✅ {msg}")
+            return {
+                "ok": True,
+                "image_ref": resolved,
+                "message": msg,
+            }
+        except grpc.RpcError as e:
+            # If it's a real NOT_FOUND, we fall through to CRI.
+            if e.code() != grpc.StatusCode.NOT_FOUND:
+                # Some other gRPC error — log it but still try CRI.
+                logger.warning(
+                    f"[pull_image] containerd Images.Get error for {image_ref} "
+                    f"in ns={self.c.namespace}: {e.code().name}: {e.details()}"
+                )
+        except Exception as e:
+            # Defensive: don't blow up here, just log and try CRI.
+            logger.warning(
+                f"[pull_image] unexpected error while resolving {image_ref} "
+                f"in ns={self.c.namespace}: {e}"
+            )
+
+        # ----- 2) CRI pull fallback (works against the CRI plugin, usually k8s.io) -----
+        cri_sock = os.environ.get("CRI_SOCKET", "/run/containerd/containerd.sock")
+        cri = _CRIImageClient(socket_target=cri_sock)
+
+        pulled = cri.pull(image_ref)
+        if not pulled:
+            # CRI PullImage failed (like your insufficient_scope case)
+            msg = f"Failed to pull image via CRI: {image_ref}"
+            print(f"❌ {msg}")
+            return {
+                "ok": False,
+                "image_ref": None,
+                "message": msg,
+            }
+
+        # Optionally re-resolve in containerd using the digest-like ref CRI returns
+        final_ref = pulled
+        try:
+            final_ref = self.images.resolve_image_name(pulled)
+        except Exception:
+            # If this fails we still return the pulled ref
+            pass
+
+        msg = f"Pulled image via CRI and available as: {final_ref}"
+        print(f"✅ {msg}")
+        return {
+            "ok": True,
+            "image_ref": final_ref,
+            "message": msg,
+        }
+    
+    @log_to_file(logger)
     def _ensure_unpacked(self, image: str):
         """
         Ensure blobs exist in content store and unpack chain into snapshots.
@@ -1585,6 +1730,7 @@ class PodManager:
             self.snaps._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
         )
 
+    @log_to_file(logger)
     def _build_runtime_pod_struct(self, namespace: str, pod_name: str,
                                   cni_network: str = DEFAULT_CNI_NET_NAME,
                                   ifname: str = DEFAULT_IFNAME) -> tuple[Optional[Dict], List[Dict]]:
@@ -2028,6 +2174,7 @@ class PodManager:
             "apps_terminated": apps_terminated,
         }
 
+    @log_to_file(logger)
     def terminate_pod(self,namespace: str, pod_name: str,
                       cni_network: str = DEFAULT_CNI_NET_NAME,
                       ifname: str = DEFAULT_IFNAME) -> dict:
@@ -2053,6 +2200,7 @@ class PodManager:
         except Exception as e:
             return {"ok": False, "message": f"delete_pod failed: {e}"}
 
+    @log_to_file(logger)
     def terminate_pods_in_namespace(self,namespace: str) -> dict:
         """
         Convenience: terminate ALL labeled pods in a namespace.
@@ -2075,19 +2223,21 @@ class PodManager:
         return {"namespace": namespace, "results": results}
 
     # Add these near the bottom of PodManager
-
+    @log_to_file(logger)
     def destroy_pod(self, namespace: str, pod_name: str) -> dict:
         """
         Alias for terminate_pod(); kept for readability with 'destroy' wording.
         """
         return self.terminate_pod(namespace, pod_name)
 
+    @log_to_file(logger)
     def destroy_all_pods(self, namespace: str) -> dict:
         """
         Alias for terminate_pods_in_namespace(); destroys all labeled pods.
         """
         return self.terminate_pods_in_namespace(namespace)
 
+    @log_to_file(logger)
     def destroy_container_by_id(self, namespace: str, cid: str) -> dict:
         """
         Stop/delete a single container by id in a namespace.
