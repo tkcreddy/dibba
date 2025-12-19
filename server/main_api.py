@@ -498,8 +498,6 @@ async def destroy_all_pods_api(request: DestroyAllPodsRequest, user: str = Depen
         task = destroy_all_pods_task.apply_async(
             args=(request.namespace,),
             kwargs={
-                "cni_network": request.cni_network,
-                "ifname": request.ifname,
             },
             **_host_queue(request.host_name)
         )

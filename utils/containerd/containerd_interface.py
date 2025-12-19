@@ -38,16 +38,16 @@ from generated.api.services.diff.v1 import diff_pb2, diff_pb2_grpc
 from generated.api.services.leases.v1 import leases_pb2, leases_pb2_grpc
 from generated.api.services.namespaces.v1 import namespace_pb2, namespace_pb2_grpc   # <-- add this
 from generated.api.types import descriptor_pb2
-from generated.api.types import mount_pb2
+#from generated.api.types import mount_pb2
 
-from generated.api.services.tasks.v1 import tasks_pb2 as tpb
+#from generated.api.services.tasks.v1 import tasks_pb2 as tpb
 
 
 # diff + leases for gRPC-only unpack
 
 from utils.containerd.grpc_ns import _AddNamespaceInterceptor
 from utils.containerd.models import ResourceSpec
-from google.protobuf import empty_pb2
+#from google.protobuf import empty_pb2
 
 logger = LogKCld()
 
@@ -337,7 +337,7 @@ class ContainerSpec:
 
 # ---- Content / CRI helpers ----
 @log_to_file(logger)
-def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0.25) -> bool:
+def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0.25) -> bool|None:
     # Use Content.Info which returns NOT_FOUND if the blob is absent under the current namespace.
     for i in range(retries + 1):
         try:
@@ -1600,7 +1600,7 @@ class PodManager:
         1) First check containerd's native Images service (namespaced).
         2) Only if not found, use CRI PullImage as a fallback.
         """
-
+        ns = getattr(self.c, "namespace", None) or NAMESPACE
         # ----- 1) Native containerd check in this namespace -----
         try:
             resolved = self.images.resolve_image_name(image_ref)
@@ -1610,7 +1610,9 @@ class PodManager:
             return {
                 "ok": True,
                 "image_ref": resolved,
-                "message": msg,
+                "namespace": ns,
+                "message": f"Image available: {resolved}",
+                "source": "containerd",
             }
         except grpc.RpcError as e:
             # If it's a real NOT_FOUND, we fall through to CRI.
@@ -1631,32 +1633,67 @@ class PodManager:
         cri_sock = os.environ.get("CRI_SOCKET", "/run/containerd/containerd.sock")
         cri = _CRIImageClient(socket_target=cri_sock)
 
-        pulled = cri.pull(image_ref)
-        if not pulled:
-            # CRI PullImage failed (like your insufficient_scope case)
-            msg = f"Failed to pull image via CRI: {image_ref}"
-            print(f"❌ {msg}")
+        try:
+            pulled = cri.pull(image_ref)
+            if not pulled:
+                # CRI PullImage failed (like your insufficient_scope case)
+                msg = f"Failed to pull image via CRI: {image_ref}"
+                print(f"❌ {msg}")
+                return {
+                    "ok": False,
+                    "image_ref": None,
+                    "namespace": ns,
+                    "message": f"Failed to pull image: {image_ref}",
+                    "source": "cri",
+                    "grpc_code": None,
+                    "grpc_details": None,
+                    "hint": (
+                        "If this is a private repo, configure registry auth for containerd/CRI "
+                        "(hosts.toml or credential helpers)."
+                    ),
+                }
+
+            # Optionally re-resolve in containerd using the digest-like ref CRI returns
+            final_ref = pulled
+            try:
+                final_ref = self.images.resolve_image_name(pulled)
+            except Exception:
+                # If this fails we still return the pulled ref
+                pass
+
+            msg = f"Pulled image via CRI and available as: {final_ref}"
+            print(f"✅ {msg}")
+            return {
+                "ok": True,
+                "image_ref": final_ref,
+                "namespace": ns,
+                "message": f"Image pulled: {final_ref}",
+                "source": "cri",
+                "cri_returned": pulled,
+            }
+        except grpc.RpcError as e:
             return {
                 "ok": False,
                 "image_ref": None,
-                "message": msg,
+                "namespace": ns,
+                "message": f"CRI PullImage failed for: {image_ref}",
+                "source": "cri",
+                "grpc_code": getattr(e.code(), "name", lambda: str(e.code()))(),
+                "grpc_details": e.details(),
+                "hint": (
+                    "Common causes: private registry auth, wrong repo/tag, or insufficient_scope. "
+                    "Verify the image ref and registry credentials."
+                ),
             }
-
-        # Optionally re-resolve in containerd using the digest-like ref CRI returns
-        final_ref = pulled
-        try:
-            final_ref = self.images.resolve_image_name(pulled)
-        except Exception:
-            # If this fails we still return the pulled ref
-            pass
-
-        msg = f"Pulled image via CRI and available as: {final_ref}"
-        print(f"✅ {msg}")
-        return {
-            "ok": True,
-            "image_ref": final_ref,
-            "message": msg,
-        }
+        except Exception as e:
+            return {
+                "ok": False,
+                "image_ref": None,
+                "namespace": ns,
+                "message": f"Unexpected pull error for: {image_ref}",
+                "source": "cri",
+                "error": str(e),
+            }
     
     @log_to_file(logger)
     def _ensure_unpacked(self, image: str):
