@@ -1,32 +1,33 @@
 import json
+from typing import Optional, Dict, Any
 from utils.singleton import Singleton
 import os
+from logpkg.log_kcld import LogKCld
 
+logger = LogKCld()
 
-# from logpkg.log_decorator import setup_logger,log_to_file
-# logger = setup_logger("my_app", log_file="app.log")
 class _ReadConfig:
 
-    def __init__(self, base_dir=None) -> None:
+    def __init__(self, base_dir: Optional[str] = None) -> None:
         if base_dir is not None:
-            print(f"Loading config from {base_dir}")
+            logger.debug(f"Loading config from {base_dir}")
             self.base_dir = os.path.join(base_dir, 'config')
-            print(f'base_dir: {self.base_dir}')
+            logger.debug(f'base_dir: {self.base_dir}')
         else:
             PATH = os.getcwd()
-            print("Loading config from default path")
+            logger.debug("Loading config from default path")
             self.base_dir = os.path.join(PATH, 'config')
             #self.base_dir = 'config/'
-            print(f'base_dir: {self.base_dir}')
+            logger.debug(f'base_dir: {self.base_dir}')
 
 
         try:
             self.file_path = os.path.join(self.base_dir, 'config.json')
             self._config_data = None
             self.load_config()
-            print(f"Initializing ReadConfig once {self.file_path}")
+            logger.info(f"Initializing ReadConfig once: {self.file_path}")
         except Exception as e:
-            print(f"Fail to load config: {e}")
+            logger.error(f"Failed to load config: {e}", exc_info=True)
 
     @property
     def set_config_dir(self) -> str:
@@ -37,34 +38,47 @@ class _ReadConfig:
             with open(self.file_path, 'r') as file:
                 self._config_data = json.load(file)
         except Exception as e:
-            print(f"file open error {e}")
+            logger.error(f"File open error: {e}", exc_info=True)
+            raise
 
     @property
-    def logging_config(self):
+    def logging_config(self) -> Dict[str, Any]:
+        """Get logging configuration."""
         return self._config_data['logging']
 
     @property
-    def kafka_config(self):
+    def kafka_config(self) -> Dict[str, Any]:
+        """Get Kafka configuration."""
         return self._config_data['kafka']
 
     @property
-    def kafka_ssl(self):
+    def kafka_ssl(self) -> Dict[str, Any]:
+        """Get Kafka SSL configuration."""
         return self.kafka_config['ssl_config']
 
     @property
-    def encryption_config(self):
+    def encryption_config(self) -> Dict[str, Any]:
+        """Get encryption configuration."""
         return self._config_data['encryption']
+    
     @property
-    def aws_config(self):
+    def aws_config(self) -> Dict[str, Any]:
+        """Get AWS configuration."""
         return self._config_data['aws']
+    
     @property
-    def celery_config(self):
+    def celery_config(self) -> Dict[str, Any]:
+        """Get Celery configuration."""
         return self._config_data['celery']
+    
     @property
-    def redis_db_config(self):
+    def redis_db_config(self) -> Dict[str, Any]:
+        """Get Redis database configuration."""
         return self._config_data['redis_db']
+    
     @property
-    def redis_queue_config(self):
+    def redis_queue_config(self) -> Dict[str, Any]:
+        """Get Redis queue configuration."""
         return self._config_data['redis_queue']
 
 class ReadConfig(_ReadConfig, metaclass=Singleton):

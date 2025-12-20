@@ -35,17 +35,17 @@ def get_celery_nodes():
         else:
             return []
     except Exception as e:
-        print(f"Error retrieving Celery nodes: {e}")
+        logger.error(f"Error retrieving Celery nodes: {e}", exc_info=True)
         return []
 
 if __name__ == "__main__":
     active_nodes = get_celery_nodes()
-    print(f"Active node full info is {active_nodes}")
+    logger.info(f"Active node full info: {active_nodes}")
     async_results = []
     if active_nodes:
-        print("Active Celery nodes in the cluster:")
+        logger.info("Active Celery nodes in the cluster:")
         for node in active_nodes:
-            print(f"{node}")
+            logger.info(f"Node: {node}")
             host_queue_info = {
                 'exchange': Exchange('secure_exchange', type='direct'),
                 'queue': ue.encode_hostname_with_key(node),
@@ -56,16 +56,16 @@ if __name__ == "__main__":
                 args=(),
                 **host_queue_info
                 )
-            print(f"Queued get_worker_node_info on {node} with task_id={r.id}")
+            logger.info(f"Queued get_worker_node_info on {node} with task_id={r.id}")
             async_results.append((node, r))
     else:
-        print("No active Celery nodes found or an error occurred.")
+        logger.warning("No active Celery nodes found or an error occurred.")
     for node, r in async_results:
         try:
             info = r.get(timeout=30)
-            print(f"Result from {node} ({r.id}): {info}")
+            logger.info(f"Result from {node} ({r.id}): {info}")
         except Exception as e:
-            print(f"Error getting result from {node} ({r.id}): {e}")
+            logger.error(f"Error getting result from {node} ({r.id}): {e}", exc_info=True)
         finally:
             try:
                 # This removes it from the backend and pending registry

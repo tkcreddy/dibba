@@ -4,13 +4,17 @@ from socket import gethostname
 from utils.ReadConfig import ReadConfig as rc
 from utils.extensions.utilities_extention import UtilitiesExtension
 
+from logpkg.log_kcld import LogKCld
+
+logger = LogKCld()
+
 read_config = rc()
 secure_exchange = Exchange('secure_exchange', type='direct')
 hostname = gethostname()
 key = read_config.encryption_config['key']
 encode_util = UtilitiesExtension(key)
 hostname_queue_name = encode_util.encode_hostname_with_key(hostname)
-print(f"hostname is {hostname}")
+logger.info(f"Worker node hostname: {hostname}")
 celery_app.conf.task_queues = [
 
             Queue(hostname_queue_name, exchange=secure_exchange, routing_key=hostname_queue_name),

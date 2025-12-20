@@ -5,6 +5,7 @@ import hmac
 import base64
 import time
 import re
+from typing import Optional
 from utils.singleton import Singleton
 from utils.ReadConfig import ReadConfig as rc
 from logpkg.log_kcld import LogKCld, log_to_file
@@ -14,7 +15,12 @@ logger = LogKCld()
 
 class _UtilitiesExtension:
     @log_to_file(logger)
-    def __init__(self, key):
+    def __init__(self, key: str) -> None:
+        """Initialize UtilitiesExtension with encryption key.
+        
+        Args:
+            key: Encryption key for encoding operations
+        """
         self.key = key
 
     @log_to_file(logger)
@@ -47,7 +53,7 @@ class _UtilitiesExtension:
         return base64_encoded[:-2]
 
     @log_to_file(logger)
-    def encode_phrase_with_key(self, phrase: str = None, size: int = 48, hash_algorithm='sha256', ) -> str | None:
+    def encode_phrase_with_key(self, phrase: Optional[str] = None, size: int = 48, hash_algorithm: str = 'sha256') -> Optional[str]:
         """
         Encodes the hostname using the provided key and a hash algorithm.
 
@@ -68,7 +74,7 @@ class _UtilitiesExtension:
         return hmac_object.hexdigest()[:size]
 
     @log_to_file(logger)
-    def encode_hostname_with_key(self, hostname: str = None, size: int = 48, hash_algorithm='sha256', ) -> str:
+    def encode_hostname_with_key(self, hostname: Optional[str] = None, size: int = 48, hash_algorithm: str = 'sha256') -> str:
         """
         Encodes the hostname using the provided key and a hash algorithm.
 
@@ -89,7 +95,8 @@ class UtilitiesExtension(_UtilitiesExtension, metaclass=Singleton):
     pass
 
 
-def main():
+def main() -> None:
+    """Main function for testing UtilitiesExtension."""
     read_config = rc("/Users/krishnareddy/PycharmProjects/kobraCldSS")
     # key = "your_key_here"
     key_read = read_config.encryption_config
