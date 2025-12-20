@@ -1,58 +1,128 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, Depends, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, Extra,ConfigDict
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, ValidationError as PydanticValidationError
 from server.api_models import CreatePodsRequest
-from utils.celery.tasks.worker_node_tasks import *
-from utils.celery.tasks.containerd_tasks import *
-from utils.celery.tasks.aws_tasks import get_ec2_instances, create_worker_nodes, terminate_worker_node
+
+from utils.celery.tasks.worker_node_tasks import *  # noqa
+from utils.celery.tasks.containerd_tasks import *   # noqa
+from utils.celery.tasks.aws_tasks import create_worker_nodes, terminate_worker_node
+
 from utils.extensions.utilities_extention import UtilitiesExtension
-from kombu import Exchange
 from utils.redis.redis_interface import RedisInterface
-import logging
+from utils.ReadConfig import ReadConfig as rc
+from utils.celery.celery_config import celery_app
+
+from utils.exceptions import (
+    DibbaBaseException,
+    AuthenticationError,
+    NotFoundError,
+    exception_to_http_exception
+)
+from utils.error_handlers import (
+    handle_async_errors,
+    create_error_response,
+    create_success_response
+)
+from utils.celery.queue_utils import (
+    create_queue_info,
+    create_host_queue_info,
+    submit_celery_task,
+    extract_extra_kwargs
+)
+
+from typing import Optional, Dict, Any, Union
 import jwt
-from datetime import datetime, timedelta,UTC
+from datetime import datetime, timedelta, UTC
 from logpkg.log_kcld import LogKCld, log_to_file
 from dataclasses import is_dataclass, asdict
 
 
 logger = LogKCld()
-# Initialize FastAPI app
-app = FastAPI()
 
-# OAuth2 for authentication
+app = FastAPI(
+    title="Dibba Container Orchestration API",
+    description="Dibba is a lightweight, Python-based container orchestration layer.",
+    version="1.0.0",
+    contact={"name": "Dibba Contributors", "url": "https://github.com/tkcreddy/dibba"},
+    license_info={"name": "Apache 2.0"},
+)
+
+# ==================== Error Handlers ====================
+
+@app.exception_handler(DibbaBaseException)
+async def dibba_exception_handler(request: Request, exc: DibbaBaseException):
+    http_exc = exception_to_http_exception(exc)
+    return JSONResponse(status_code=http_exc.status_code, content=exc.to_dict())
+
+
+@app.exception_handler(PydanticValidationError)
+async def validation_exception_handler(request: Request, exc: PydanticValidationError):
+    error_details = []
+    for error in exc.errors():
+        error_details.append({
+            "field": ".".join(str(loc) for loc in error["loc"]),
+            "message": error["msg"],
+            "type": error["type"]
+        })
+
+    response = create_error_response(
+        error_code="VALIDATION_ERROR",
+        message="Request validation failed",
+        details={"validation_errors": error_details},
+        status_code=status.HTTP_400_BAD_REQUEST
+    )
+    return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=response)
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        f"Unhandled exception: {str(exc)}",
+        extra={
+            "path": str(request.url),
+            "method": request.method,
+            "exception_type": type(exc).__name__
+        },
+        exc_info=True
+    )
+    response = create_error_response(
+        error_code="INTERNAL_SERVER_ERROR",
+        message="An unexpected error occurred",
+        details={"exception_type": type(exc).__name__},
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+    )
+    return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content=response)
+
+
+# OAuth2
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-# Logger setup
-# logger = logging.getLogger(__name__)
 
 # Read configuration
 read_config = rc()
 aws_config = read_config.aws_config
 key_read = read_config.encryption_config
 redis_db_config = read_config.redis_db_config
-ue = UtilitiesExtension(key_read['key'])
+
+ue = UtilitiesExtension(key_read["key"])
 rd = RedisInterface(
-    redis_db_config['redis_host'],
-    redis_db_config['redis_port'],
-    redis_db_config['redis_db']
+    redis_db_config["redis_host"],
+    redis_db_config["redis_port"],
+    redis_db_config["redis_db"]
 )
 
-SECRET_KEY = key_read['key']
+SECRET_KEY = key_read["key"]
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 if not SECRET_KEY:
     raise ValueError("SECRET_KEY is required!")
 
 # Queue Information
-aws_queue_info = {
-    'exchange': Exchange('secure_exchange', type='direct'),
-    'queue': ue.encode_hostname_with_key('aws_interface'),
-    'routing_key': ue.encode_hostname_with_key('aws_interface'),
-    'delivery_mode': 2
-}
+aws_queue_info = create_queue_info("aws_interface", utilities_extension=ue)
 
 
-# Models for request validation
+# ==================== Models ====================
+
 class CreateInstanceRequest(BaseModel):
     instance_type: str
     ami_id: str
@@ -62,28 +132,23 @@ class CreateInstanceRequest(BaseModel):
     namespace: str
     min_count: int
     max_count: int
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
 
 
 class TerminateInstanceRequest(BaseModel):
     namespace: str
 
 
-class TaskId(BaseModel):
-    task_id: str
-
-
-class HostName(BaseModel):
-    host_name: str
-
 class ContainerdHostRequest(BaseModel):
     host_name: str
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
+
 
 class PodNamespaceHostRequest(BaseModel):
     host_name: str
     namespace: str
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
+
 
 class TerminatePodRequest(BaseModel):
     host_name: str
@@ -91,7 +156,7 @@ class TerminatePodRequest(BaseModel):
     pod_name: str
     cni_network: Optional[str] = None
     ifname: Optional[str] = None
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
 
 
 class TerminatePodByCidRequest(BaseModel):
@@ -100,7 +165,7 @@ class TerminatePodByCidRequest(BaseModel):
     pause_cid: str
     cni_network: Optional[str] = None
     ifname: Optional[str] = None
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
 
 
 class DestroyAllPodsRequest(BaseModel):
@@ -108,64 +173,57 @@ class DestroyAllPodsRequest(BaseModel):
     namespace: str
     cni_network: Optional[str] = None
     ifname: Optional[str] = None
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
 
 
 class DestroyContainerRequest(BaseModel):
     host_name: str
     namespace: str
     cid: str
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
 
 
 class PruneNamespaceRequest(BaseModel):
     host_name: str
     namespace: str
     aggressive: bool = True
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
 
 
 class PurgeStoppedRequest(BaseModel):
     host_name: str
     namespace: str
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
 
 
 class ContainerInfoRequest(BaseModel):
     host_name: str
     namespace: str
     cid: str
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
 
 
 class CleanupTasksByPodPrefixRequest(BaseModel):
     host_name: str
     namespace: str
-    pod_id: str          # e.g. cd83c6a7ac0f47c6
+    pod_id: str
     prefer_grpc: bool = True
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra="allow")
+
+
+# ==================== Helpers ====================
 
 @log_to_file(logger)
-def _host_queue(host_name: str) -> dict:
-    return {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(host_name),
-        'routing_key': ue.encode_hostname_with_key(host_name),
-        'delivery_mode': 2
-    }
-
-
-
-@log_to_file(logger)
-def authenticate_user(username: str, password: str):
+def authenticate_user(username: str, password: str) -> Union[str, bool]:
     if not rd.get_user_pass(username):
         return False
     if ue.encode_phrase_with_key(password) == rd.get_user_pass(username):
         return username
+    return False
 
 
 @log_to_file(logger)
-def create_access_token(data: dict, expires_delta: timedelta):
+def create_access_token(data: Dict[str, Any], expires_delta: timedelta) -> str:
     to_encode = data.copy()
     expire = datetime.now(UTC) + expires_delta
     to_encode["exp"] = expire
@@ -173,442 +231,395 @@ def create_access_token(data: dict, expires_delta: timedelta):
 
 
 @log_to_file(logger)
-def as_plain(obj):
+def as_plain(obj: Any) -> Any:
     if obj is None:
         return None
-    if hasattr(obj, "model_dump"):     # Pydantic v2
+    if hasattr(obj, "model_dump"):
         return obj.model_dump()
-    if hasattr(obj, "dict"):           # Pydantic v1
+    if hasattr(obj, "dict"):
         return obj.dict()
-    if is_dataclass(obj):              # Python dataclass
+    if is_dataclass(obj):
         return asdict(obj)
     if isinstance(obj, (list, tuple)):
         return [as_plain(x) for x in obj]
     if isinstance(obj, dict):
         return {k: as_plain(v) for k, v in obj.items()}
-    # last resort: object's __dict__
     return getattr(obj, "__dict__", obj)
 
 
+def _envelope_success(message: str, data: Any = None) -> Dict[str, Any]:
+    # Uses your existing helper for consistency across the codebase
+    return create_success_response(message=message, data=as_plain(data))
+
+
+def _envelope_error(error_code: str, message: str, details: Any = None, status_code: int = 500) -> Dict[str, Any]:
+    # Uses your existing helper for consistency across the codebase
+    return create_error_response(
+        error_code=error_code,
+        message=message,
+        details=as_plain(details) if details is not None else None,
+        status_code=status_code
+    )
+
+
+# ==================== Auth ====================
 
 @log_to_file(logger)
+@handle_async_errors("login", "AUTHENTICATION_ERROR")
 @app.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid credentials")
+        raise AuthenticationError(
+            message="Invalid username or password",
+            error_code="INVALID_CREDENTIALS",
+            details={"username": form_data.username},
+        )
     access_token = create_access_token(
         data={"sub": form_data.username},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    return _envelope_success(
+        message="Authentication successful",
+        data={"access_token": access_token, "token_type": "bearer"},
+    )
 
 
-#Dependency to get the current user
 @log_to_file(logger)
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
-        print(username)
         if username is None or not rd.get_user_pass(username):
-            raise HTTPException(status_code=401, detail="Invalid authentication")
+            raise AuthenticationError(
+                message="Invalid authentication token",
+                error_code="INVALID_TOKEN",
+                details={"username": username},
+            )
         return username
     except jwt.ExpiredSignatureError as e:
-        raise HTTPException(status_code=401, detail="Token expired") from e
+        raise AuthenticationError(
+            message="Authentication token has expired",
+            error_code="TOKEN_EXPIRED",
+            cause=e
+        ) from e
     except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail="Invalid token") from e
+        raise AuthenticationError(
+            message="Invalid authentication token",
+            error_code="INVALID_TOKEN",
+            cause=e
+        ) from e
 
 
-@log_to_file(logger)
-@app.post("/create-instances/")
-async def create_instances(request: CreateInstanceRequest, user: str = Depends(get_current_user)):
-    """
-    API endpoint to create AWS EC2 instances via a Celery task.
-    """
-    request_data = request.dict()
-    defined_fields = CreateInstanceRequest.__annotations__.keys()
-
-    extra_kwargs = {k: v for k, v in request_data.items() if k not in defined_fields}
-
-    try:
-        # Submit the Celery create_worker_nodes task
-        task = create_worker_nodes.apply_async(
-            args=(
-                aws_config['aws_access_key_id'],
-                aws_config['aws_secret_access_key'],
-                aws_config['region'],
-                request.instance_type,
-                request.ami_id,
-                request.key_name,
-                request.security_group_ids,
-                request.subnet_id,
-                request.namespace,
-            ),
-            kwargs={
-                'MinCount': request.min_count,
-                'MaxCount': request.max_count,
-                **extra_kwargs
-            },
-            **aws_queue_info
-        )
-
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting create_instances task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
-
+# ==================== Task Status ====================
 
 @log_to_file(logger)
-@app.post("/terminate-namespace/")
-async def terminate_namespace(request: TerminateInstanceRequest, user: str = Depends(get_current_user)):
-    """
-    API endpoint to terminate AWS EC2 instances via a Celery task.
-    """
-    try:
-        # Fetch instance IDs to terminate from Redis
-        instances_to_terminate = rd.get_instance_ids_namespace(request.namespace)
-
-        if not instances_to_terminate:
-            return {"message": "No instances found for the given namespace"}
-
-        # Submit the Celery terminate_worker_node task
-        task = terminate_worker_node.apply_async(
-            args=(
-                aws_config['aws_access_key_id'],
-                aws_config['aws_secret_access_key'],
-                aws_config['region'],
-                instances_to_terminate,
-            ),
-            **aws_queue_info
-        )
-
-        # Return task status
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting terminate_instances task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
-
-
-@log_to_file(logger)
-async def monitor_task(task_id: str, namespace: str, max_count: int):
-    """
-    Background task to monitor the Celery task result and save instances to Redis.
-    """
-    try:
-        print(f"starting the monitoring task with {task_id}")
-        task_result = create_worker_nodes.AsyncResult(task_id).get(timeout=30)
-        instances = {
-            task_result['Instances'][i]['PrivateDnsName']: {
-                'IpAddress': task_result['Instances'][i]['PrivateIpAddress'],
-                'InstanceId': task_result['Instances'][i]['InstanceId'],
-                'NameSpace': namespace,
-                'InstanceType': task_result['Instances'][i]['InstanceType'],
-            }
-            for i in range(max_count)
-        }
-
-        logger.info(f"Instances successfully created and saved to Redis: {instances}")
-
-    except Exception as e:
-        logger.error(f"Error in monitoring task {task_id}: {e}")
-
-
-@log_to_file(logger)
-@app.get("/task/{task_id}")
-async def get_task_status(task_id: str, user: str = Depends(get_current_user)):
+@app.get("/task/{task_id}", tags=["Task Management"])
+async def get_task_status(task_id: str, user: str = Depends(get_current_user)) -> Dict[str, Any]:
     task = celery_app.AsyncResult(task_id)
-
-    return {
+    payload = {
         "task_id": task.id,
         "status": task.status,
         "result": task.result if task.ready() else None,
         "progress": task.info if task.state == "PROGRESS" else None,
     }
+    return _envelope_success(message="Task status retrieved", data=payload)
+
+
+# ==================== Worker Node Endpoints (query params) ====================
 
 @log_to_file(logger)
-@app.get("/get_worker_node_data/")
-async def get_worker_node_data(request: HostName, user: str = Depends(get_current_user)):
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    try:
-        task = get_worker_node_info.apply_async(
-            args=(),
-            **host_queue_info
+@handle_async_errors("get_worker_node_data", "TASK_SUBMISSION_ERROR")
+@app.get("/get_worker_node_data/", tags=["Worker Nodes"])
+async def get_worker_node_data(host_name: str, user: str = Depends(get_current_user)):
+    host_queue_info = create_host_queue_info(host_name, ue)
+    result = submit_celery_task(
+        task=get_worker_node_info,
+        queue_info=host_queue_info,
+        operation_name="get_worker_node_data",
+        error_code="GET_WORKER_NODE_DATA_ERROR",
+        additional_data={"host_name": host_name},
+    )
+    # submit_celery_task already returns your standard shape (if you wrote it that way),
+    # but to guarantee the contract, we normalize here:
+    return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+@log_to_file(logger)
+@app.get("/get_worker_node_ip/", tags=["Worker Nodes"])
+async def get_worker_node_ip(host_name: str, user: str = Depends(get_current_user)):
+    host_queue_info = create_host_queue_info(host_name, ue)
+    result = submit_celery_task(
+        task=get_host_ip,
+        queue_info=host_queue_info,
+        operation_name="get_worker_node_ip",
+        error_code="GET_WORKER_NODE_IP_ERROR",
+        additional_data={"host_name": host_name},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+@log_to_file(logger)
+@app.get("/get_worker_usage_data/", tags=["Worker Nodes"])
+async def get_worker_usage_data(host_name: str, user: str = Depends(get_current_user)):
+    host_queue_info = create_host_queue_info(host_name, ue)
+    result = submit_celery_task(
+        task=get_usage,
+        queue_info=host_queue_info,
+        operation_name="get_worker_usage_data",
+        error_code="GET_WORKER_USAGE_DATA_ERROR",
+        additional_data={"host_name": host_name},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+# ==================== AWS Management ====================
+
+@log_to_file(logger)
+@handle_async_errors("create_instances", "TASK_SUBMISSION_ERROR")
+@app.post("/create-instances/", tags=["AWS Management"])
+async def create_instances(request: CreateInstanceRequest, user: str = Depends(get_current_user)):
+    request_data = request.model_dump()
+    defined_fields = set(CreateInstanceRequest.__annotations__.keys())
+    extra_kwargs = extract_extra_kwargs(request_data, defined_fields)
+
+    result = submit_celery_task(
+        task=create_worker_nodes,
+        args=(
+            aws_config["aws_access_key_id"],
+            aws_config["aws_secret_access_key"],
+            aws_config["region"],
+            request.instance_type,
+            request.ami_id,
+            request.key_name,
+            request.security_group_ids,
+            request.subnet_id,
+            request.namespace,
+        ),
+        kwargs={
+            "MinCount": request.min_count,
+            "MaxCount": request.max_count,
+            **extra_kwargs,
+        },
+        queue_info=aws_queue_info,
+        operation_name="create_instances",
+        error_code="CREATE_INSTANCES_TASK_ERROR",
+        additional_data={"namespace": request.namespace, "instance_type": request.instance_type},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+@log_to_file(logger)
+@handle_async_errors("terminate_namespace", "TASK_SUBMISSION_ERROR")
+@app.post("/terminate-namespace/", tags=["AWS Management"])
+async def terminate_namespace(request: TerminateInstanceRequest, user: str = Depends(get_current_user
+)):
+    instances_to_terminate = rd.get_instance_ids_namespace(request.namespace)
+    if not instances_to_terminate:
+        raise NotFoundError(
+            message="No instances found for the given namespace",
+            error_code="NO_INSTANCES_FOUND",
+            details={"namespace": request.namespace},
         )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting get_host_system_info task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+
+    result = submit_celery_task(
+        task=terminate_worker_node,
+        args=(
+            aws_config["aws_access_key_id"],
+            aws_config["aws_secret_access_key"],
+            aws_config["region"],
+            instances_to_terminate,
+        ),
+        queue_info=aws_queue_info,
+        operation_name="terminate_namespace",
+        error_code="TERMINATE_INSTANCES_TASK_ERROR",
+        additional_data={"instances_count": len(instances_to_terminate)},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
-@log_to_file(logger)
-@app.get("/get_worker_node_ip/")
-async def get_worker_node_ip(request: HostName, user: str = Depends(get_current_user)):
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    try:
-        task = get_host_ip.apply_async(
-            args=(),
-            **host_queue_info
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting host_ip task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
-
+# ==================== Containerd - Pods ====================
 
 @log_to_file(logger)
-@app.get("/get_worker_usage_data/")
-async def get_worker_usage_data(request: HostName, user: str = Depends(get_current_user)):
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    try:
-        task = get_usage.apply_async(
-            args=(),
-            **host_queue_info
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting get_usage task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+@handle_async_errors("create_pods", "TASK_SUBMISSION_ERROR")
+@app.post("/containerd/create-pods/", tags=["Containerd - Pods"])
+async def create_pods(request: CreatePodsRequest, user: str = Depends(get_current_user)):
+    host_queue_info = create_host_queue_info(request.host_name, ue)
 
-
-@log_to_file(logger)
-@app.post("/containerd/create-pods")
-@app.post("/containerd/create-pods/")
-async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current_user)):
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    logger.info(f"Inside create_pods")
-
-
-    #containers_payload = [c.model_dump(mode="json") for c in request.containers]
     containers_payload = [c.model_dump() for c in request.containers]
-
-
-    extra_kwargs = {
-        k: v for k, v in request.model_dump().items()
-        if k not in CreatePodsRequest.__annotations__.keys()
-    } or {"host_name": request.host_name}
-    #containers_payload  =  containers_payload.to_dict()
     namespace = request.namespace
 
-    try:
-        task = create_pod_task.apply_async(
-            args=(containers_payload, namespace),
-            kwargs={
+    request_data = request.model_dump()
+    defined_fields = set(CreatePodsRequest.__annotations__.keys())
+    extra_kwargs = extract_extra_kwargs(request_data, defined_fields)
+    extra_kwargs = extra_kwargs or {"host_name": request.host_name}
+
+    result = submit_celery_task(
+        task=create_pod_task,
+        args=(containers_payload, namespace),
+        kwargs={"host_name": request.host_name, **extra_kwargs},
+        queue_info=host_queue_info,
+        operation_name="create_pods",
+        error_code="CREATE_PODS_TASK_ERROR",
+        additional_data={
             "host_name": request.host_name,
-            # any extra kwargs you want to flow to the task (must be JSON-safe)
-            # "cni_network": "calico",
-            # "cni_ifname": "eth0",
+            "namespace": namespace,
+            "containers_count": len(containers_payload),
         },
-            **host_queue_info
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting get_usage task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
 @log_to_file(logger)
-@app.post("/containerd/list_namespaces_and_pods/")
+@app.post("/containerd/list_namespaces_and_pods/", tags=["Containerd - Pods"])
 async def list_namespaces_and_pods_api(request: ContainerdHostRequest, user: str = Depends(get_current_user)):
-    try:
-        task = list_namespaces_and_pods_task.apply_async(
-            args=(),
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting list_namespaces_and_pods_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
-
-@log_to_file(logger)
-@app.post("/containerd/list_pods_by_namespace/")
-async def list_namespaces_and_pods_api(request: PodNamespaceHostRequest, user: str = Depends(get_current_user)):
-    try:
-        task = list_pods_by_namespace_task.apply_async(
-            args=([request.namespace]),
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting list_namespaces_and_pods_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
-
+    result = submit_celery_task(
+        task=list_namespaces_and_pods_task,
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="list_namespaces_and_pods",
+        error_code="LIST_NAMESPACES_PODS_ERROR",
+        additional_data={"host_name": request.host_name},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
 @log_to_file(logger)
-@app.post("/containerd/terminate_pod/")
+@app.post("/containerd/list_pods_by_namespace/", tags=["Containerd - Pods"])
+async def list_pods_by_namespace_api(request: PodNamespaceHostRequest, user: str = Depends(get_current_user)):
+    result = submit_celery_task(
+        task=list_pods_by_namespace_task,
+        args=([request.namespace],),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="list_pods_by_namespace",
+        error_code="LIST_PODS_BY_NAMESPACE_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+@log_to_file(logger)
+@app.post("/containerd/terminate_pod/", tags=["Containerd - Pods"])
 async def terminate_pod_api(request: TerminatePodRequest, user: str = Depends(get_current_user)):
-    try:
-        task = terminate_pod_task.apply_async(
-            args=(request.namespace, request.pod_name),
-            kwargs={
-                "cni_network": request.cni_network,
-                "ifname": request.ifname,
-            },
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting terminate_pod_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+    result = submit_celery_task(
+        task=terminate_pod_task,
+        args=(request.namespace, request.pod_name),
+        kwargs={"cni_network": request.cni_network, "ifname": request.ifname},
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="terminate_pod",
+        error_code="TERMINATE_POD_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace, "pod_name":request.pod_name},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
 @log_to_file(logger)
-@app.post("/containerd/terminate_pod_by_pause_cid/")
+@app.post("/containerd/terminate_pod_by_pause_cid/", tags=["Containerd - Pods"])
 async def terminate_pod_by_pause_cid_api(request: TerminatePodByCidRequest, user: str = Depends(get_current_user)):
-    try:
-        task = terminate_pod_by_pause_cid_task.apply_async(
-            args=(request.namespace, request.pause_cid),
-            kwargs={
-                "cni_network": request.cni_network,
-                "ifname": request.ifname,
-            },
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting terminate_pod_by_pause_cid_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+    result = submit_celery_task(
+        task=terminate_pod_by_pause_cid_task,
+        args=(request.namespace, request.pause_cid),
+        kwargs={"cni_network": request.cni_network, "ifname": request.ifname},
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="terminate_pod_by_pause_cid",
+        error_code="TERMINATE_POD_BY_CID_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace, "pause_cid":request.pause_cid},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
 @log_to_file(logger)
-@app.post("/containerd/destroy_all_pods/")
+@app.post("/containerd/destroy_all_pods/", tags=["Containerd - Pods"])
 async def destroy_all_pods_api(request: DestroyAllPodsRequest, user: str = Depends(get_current_user)):
-    try:
-        task = destroy_all_pods_task.apply_async(
-            args=(request.namespace,),
-            kwargs={
-            },
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting destroy_all_pods_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+    result = submit_celery_task(
+        task=destroy_all_pods_task,
+        args=(request.namespace,),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="destroy_all_pods",
+        error_code="DESTROY_ALL_PODS_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
+
+# ==================== Containerd - Containers ====================
 
 @log_to_file(logger)
-@app.post("/containerd/destroy_container/")
+@app.post("/containerd/destroy_container/", tags=["Containerd - Containers"])
 async def destroy_container_api(request: DestroyContainerRequest, user: str = Depends(get_current_user)):
-    try:
-        task = destroy_container_by_id_task.apply_async(
-            args=(request.namespace, request.cid),
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting destroy_container_by_id_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+    result = submit_celery_task(
+        task=destroy_container_by_id_task,
+        args=(request.namespace, request.cid),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="destroy_container",
+        error_code="DESTROY_CONTAINER_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace, "container_id": request.cid},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
 @log_to_file(logger)
-@app.post("/containerd/purge_stopped/")
+@app.post("/containerd/purge_stopped/", tags=["Containerd - Maintenance"])
 async def purge_stopped_api(request: PurgeStoppedRequest, user: str = Depends(get_current_user)):
-    try:
-        task = purge_stopped_tasks_and_containers_task.apply_async(
-            args=(request.namespace,),
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting purge_stopped_tasks_and_containers_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+    result = submit_celery_task(
+        task=purge_stopped_tasks_and_containers_task,
+        args=(request.namespace,),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="purge_stopped",
+        error_code="PURGE_STOPPED_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
 @log_to_file(logger)
-@app.post("/containerd/prune_namespace/")
+@app.post("/containerd/prune_namespace/", tags=["Containerd - Maintenance"])
 async def prune_namespace_api(request: PruneNamespaceRequest, user: str = Depends(get_current_user)):
-    try:
-        task = prune_namespace_task.apply_async(
-            args=(request.namespace,),
-            kwargs={"aggressive": request.aggressive},
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting prune_namespace_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+    result = submit_celery_task(
+        task=prune_namespace_task,
+        args=(request.namespace,),
+        kwargs={"aggressive": request.aggressive},
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="prune_namespace",
+        error_code="PRUNE_NAMESPACE_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace, "aggressive": request.aggressive},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
 @log_to_file(logger)
-@app.post("/containerd/get_container_info/")
-async def get_container_info_api(request: ContainerInfoRequest, user: str = Depends(get_current_user)):
-    try:
-        task = get_container_info_task.apply_async(
-            args=(request.namespace, request.cid),
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting get_container_info_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+@app.post("/containerd/get_container_info/", tags=["Containerd - Containers"])
+async def get_container_info_api(request: ContainerInfoRequest, user: str = Depends(get_current_user)
+):
+    result = submit_celery_task(
+        task=get_container_info_task,
+        args=(request.namespace, request.cid),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="get_container_info",
+        error_code="GET_CONTAINER_INFO_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace, "container_id": request.cid},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
 @log_to_file(logger)
-@app.post("/containerd/cleanup_tasks_by_pod_prefix/")
+@app.post("/containerd/cleanup_tasks_by_pod_prefix/", tags=["Containerd - Maintenance"])
 async def cleanup_tasks_by_pod_prefix_api(request: CleanupTasksByPodPrefixRequest, user: str = Depends(get_current_user)):
-    """
-    This is the one you want for:
-      ctr -n <ns> task list  -> STOPPED leftovers
-    Example: pod_id="cd83c6a7ac0f47c6" removes:
-      cd83c6a7ac0f47c6-*
-      cd83c6a7ac0f47c6 (if exists)
-    """
-    try:
-        task = cleanup_tasks_by_pod_prefix_task.apply_async(
-            args=(request.namespace, request.pod_id),
-            kwargs={"prefer_grpc": request.prefer_grpc},
-            **_host_queue(request.host_name)
-        )
-        return {"message": "Task submitted successfully", "task_id": task.id}
-    except Exception as e:
-        logger.error(f"Error submitting cleanup_tasks_by_pod_prefix_task: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit task") from e
+    result = submit_celery_task(
+        task=cleanup_tasks_by_pod_prefix_task,
+        args=(request.namespace, request.pod_id),
+        kwargs={"prefer_grpc": request.prefer_grpc},
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="cleanup_tasks_by_pod_prefix",
+        error_code="CLEANUP_TASKS_BY_POD_PREFIX_ERROR",
+        additional_data={"host_name": request.host_name, "namespace": request.namespace, "pod_id": request.pod_id},
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
-
-#
-# @log_to_file(logger)
-# @app.get("/list_namespaces_and_pods/")
-# async def list_namespaces_and_pods(request: HostName, user: str = Depends(get_current_user)):
-#     host_queue_info = {
-#         'exchange': Exchange('secure_exchange', type='direct'),
-#         'queue': ue.encode_hostname_with_key(request.host_name),
-#         'routing_key': ue.encode_hostname_with_key(request.host_name),
-#         'delivery_mode': 2
-#     }
-#     try:
-#         task = list_namespaces_and_pods.apply_async(
-#             args=(),
-#             **host_queue_info
-#         )
-#         return {"message": "Task submitted successfully", "task_id": task.id}
-#     except Exception as e:
-#         logger.error(f"Error submitting get_usage task: {e}")
-#         raise HTTPException(status_code=500, detail="Failed to submit task") from e
-
-if __name__ == "__main__":
+def run_server():
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
+
+if __name__ == "__main__":
+    run_server()

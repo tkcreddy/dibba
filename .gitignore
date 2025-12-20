@@ -1,4 +1,10 @@
 /config/
-/scripts/
 /cri-api/
-
+/gogo-protobuf/
+/generated/
+/.idea
+/archive
+/venv
+/.venv
+/.venv2
+/cri-api/
