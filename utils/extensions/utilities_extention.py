@@ -102,7 +102,7 @@ def main() -> None:
     key_read = read_config.encryption_config
     key = key_read['key']
     ue = UtilitiesExtension(key)
-    print(ue.encode_hostname_with_key())
+    logger.info(f"Encoded hostname: {ue.encode_hostname_with_key()}")
 
 
 if __name__ == "__main__":

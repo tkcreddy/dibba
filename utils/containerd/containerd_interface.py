@@ -402,16 +402,16 @@ class _CRIImageClient:
             for img in list_response.images:
                 # tags like 'docker.io/library/alpine:latest'
                 if img.repo_tags and image_ref in img.repo_tags:
-                    print(f"✅ Image already exists: {image_ref}")
+                    logger.info(f"Image already exists: {image_ref}")
                     return True
                 # digests like 'sha256:abcd...'
                 if img.repo_digests and image_ref in img.repo_digests:
-                    print(f"✅ Image already exists by digest: {image_ref}")
+                    logger.info(f"Image already exists by digest: {image_ref}")
                     return True
-            print(f"❌ Image not found locally: {image_ref}")
+            logger.debug(f"Image not found locally: {image_ref}")
             return False
         except grpc.RpcError as e:
-            print(f"⚠️ Error checking image existence: {e.code().name} - {e.details()}")
+            logger.warning(f"Error checking image existence: {e.code().name} - {e.details()}")
             return False
 
     @log_to_file(logger)
@@ -424,16 +424,16 @@ class _CRIImageClient:
         if self.image_exists(image_ref):
             return image_ref
 
-        print(f"📦 Pulling image: {image_ref}")
+        logger.info(f"Pulling image: {image_ref}")
         request = api_pb2.PullImageRequest(
             image=api_pb2.ImageSpec(image=image_ref)
         )
         try:
             response = self.stub.PullImage(request)
-            print(f"✅ Pulled image: {response.image_ref}")
+            logger.info(f"Pulled image: {response.image_ref}")
             return response.image_ref
         except grpc.RpcError as e:
-            print(f"❌ Pull failed: {e.code().name} - {e.details()}")
+            logger.error(f"Pull failed: {e.code().name} - {e.details()}", exc_info=True)
             return None
 
     @log_to_file(logger)
@@ -448,7 +448,7 @@ class _CRIImageClient:
             if st.image and st.image.id:
                 return st.image.id
         except grpc.RpcError as e:
-            print(f"[cri] ImageStatus error: {e.code().name}: {e.details()}")
+            logger.error(f"[cri] ImageStatus error: {e.code().name}: {e.details()}", exc_info=True)
         return None
 
 
@@ -632,7 +632,7 @@ class SnapshotManager:
                     labels=snap_labels,  # <--- use labels
                 )
                 resp = self.c.snapshots.Prepare(req)
-                print(f"Using snapshotter '{self._snapshotter_value_cache}'")
+                logger.debug(f"Using snapshotter '{self._snapshotter_value_cache}'")
                 return list(resp.mounts), key
             except grpc.RpcError:
                 pass
@@ -648,7 +648,7 @@ class SnapshotManager:
                 )
                 resp = self.c.snapshots.Prepare(req)
                 self._snapshotter_value_cache = snap_val
-                print(f"Discovered snapshotter '{snap_val}'")
+                logger.info(f"Discovered snapshotter '{snap_val}'")
                 return list(resp.mounts), key
             except grpc.RpcError:
                 continue
@@ -914,7 +914,7 @@ class CniManager:
         cmd = [self.cnitool, "del", network_name, netns_path]
         res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
         if res.returncode != 0:
-            print(f"[cni] delete warning: {res.stderr.strip() or res.stdout.strip()}")
+            logger.warning(f"[cni] delete warning: {res.stderr.strip() or res.stdout.strip()}")
 
     # ======== config discovery supporting .conflist and .conf ========
     @log_to_file(logger)
@@ -1041,7 +1041,7 @@ class CniManager:
             }
             self._exec_plugin(plugin_type, "DEL", netns_path, container_id, ifname, plugin_cfg, timeout)
         except Exception as e:
-            print(f"[cni] delete fallback warning: {e}")
+            logger.warning(f"[cni] delete fallback warning: {e}", exc_info=True)
 
 # ========== Container/Task ==========
 class RuntimeManager:
@@ -1606,7 +1606,7 @@ class PodManager:
             resolved = self.images.resolve_image_name(image_ref)
             # If this didn't raise NOT_FOUND, the image is already present in this ns.
             msg = f"Image available in containerd namespace '{self.c.namespace}': {resolved}"
-            print(f"✅ {msg}")
+            logger.info(msg)
             return {
                 "ok": True,
                 "image_ref": resolved,
@@ -1638,7 +1638,7 @@ class PodManager:
             if not pulled:
                 # CRI PullImage failed (like your insufficient_scope case)
                 msg = f"Failed to pull image via CRI: {image_ref}"
-                print(f"❌ {msg}")
+                logger.error(msg)
                 return {
                     "ok": False,
                     "image_ref": None,
@@ -1662,7 +1662,7 @@ class PodManager:
                 pass
 
             msg = f"Pulled image via CRI and available as: {final_ref}"
-            print(f"✅ {msg}")
+            logger.info(msg)
             return {
                 "ok": True,
                 "image_ref": final_ref,
@@ -1718,7 +1718,7 @@ class PodManager:
 
         missing = [dg for dg in layer_digests if not _blob_exists(self.c.content, dg)]
         if missing:
-            print("ℹ️  Some blobs missing in content store; invoking CRI pull...")
+            logger.info("Some blobs missing in content store; invoking CRI pull...")
             cri = _CRIImageClient(
                 socket_target=os.environ.get("CRI_SOCKET", "/run/containerd/containerd.sock")
                 # You can also reuse your CONTAINERD_SOCKET env/config here; the normalizer handles both.
@@ -1783,7 +1783,7 @@ class PodManager:
         try:
             clist = client.containers.List(containers_pb2.ListContainersRequest()).containers
         except Exception as e:
-            print(f"[{namespace}] containers.List error: {e}")
+            logger.error(f"[{namespace}] containers.List error: {e}", exc_info=True)
             return None, []
 
         pause_cid = None
@@ -1883,12 +1883,12 @@ class PodManager:
                              network_name: str, ifname: str):
         netns_path = f"/proc/{pause_pid}/ns/net" if pause_pid and os.path.exists(f"/proc/{pause_pid}/ns/net") else ""
         try:
-            print(
+            logger.debug(
                 f"[cleanup] CNI DEL network={network_name} ifname={ifname} netns={'present' if netns_path else 'missing'}")
             self.cni.delete(network_name=network_name, container_id=pause_cid,
                             netns_path=netns_path, ifname=ifname)
         except Exception as e:
-            print(f"[cleanup] CNI DEL warning: {e}")
+            logger.warning(f"[cleanup] CNI DEL warning: {e}", exc_info=True)
 
     @log_to_file(logger)
     def _remove_active_snapshots_matching(self, namespace: str, candidates: list[str]):
@@ -1914,16 +1914,16 @@ class PodManager:
                 if key.startswith(cid):
                     try:
                         self.snaps._snap_remove_active(snap, key)
-                        print(f"[cleanup] removed snapshot key: {key}")
+                        logger.debug(f"[cleanup] removed snapshot key: {key}")
                     except Exception as e:
-                        print(f"[cleanup] snapshot remove warning ({key}): {e}")
+                        logger.warning(f"[cleanup] snapshot remove warning ({key}): {e}", exc_info=True)
 
     @log_to_file(logger)
     def create_pod(self, name: str, pause_image: str = "registry.k8s.io/pause:3.9",
                    resources: Optional[ResourceSpec] = None,
                    cni_network: str = DEFAULT_CNI_NET_NAME,
                    cni_ifname: str = DEFAULT_IFNAME) -> Dict:
-        print(f"Using platform: {PLATFORM_OS}/{PLATFORM_ARCH}")
+        logger.info(f"Using platform: {PLATFORM_OS}/{PLATFORM_ARCH}")
         self._ensure_unpacked(pause_image)
 
         chain_id = self.images.chain_id_for_image(pause_image)
@@ -1934,7 +1934,7 @@ class PodManager:
         args_cfg = list((cfg.get("config") or {}).get("Entrypoint") or [])
         args_cfg += list((cfg.get("config") or {}).get("Cmd") or [])
         args = args_cfg or ["/pause"]
-        print(f"[pause] args={args}")
+        logger.debug(f"[pause] args={args}")
 
         ns = [
             {"type": "pid"},
@@ -1954,15 +1954,15 @@ class PodManager:
 
         ns_base = f"/proc/{pid}/ns"
         ns_paths = {k: f"{ns_base}/{k}" for k in ["pid", "net", "ipc", "uts"]}
-        print(f"✅ Pause pod up: cid={cid}, pid={pid}")
+        logger.info(f"Pause pod up: cid={cid}, pid={pid}")
         cni_result = {}
         # Attach Calico via CNI (prefers cnitool, falls back to direct first-plugin exec)
         try:
             cni_result = self.cni.add(network_name=cni_network, container_id=cid,
                                       netns_path=ns_paths["net"], ifname=cni_ifname)
-            print(f"🌐 CNI attached: {cni_result if isinstance(cni_result, dict) else 'ok'}")
+            logger.info(f"CNI attached: {cni_result if isinstance(cni_result, dict) else 'ok'}")
         except Exception as e:
-            print(f"❗ CNI attach failed: {e}")
+            logger.error(f"CNI attach failed: {e}", exc_info=True)
 
         return {"name": name, "pause": {"cid": cid, "pid": pid}, "ns": ns_paths,
                 "cni": {"network": cni_network, "ifname": cni_ifname},
@@ -2008,7 +2008,7 @@ class PodManager:
         cid = f"{pod_name}-{name}"
         self.runtime.create_container(cid, image, spec_any, labels={"pod": pod_name, "app": name,"role": "app"})
         pid = self.runtime.start_task(cid, mounts)
-        print(f"🚀 App started: cid={cid}, pid={pid}, image={image}")
+        logger.info(f"App started: cid={cid}, pid={pid}, image={image}")
         return {"cid": cid, "pid": pid, "snapshot_key": snap_key}
 
     @log_to_file(logger)
@@ -2046,17 +2046,17 @@ class PodManager:
         cid = app.get("cid")
         snap_key = app.get("snapshot_key")
         if not cid:
-            print("[cleanup] app has no 'cid'; skipping task/container delete")
+            logger.warning("[cleanup] app has no 'cid'; skipping task/container delete")
         else:
-            print(f"[cleanup] stopping app container: {cid}")
+            logger.debug(f"[cleanup] stopping app container: {cid}")
             self.runtime.stop_and_delete_task(cid)
 
         if snap_key:
             try:
                 self.snaps._snap_remove_active(self._snapshotter_name(), snap_key)
-                print(f"[cleanup] removed snapshot key: {snap_key}")
+                logger.debug(f"[cleanup] removed snapshot key: {snap_key}")
             except Exception as e:
-                print(f"[cleanup] snapshot remove warning ({snap_key}): {e}")
+                logger.warning(f"[cleanup] snapshot remove warning ({snap_key}): {e}", exc_info=True)
 
         # --- in PodManager.delete_container(...) (end of method), after stop/delete:
         # we already remove the explicit 'snap_key' if present; now also sweep any other matching actives
@@ -2104,17 +2104,17 @@ class PodManager:
             # Best-effort: if /proc/<pid>/ns/net is gone, try empty NETNS (some plugins accept it)
             netns_for_del = netns_path if (netns_path and os.path.exists(netns_path)) else ""
             try:
-                print(f"[cleanup] CNI DEL network={network_name}, ifname={ifname}, netns={'present' if netns_for_del else 'missing'}")
+                logger.debug(f"[cleanup] CNI DEL network={network_name}, ifname={ifname}, netns={'present' if netns_for_del else 'missing'}")
                 self.cni.delete(network_name=network_name, container_id=pause_cid, netns_path=netns_for_del, ifname=ifname)
-                print("[cleanup] CNI released")
+                logger.debug("[cleanup] CNI released")
             except Exception as e:
-                print(f"[cleanup] CNI DEL warning: {e}")
+                logger.warning(f"[cleanup] CNI DEL warning: {e}", exc_info=True)
         else:
-            print("[cleanup] skip CNI DEL (missing pause cid or network name)")
+            logger.debug("[cleanup] skip CNI DEL (missing pause cid or network name)")
 
         # 3) Stop & delete the pause task/container
         if pause_cid:
-            print(f"[cleanup] stopping pause container: {pause_cid}")
+            logger.debug(f"[cleanup] stopping pause container: {pause_cid}")
             self.runtime.stop_and_delete_task(pause_cid)
 
         # 4) Remove the pause snapshot key (stored as pod['snapshot_key'])
@@ -2122,19 +2122,19 @@ class PodManager:
         if snap_key:
             try:
                 self.snaps._snap_remove_active(self._snapshotter_name(), snap_key)
-                print(f"[cleanup] removed pause snapshot key: {snap_key}")
+                logger.debug(f"[cleanup] removed pause snapshot key: {snap_key}")
             except Exception as e:
-                print(f"[cleanup] pause snapshot remove warning ({snap_key}): {e}")
+                logger.warning(f"[cleanup] pause snapshot remove warning ({snap_key}): {e}", exc_info=True)
 
         # 5) Sweep any remaining active snapshots for this pod (even if we lost individual keys)
         try:
             res = self.snaps.remove_active_by_label({"pod": pod["name"]})
             if res["removed"]:
-                print(f"[cleanup] removed active snapshots by label pod={pod['name']}: {res['removed']}")
+                logger.debug(f"[cleanup] removed active snapshots by label pod={pod['name']}: {res['removed']}")
             if res["kept"]:
-                print(f"[cleanup] could not remove some snapshots (likely parents/pinned): {res['kept']}")
+                logger.debug(f"[cleanup] could not remove some snapshots (likely parents/pinned): {res['kept']}")
         except Exception as e:
-            print(f"[cleanup] snapshot label sweep warning: {e}")
+            logger.warning(f"[cleanup] snapshot label sweep warning: {e}", exc_info=True)
 
 
 
@@ -2157,10 +2157,10 @@ class PodManager:
         # 1) CNI DEL (best-effort)
         try:
             netns = f"/proc/{pause_pid}/ns/net" if (pause_pid and os.path.exists(f"/proc/{pause_pid}")) else ""
-            print(f"[cleanup] CNI DEL network={cni_network} ifname={ifname} netns={'present' if netns else 'missing'}")
+            logger.debug(f"[cleanup] CNI DEL network={cni_network} ifname={ifname} netns={'present' if netns else 'missing'}")
             self.cni.delete(network_name=cni_network, container_id=pause_cid, netns_path=netns, ifname=ifname)
         except Exception as e:
-            print(f"[cleanup] CNI DEL warning: {e}")
+            logger.warning(f"[cleanup] CNI DEL warning: {e}", exc_info=True)
 
         # 2) Delete app containers/tasks first
         app_ids = self._guess_apps_by_prefix(namespace, pause_cid)
@@ -2428,5 +2428,5 @@ if __name__ == "__main__":
     pod_mgr = PodManager(client)
 
     status = pod_mgr.destroy_pod("testKCR", "ed726e5104bd4a32")
-    print(f"Print the status {status}")
+    logger.info(f"Status: {status}")
     #check_status = pod_mgr.runtime.prune_namespace("testKCR")

@@ -20,6 +20,12 @@ from utils.exceptions import (
     exception_to_http_exception
 )
 from utils.error_handlers import handle_async_errors, create_error_response, create_success_response
+from utils.celery.queue_utils import (
+    create_queue_info,
+    create_host_queue_info,
+    submit_celery_task,
+    extract_extra_kwargs
+)
 from typing import Optional, Dict, Any, Union, List
 import logging
 import jwt
@@ -136,12 +142,7 @@ if not SECRET_KEY:
     raise ValueError("SECRET_KEY is required!")
 
 # Queue Information
-aws_queue_info = {
-    'exchange': Exchange('secure_exchange', type='direct'),
-    'queue': ue.encode_hostname_with_key('aws_interface'),
-    'routing_key': ue.encode_hostname_with_key('aws_interface'),
-    'delivery_mode': 2
-}
+aws_queue_info = create_queue_info('aws_interface', utilities_extension=ue)
 
 
 # Models for request validation
@@ -241,18 +242,16 @@ class CleanupTasksByPodPrefixRequest(BaseModel):
 def _host_queue(host_name: str) -> Dict[str, Any]:
     """Create queue information dictionary for a host.
     
+    DEPRECATED: Use create_host_queue_info() from utils.celery.queue_utils instead.
+    This function is kept for backward compatibility.
+    
     Args:
         host_name: Name of the host
         
     Returns:
         Dictionary with exchange, queue, routing_key, and delivery_mode
     """
-    return {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(host_name),
-        'routing_key': ue.encode_hostname_with_key(host_name),
-        'delivery_mode': 2
-    }
+    return create_host_queue_info(host_name, ue)
 
 
 
@@ -454,44 +453,36 @@ async def create_instances(request: CreateInstanceRequest, user: str = Depends(g
         TaskSubmissionError: If task submission fails
         AuthenticationError: If authentication fails
     """
-    request_data = request.dict()
-    defined_fields = CreateInstanceRequest.__annotations__.keys()
+    request_data = request.model_dump()
+    defined_fields = set(CreateInstanceRequest.__annotations__.keys())
+    extra_kwargs = extract_extra_kwargs(request_data, defined_fields)
 
-    extra_kwargs = {k: v for k, v in request_data.items() if k not in defined_fields}
-
-    try:
-        # Submit the Celery create_worker_nodes task
-        task = create_worker_nodes.apply_async(
-            args=(
-                aws_config['aws_access_key_id'],
-                aws_config['aws_secret_access_key'],
-                aws_config['region'],
-                request.instance_type,
-                request.ami_id,
-                request.key_name,
-                request.security_group_ids,
-                request.subnet_id,
-                request.namespace,
-            ),
-            kwargs={
-                'MinCount': request.min_count,
-                'MaxCount': request.max_count,
-                **extra_kwargs
-            },
-            **aws_queue_info
-        )
-
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit create instances task",
-            error_code="CREATE_INSTANCES_TASK_ERROR",
-            details={"namespace": request.namespace, "instance_type": request.instance_type},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=create_worker_nodes,
+        args=(
+            aws_config['aws_access_key_id'],
+            aws_config['aws_secret_access_key'],
+            aws_config['region'],
+            request.instance_type,
+            request.ami_id,
+            request.key_name,
+            request.security_group_ids,
+            request.subnet_id,
+            request.namespace,
+        ),
+        kwargs={
+            'MinCount': request.min_count,
+            'MaxCount': request.max_count,
+            **extra_kwargs
+        },
+        queue_info=aws_queue_info,
+        operation_name="create_instances",
+        error_code="CREATE_INSTANCES_TASK_ERROR",
+        additional_data={
+            "namespace": request.namespace,
+            "instance_type": request.instance_type
+        }
+    )
 
 
 @log_to_file(logger)
@@ -584,42 +575,30 @@ async def terminate_namespace(request: TerminateInstanceRequest, user: str = Dep
         NotFoundError: If no instances found for namespace
         TaskSubmissionError: If task submission fails
     """
-    try:
-        # Fetch instance IDs to terminate from Redis
-        instances_to_terminate = rd.get_instance_ids_namespace(request.namespace)
+    # Fetch instance IDs to terminate from Redis
+    instances_to_terminate = rd.get_instance_ids_namespace(request.namespace)
 
-        if not instances_to_terminate:
-            raise NotFoundError(
-                message="No instances found for the given namespace",
-                error_code="NO_INSTANCES_FOUND",
-                details={"namespace": request.namespace}
-            )
-
-        # Submit the Celery terminate_worker_node task
-        task = terminate_worker_node.apply_async(
-            args=(
-                aws_config['aws_access_key_id'],
-                aws_config['aws_secret_access_key'],
-                aws_config['region'],
-                instances_to_terminate,
-            ),
-            **aws_queue_info
+    if not instances_to_terminate:
+        raise NotFoundError(
+            message="No instances found for the given namespace",
+            error_code="NO_INSTANCES_FOUND",
+            details={"namespace": request.namespace}
         )
 
-        # Return task status
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "instances_count": len(instances_to_terminate)}
-        )
-    except NotFoundError:
-        raise
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit terminate instances task",
-            error_code="TERMINATE_INSTANCES_TASK_ERROR",
-            details={"namespace": request.namespace},
-            cause=e
-        ) from e
+    # Submit the Celery terminate_worker_node task
+    return submit_celery_task(
+        task=terminate_worker_node,
+        args=(
+            aws_config['aws_access_key_id'],
+            aws_config['aws_secret_access_key'],
+            aws_config['region'],
+            instances_to_terminate,
+        ),
+        queue_info=aws_queue_info,
+        operation_name="terminate_namespace",
+        error_code="TERMINATE_INSTANCES_TASK_ERROR",
+        additional_data={"instances_count": len(instances_to_terminate)}
+    )
 
 
 @log_to_file(logger)
@@ -806,28 +785,15 @@ async def get_worker_node_data(request: HostName, user: str = Depends(get_curren
     Returns:
         Success response with task ID
     """
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    try:
-        task = get_worker_node_info.apply_async(
-            args=(),
-            **host_queue_info
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "host_name": request.host_name}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit get worker node data task",
-            error_code="GET_WORKER_NODE_DATA_ERROR",
-            details={"host_name": request.host_name},
-            cause=e
-        ) from e
+    host_queue_info = create_host_queue_info(request.host_name, ue)
+    
+    return submit_celery_task(
+        task=get_worker_node_info,
+        queue_info=host_queue_info,
+        operation_name="get_worker_node_data",
+        error_code="GET_WORKER_NODE_DATA_ERROR",
+        additional_data={"host_name": request.host_name}
+    )
 
 
 @log_to_file(logger)
@@ -869,28 +835,15 @@ async def get_worker_node_ip(request: HostName, user: str = Depends(get_current_
     Returns:
         Success response with task ID
     """
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    try:
-        task = get_host_ip.apply_async(
-            args=(),
-            **host_queue_info
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "host_name": request.host_name}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit get worker node IP task",
-            error_code="GET_WORKER_NODE_IP_ERROR",
-            details={"host_name": request.host_name},
-            cause=e
-        ) from e
+    host_queue_info = create_host_queue_info(request.host_name, ue)
+    
+    return submit_celery_task(
+        task=get_host_ip,
+        queue_info=host_queue_info,
+        operation_name="get_worker_node_ip",
+        error_code="GET_WORKER_NODE_IP_ERROR",
+        additional_data={"host_name": request.host_name}
+    )
 
 
 @log_to_file(logger)
@@ -941,28 +894,15 @@ async def get_worker_usage_data(request: HostName, user: str = Depends(get_curre
     Returns:
         Success response with task ID
     """
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
-    try:
-        task = get_usage.apply_async(
-            args=(),
-            **host_queue_info
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "host_name": request.host_name}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit get worker usage data task",
-            error_code="GET_WORKER_USAGE_DATA_ERROR",
-            details={"host_name": request.host_name},
-            cause=e
-        ) from e
+    host_queue_info = create_host_queue_info(request.host_name, ue)
+    
+    return submit_celery_task(
+        task=get_usage,
+        queue_info=host_queue_info,
+        operation_name="get_worker_usage_data",
+        error_code="GET_WORKER_USAGE_DATA_ERROR",
+        additional_data={"host_name": request.host_name}
+    )
 
 
 @log_to_file(logger)
@@ -1049,57 +989,33 @@ async def create_pods(request: CreatePodsRequest,user: str = Depends(get_current
         TaskSubmissionError: If task submission fails
         ValidationError: If request validation fails
     """
-    host_queue_info = {
-        'exchange': Exchange('secure_exchange', type='direct'),
-        'queue': ue.encode_hostname_with_key(request.host_name),
-        'routing_key': ue.encode_hostname_with_key(request.host_name),
-        'delivery_mode': 2
-    }
+    host_queue_info = create_host_queue_info(request.host_name, ue)
     logger.info(f"Inside create_pods")
 
-
-    #containers_payload = [c.model_dump(mode="json") for c in request.containers]
     containers_payload = [c.model_dump() for c in request.containers]
-
-
-    extra_kwargs = {
-        k: v for k, v in request.model_dump().items()
-        if k not in CreatePodsRequest.__annotations__.keys()
-    } or {"host_name": request.host_name}
-    #containers_payload  =  containers_payload.to_dict()
     namespace = request.namespace
 
-    try:
-        task = create_pod_task.apply_async(
-            args=(containers_payload, namespace),
-            kwargs={
+    request_data = request.model_dump()
+    defined_fields = set(CreatePodsRequest.__annotations__.keys())
+    extra_kwargs = extract_extra_kwargs(request_data, defined_fields)
+    extra_kwargs = extra_kwargs or {"host_name": request.host_name}
+
+    return submit_celery_task(
+        task=create_pod_task,
+        args=(containers_payload, namespace),
+        kwargs={
             "host_name": request.host_name,
-            # any extra kwargs you want to flow to the task (must be JSON-safe)
-            # "cni_network": "calico",
-            # "cni_ifname": "eth0",
+            **extra_kwargs
         },
-            **host_queue_info
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={
-                "task_id": task.id,
-                "host_name": request.host_name,
-                "namespace": namespace,
-                "containers_count": len(containers_payload)
-            }
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit create pods task",
-            error_code="CREATE_PODS_TASK_ERROR",
-            details={
-                "host_name": request.host_name,
-                "namespace": namespace,
-                "containers_count": len(containers_payload)
-            },
-            cause=e
-        ) from e
+        queue_info=host_queue_info,
+        operation_name="create_pods",
+        error_code="CREATE_PODS_TASK_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": namespace,
+            "containers_count": len(containers_payload)
+        }
+    )
 
 
 @log_to_file(logger)
@@ -1144,22 +1060,13 @@ async def list_namespaces_and_pods_api(request: ContainerdHostRequest, user: str
     Returns:
         Success response with task ID
     """
-    try:
-        task = list_namespaces_and_pods_task.apply_async(
-            args=(),
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "host_name": request.host_name}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit list namespaces and pods task",
-            error_code="LIST_NAMESPACES_PODS_ERROR",
-            details={"host_name": request.host_name},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=list_namespaces_and_pods_task,
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="list_namespaces_and_pods",
+        error_code="LIST_NAMESPACES_PODS_ERROR",
+        additional_data={"host_name": request.host_name}
+    )
 
 @log_to_file(logger)
 @app.post(
@@ -1204,22 +1111,17 @@ async def list_namespaces_and_pods_api(request: PodNamespaceHostRequest, user: s
     Returns:
         Success response with task ID
     """
-    try:
-        task = list_pods_by_namespace_task.apply_async(
-            args=([request.namespace]),
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "host_name": request.host_name, "namespace": request.namespace}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit list pods by namespace task",
-            error_code="LIST_PODS_BY_NAMESPACE_ERROR",
-            details={"host_name": request.host_name, "namespace": request.namespace},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=list_pods_by_namespace_task,
+        args=([request.namespace],),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="list_pods_by_namespace",
+        error_code="LIST_PODS_BY_NAMESPACE_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace
+        }
+    )
 
 
 
@@ -1272,26 +1174,22 @@ async def terminate_pod_api(request: TerminatePodRequest, user: str = Depends(ge
     Returns:
         Success response with task ID
     """
-    try:
-        task = terminate_pod_task.apply_async(
-            args=(request.namespace, request.pod_name),
-            kwargs={
-                "cni_network": request.cni_network,
-                "ifname": request.ifname,
-            },
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "pod_name": request.pod_name, "namespace": request.namespace}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit terminate pod task",
-            error_code="TERMINATE_POD_ERROR",
-            details={"host_name": request.host_name, "namespace": request.namespace, "pod_name": request.pod_name},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=terminate_pod_task,
+        args=(request.namespace, request.pod_name),
+        kwargs={
+            "cni_network": request.cni_network,
+            "ifname": request.ifname,
+        },
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="terminate_pod",
+        error_code="TERMINATE_POD_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace,
+            "pod_name": request.pod_name
+        }
+    )
 
 
 @log_to_file(logger)
@@ -1331,23 +1229,22 @@ async def terminate_pod_by_pause_cid_api(request: TerminatePodByCidRequest, user
     Returns:
         Success response with task ID
     """
-    try:
-        task = terminate_pod_by_pause_cid_task.apply_async(
-            args=(request.namespace, request.pause_cid),
-            kwargs={
-                "cni_network": request.cni_network,
-                "ifname": request.ifname,
-            },
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "pause_cid": request.pause_cid, "namespace": request.namespace}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit terminate pod by pause CID task",
-            error_code="TERMINATE_POD_BY_CID_ERROR",
+    return submit_celery_task(
+        task=terminate_pod_by_pause_cid_task,
+        args=(request.namespace, request.pause_cid),
+        kwargs={
+            "cni_network": request.cni_network,
+            "ifname": request.ifname,
+        },
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="terminate_pod_by_pause_cid",
+        error_code="TERMINATE_POD_BY_CID_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace,
+            "pause_cid": request.pause_cid
+        }
+    )
             details={"host_name": request.host_name, "namespace": request.namespace, "pause_cid": request.pause_cid},
             cause=e
         ) from e
@@ -1388,24 +1285,17 @@ async def destroy_all_pods_api(request: DestroyAllPodsRequest, user: str = Depen
     Returns:
         Success response with task ID
     """
-    try:
-        task = destroy_all_pods_task.apply_async(
-            args=(request.namespace,),
-            kwargs={
-            },
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "namespace": request.namespace}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit destroy all pods task",
-            error_code="DESTROY_ALL_PODS_ERROR",
-            details={"host_name": request.host_name, "namespace": request.namespace},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=destroy_all_pods_task,
+        args=(request.namespace,),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="destroy_all_pods",
+        error_code="DESTROY_ALL_PODS_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace
+        }
+    )
 
 
 @log_to_file(logger)
@@ -1441,22 +1331,18 @@ async def destroy_container_api(request: DestroyContainerRequest, user: str = De
     Returns:
         Success response with task ID
     """
-    try:
-        task = destroy_container_by_id_task.apply_async(
-            args=(request.namespace, request.cid),
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "container_id": request.cid, "namespace": request.namespace}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit destroy container task",
-            error_code="DESTROY_CONTAINER_ERROR",
-            details={"host_name": request.host_name, "namespace": request.namespace, "container_id": request.cid},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=destroy_container_by_id_task,
+        args=(request.namespace, request.cid),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="destroy_container",
+        error_code="DESTROY_CONTAINER_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace,
+            "container_id": request.cid
+        }
+    )
 
 
 @log_to_file(logger)
@@ -1494,22 +1380,17 @@ async def purge_stopped_api(request: PurgeStoppedRequest, user: str = Depends(ge
     Returns:
         Success response with task ID
     """
-    try:
-        task = purge_stopped_tasks_and_containers_task.apply_async(
-            args=(request.namespace,),
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "namespace": request.namespace}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit purge stopped task",
-            error_code="PURGE_STOPPED_ERROR",
-            details={"host_name": request.host_name, "namespace": request.namespace},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=purge_stopped_tasks_and_containers_task,
+        args=(request.namespace,),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="purge_stopped",
+        error_code="PURGE_STOPPED_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace
+        }
+    )
 
 
 @log_to_file(logger)
@@ -1548,23 +1429,19 @@ async def prune_namespace_api(request: PruneNamespaceRequest, user: str = Depend
     Returns:
         Success response with task ID
     """
-    try:
-        task = prune_namespace_task.apply_async(
-            args=(request.namespace,),
-            kwargs={"aggressive": request.aggressive},
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "namespace": request.namespace, "aggressive": request.aggressive}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit prune namespace task",
-            error_code="PRUNE_NAMESPACE_ERROR",
-            details={"host_name": request.host_name, "namespace": request.namespace, "aggressive": request.aggressive},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=prune_namespace_task,
+        args=(request.namespace,),
+        kwargs={"aggressive": request.aggressive},
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="prune_namespace",
+        error_code="PRUNE_NAMESPACE_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace,
+            "aggressive": request.aggressive
+        }
+    )
 
 
 @log_to_file(logger)
@@ -1603,22 +1480,18 @@ async def get_container_info_api(request: ContainerInfoRequest, user: str = Depe
     Returns:
         Success response with task ID
     """
-    try:
-        task = get_container_info_task.apply_async(
-            args=(request.namespace, request.cid),
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "container_id": request.cid, "namespace": request.namespace}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit get container info task",
-            error_code="GET_CONTAINER_INFO_ERROR",
-            details={"host_name": request.host_name, "namespace": request.namespace, "container_id": request.cid},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=get_container_info_task,
+        args=(request.namespace, request.cid),
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="get_container_info",
+        error_code="GET_CONTAINER_INFO_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace,
+            "container_id": request.cid
+        }
+    )
 
 
 @log_to_file(logger)
@@ -1669,23 +1542,19 @@ async def cleanup_tasks_by_pod_prefix_api(request: CleanupTasksByPodPrefixReques
     Returns:
         Success response with task ID
     """
-    try:
-        task = cleanup_tasks_by_pod_prefix_task.apply_async(
-            args=(request.namespace, request.pod_id),
-            kwargs={"prefer_grpc": request.prefer_grpc},
-            **_host_queue(request.host_name)
-        )
-        return create_success_response(
-            message="Task submitted successfully",
-            data={"task_id": task.id, "pod_id": request.pod_id, "namespace": request.namespace}
-        )
-    except Exception as e:
-        raise TaskSubmissionError(
-            message="Failed to submit cleanup tasks by pod prefix task",
-            error_code="CLEANUP_TASKS_BY_POD_PREFIX_ERROR",
-            details={"host_name": request.host_name, "namespace": request.namespace, "pod_id": request.pod_id},
-            cause=e
-        ) from e
+    return submit_celery_task(
+        task=cleanup_tasks_by_pod_prefix_task,
+        args=(request.namespace, request.pod_id),
+        kwargs={"prefer_grpc": request.prefer_grpc},
+        queue_info=create_host_queue_info(request.host_name, ue),
+        operation_name="cleanup_tasks_by_pod_prefix",
+        error_code="CLEANUP_TASKS_BY_POD_PREFIX_ERROR",
+        additional_data={
+            "host_name": request.host_name,
+            "namespace": request.namespace,
+            "pod_id": request.pod_id
+        }
+    )
 
 
 
@@ -1709,8 +1578,12 @@ async def cleanup_tasks_by_pod_prefix_api(request: CleanupTasksByPodPrefixReques
 #         logger.error(f"Error submitting get_usage task: {e}")
 #         raise HTTPException(status_code=500, detail="Failed to submit task") from e
 
-if __name__ == "__main__":
+def run_server():
+    """Entry point for running the Dibba API server."""
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+if __name__ == "__main__":
+    run_server()
 

@@ -1,4 +1,7 @@
 import random
+from logpkg.log_kcld import LogKCld
+
+logger = LogKCld()
 
 
 def distribute_pods(nodes, applications) -> list[dict]:
@@ -14,21 +17,21 @@ def distribute_pods(nodes, applications) -> list[dict]:
     """
 
     if not isinstance(nodes, int) or nodes <= 0:
-        print("Error: Number of nodes must be a positive integer.")
+        logger.error("Error: Number of nodes must be a positive integer.")
         return None
     if not isinstance(applications, dict) or not applications:
-        print("Error: Applications must be a non-empty dictionary.")
+        logger.error("Error: Applications must be a non-empty dictionary.")
         return None
     for quantity in applications.values():
         if not isinstance(quantity, int) or quantity < 0:
-            print("Error: Pod quantities must be non-negative integers.")
+            logger.error("Error: Pod quantities must be non-negative integers.")
             return None
 
     distributed_nodes = [{} for _ in range(nodes)]
     total_pods = sum(applications.values())
 
     if total_pods < nodes:
-        print("Warning: There are fewer pods than nodes. Some nodes will be empty or have less variety.")
+        logger.warning("There are fewer pods than nodes. Some nodes will be empty or have less variety.")
 
     # Calculate target number of applications per node
     target_per_node = total_pods // nodes
@@ -68,6 +71,6 @@ distributed_result = distribute_pods(num_nodes, pods)
 
 if distributed_result:
     for i, node in enumerate(distributed_result):
-        print(f"node {i + 1}: {node} (Total: {sum(node.values())})")
+        logger.info(f"node {i + 1}: {node} (Total: {sum(node.values())})")
 
 # need to add logic to use coin based greedy algorthm for distributing based on resources

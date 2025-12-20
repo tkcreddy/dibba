@@ -1,0 +1,35 @@
+# Include README and documentation
+include README.md
+include LICENSE
+include requirements.txt
+include pytest.ini
+include .coveragerc
+
+# Include all markdown files
+recursive-include *.md
+
+# Include configuration files
+recursive-include config *.json
+recursive-include config *.yaml
+recursive-include config *.yml
+
+# Include proto files
+recursive-include *.proto
+
+# Include shell scripts
+recursive-include scripts *.sh
+
+# Include test files (optional, for development)
+recursive-include tests *.py
+
+# Exclude unnecessary files
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude *.log
+global-exclude venv
+global-exclude .venv
+global-exclude archive
+global-exclude *.egg-info
+

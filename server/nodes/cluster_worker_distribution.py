@@ -1,9 +1,14 @@
+from logpkg.log_kcld import LogKCld
+
+logger = LogKCld()
+
+
 class ClusterWorkerDistribution:
     def __init__(self, worker_nodes: list[dict[str, int]], cluster_infos: dict[str, dict[str, int]]) -> None:
         if not isinstance(worker_nodes, list) or not worker_nodes:
-            print("Error: Worker nodes must be a non-empty list.")
+            logger.error("Error: Worker nodes must be a non-empty list.")
         if not isinstance(cluster_infos, dict) or not cluster_infos:
-            print("Error: cluster_info must be a non-empty dictionary.")
+            logger.error("Error: cluster_info must be a non-empty dictionary.")
         self.worker_nodes = worker_nodes
         self.cluster_infos = cluster_infos
 
@@ -23,23 +28,23 @@ class ClusterWorkerDistribution:
         """
         for node in self.worker_nodes:
             if not isinstance(node, dict) or "cpu" not in node or "memory" not in node:
-                print("Error: Each worker node must have 'cpu' and 'memory' keys")
+                logger.error("Error: Each worker node must have 'cpu' and 'memory' keys")
                 return None
             if not isinstance(node["cpu"], (int, float)) or node["cpu"] < 0 or not isinstance(node["memory"],
                                                                                               (int, float)) or node[
                 "memory"] < 0:
-                print("Error: Worker node cpu and memory must be non-negative numbers")
+                logger.error("Error: Worker node cpu and memory must be non-negative numbers")
                 return None
 
         for service in self.cluster_infos.values():
             if not isinstance(service,
                               dict) or "cpu" not in service or "memory" not in service or "instances" not in service:
-                print("Error: Each cluster inf must have 'cpu', 'memory' and 'instances' keys")
+                logger.error("Error: Each cluster inf must have 'cpu', 'memory' and 'instances' keys")
                 return None
             if not isinstance(service["cpu"], (int, float)) or service["cpu"] < 0 or not isinstance(service["memory"],
                                                                                                     (int, float)) or \
                     service["memory"] < 0 or not isinstance(service["instances"], int) or service["instances"] <= 0:
-                print(
+                logger.error(
                     "Error: Microservice cpu, memory must be non-negative numbers and instances must be positive integer")
                 return None
 
@@ -58,10 +63,10 @@ class ClusterWorkerDistribution:
                              self.cluster_infos.items()}
         total_memory_per_cluster = {cluster_info: values['memory'] * values['instances'] for cluster_info, values in
                                 self.cluster_infos.items()}
-        print(total_memory_per_cluster,total_cpu_per_cluster)
+        logger.debug(f"Total memory per cluster: {total_memory_per_cluster}, Total CPU per cluster: {total_cpu_per_cluster}")
         total_memory_need=sum(total_memory_per_cluster.values())
         total_cpus_need=sum(total_cpu_per_cluster.values())
-        print(total_worker_cpu,total_worker_memory,total_cpus_need,total_memory_need)
+        logger.debug(f"Total worker CPU: {total_worker_cpu}, Total worker memory: {total_worker_memory}, Total CPUs needed: {total_cpus_need}, Total memory needed: {total_memory_need}")
         # Create a list of all cluster instances to distribute
         all_instances = []
         for cluster_name, requirements in self.cluster_infos.items():
@@ -74,7 +79,7 @@ class ClusterWorkerDistribution:
         #                               'memory'], reverse=True)
         # Sort cluster by their  combined  resource requirements in descending order.
         sorted_instances = sorted(all_instances,key=lambda  item: total_cpu_per_cluster[item[0]] + total_memory_per_cluster[item[0]], reverse=True)
-        print(sorted_instances)
+        logger.debug(f"Sorted instances: {sorted_instances}")
         for service_name, instance_num in sorted_instances:
             requirements = self.cluster_infos[service_name]
             #print(requirements)
@@ -99,8 +104,8 @@ class ClusterWorkerDistribution:
             if best_node != -1:
                 distribution[best_node].append((service_name, instance_num))
             else:
-                print(
-                    f"Warning: Could not place instance {instance_num} of microservice {service_name}. Insufficient resources on all nodes. As requested CPUs are {total_cpus_need} available cpus are {total_worker_cpu} and Memoru need is {total_memory_need} and available is {total_worker_memory}")
+                logger.warning(
+                    f"Could not place instance {instance_num} of microservice {service_name}. Insufficient resources on all nodes. As requested CPUs are {total_cpus_need} available cpus are {total_worker_cpu} and Memory need is {total_memory_need} and available is {total_worker_memory}")
                 #return None
                 ##awsInterface=AwsInterface()
         return distribution
@@ -125,10 +130,10 @@ def main():
     #print(distribution)
     if distribution:
         for node_index, services in distribution.items():
-            print(f"Node {node_index + 1}: {services}")
+            logger.info(f"Node {node_index + 1}: {services}")
             node_cpu_usage = sum(microservices[s]['cpu'] for s, _ in services if s in microservices)
             node_mem_usage = sum(microservices[s]['memory'] for s, _ in services if s in microservices)
-            print(
+            logger.info(
                 f"  CPU Usage: {node_cpu_usage}/{worker_nodes[node_index]['cpu']}, Memory Usage: {node_mem_usage}/{worker_nodes[node_index]['memory']}")
 
     # Example where a service cannot be placed.
