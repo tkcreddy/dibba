@@ -23,6 +23,11 @@ import signal
 from utils.ReadConfig import ReadConfig as rc
 from logpkg.log_kcld import LogKCld, log_to_file
 from typing import Union
+import base64
+import urllib.request
+import urllib.error
+import urllib.parse
+
 
 from google.protobuf import any_pb2
 from google.protobuf.json_format import ParseDict
@@ -67,7 +72,7 @@ _STATUS_MAP = {
 
 # ---------- Config ----------
 CONTAINERD_SOCKET = "unix:///run/containerd/containerd.sock"
-NAMESPACE = os.environ.get("CONTAINERD_NAMESPACE", "k8s.io")
+NAMESPACE = os.environ.get("CONTAINERD_NAMESPACE", "default")
 DEFAULT_SNAPSHOTTER = os.environ.get("CONTAINERD_SNAPSHOTTER", "overlayfs")
 OCI_SPEC_TYPEURL = "types.containerd.io/opencontainers/runtime-spec/1/Spec"
 
@@ -83,6 +88,18 @@ OCI_MANIF   = "application/vnd.oci.image.manifest.v1+json"
 DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
 DOCKER_MAN  = "application/vnd.docker.distribution.manifest.v2+json"
 ANNOTATION_UNCOMPRESSED = "containerd.io/uncompressed"
+
+
+# Registry media types we accept
+MT_OCI_INDEX   = "application/vnd.oci.image.index.v1+json"
+MT_OCI_MANIF   = "application/vnd.oci.image.manifest.v1+json"
+MT_DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
+MT_DOCKER_MAN  = "application/vnd.docker.distribution.manifest.v2+json"
+
+ACCEPT_MANIFEST = ", ".join([MT_OCI_INDEX, MT_OCI_MANIF, MT_DOCKER_LIST, MT_DOCKER_MAN])
+
+
+
 
 @log_to_file(logger)
 def _status_to_str(v):
@@ -236,8 +253,8 @@ def _is_manifest(mt: str) -> bool:
     return mt.endswith("image.manifest.v1+json") or mt == DOCKER_MAN
 
 @log_to_file(logger)
-def ns_md(extra=None) -> Tuple[Tuple[str,str], ...]:
-    md = [("containerd-namespace", NAMESPACE)]
+def ns_md(namespace: str|None,extra=None) -> Tuple[Tuple[str,str], ...]:
+    md = [("containerd-namespace", namespace)]
     if extra:
         md.extend(extra)
     return tuple(md)
@@ -267,11 +284,18 @@ def _candidates_for_ref(ref: str) -> List[str]:
     out.add(ref.replace("k8s.gcr.io/", "registry.k8s.io/"))
     return list(out)
 
-@log_to_file(logger)
-def _read_blob_json(content_stub, digest: str, extra_md=None) -> dict:
-    stream = content_stub.Read(content_pb2.ReadContentRequest(digest=digest))
+# @log_to_file(logger)
+# def _read_blob_json(content_stub, digest: str, extra_md=None) -> dict:
+#     stream = content_stub.Read(content_pb2.ReadContentRequest(digest=digest))
+#     data = b"".join(part.data for part in stream if part.data)
+#     return json.loads(data.decode("utf-8"))
+
+def _read_blob_json(content_stub, digest: str, md):
+    req = content_pb2.ReadContentRequest(digest=digest)
+    stream = content_stub.Read(req, metadata=md)  # <- MUST include namespace
     data = b"".join(part.data for part in stream if part.data)
     return json.loads(data.decode("utf-8"))
+
 
 @log_to_file(logger)
 def _compute_chain_id(diff_ids: List[str]) -> str:
@@ -326,6 +350,317 @@ def _mcores_to_shares(millicores: int) -> int:
     shares = int(1024 * (millicores / 1000.0))
     return max(2, shares)
 
+@log_to_file(logger)
+def _content_exists(content_stub, digest: str) -> bool:
+    try:
+        content_stub.Info(content_pb2.InfoRequest(digest=digest))
+        return True
+    except grpc.RpcError as e:
+        if e.code() == grpc.StatusCode.NOT_FOUND:
+            return False
+        raise
+
+@log_to_file(logger)
+def _split_image_ref(ref: str) -> tuple[str, str, str]:
+    """
+    Return (registry, repo, reference) where reference is tag or digest.
+    Very small parser:
+      docker.io/library/nginx:latest -> registry=docker.io repo=library/nginx reference=latest
+      registry.k8s.io/pause:3.9     -> registry=registry.k8s.io repo=pause reference=3.9
+      docker.io/library/alpine@sha256:... -> reference=sha256:...
+    """
+    # normalize docker hub short names
+    if "://" in ref:
+        ref = ref.split("://", 1)[1]
+
+    parts = ref.split("/")
+    if len(parts) == 1:
+        registry = "docker.io"
+        repo = f"library/{parts[0]}"
+    else:
+        first = parts[0]
+        if "." in first or ":" in first or first == "localhost":
+            registry = first
+            repo = "/".join(parts[1:])
+        else:
+            registry = "docker.io"
+            repo = "/".join(parts)
+
+    reference = "latest"
+    if "@" in repo:
+        repo, reference = repo.split("@", 1)
+    elif ":" in repo.split("/")[-1]:
+        # tag form: repo:tag but colon is in last segment
+        repo, reference = repo.rsplit(":", 1)
+
+    return registry, repo, reference
+
+@log_to_file(logger)
+def _list_namespaces(client: "ContainerdClient") -> list[str]:
+    """
+    Return namespaces known to containerd (best-effort).
+    """
+    try:
+        resp = client.namespaces.List(namespace_pb2.ListNamespacesRequest())
+        items = getattr(resp, "namespaces", None) or getattr(resp, "items", None) or []
+        out = [n.name for n in items if getattr(n, "name", None)]
+        # keep stable order
+        return sorted(set(out))
+    except Exception:
+        # conservative fallback
+        return ["k8s.io", "default", "moby"]
+
+
+
+
+
+@log_to_file(logger)
+def _find_image_in_any_namespace(
+    socket: str,
+    image_ref: str,
+    candidates: list[str] | None = None,
+    skip: set[str] | None = None,
+    probe_namespace: str | None = None,   # <-- add
+) -> tuple[str | None, str | None]:
+    """
+    Find (namespace, resolved_name) where Images.Get works for image_ref.
+    Returns (None, None) if not found anywhere.
+    """
+    skip = skip or set()
+    # candidates: if caller doesn't provide, use ref variants
+    cand_refs = candidates or _candidates_for_ref(image_ref)
+
+    # We need SOME client to list namespaces; use env default first.
+    probe_client = ContainerdClient(socket=socket, namespace=NAMESPACE)
+    namespaces = _list_namespaces(probe_client)
+
+    # Scan: try each namespace, and for each candidate ref try Images.Get
+    for ns in namespaces:
+        if ns in skip:
+            continue
+        c = ContainerdClient(socket=socket, namespace=ns)
+        for cand in cand_refs:
+            try:
+                c.images.Get(images_pb2.GetImageRequest(name=cand))
+                return ns, cand
+            except grpc.RpcError as e:
+                if e.code() != grpc.StatusCode.NOT_FOUND:
+                    # If containerd returns another error, bubble it up; it's not "not found"
+                    raise
+            except Exception:
+                # ignore and continue scanning
+                pass
+
+    return None, None
+
+
+@log_to_file(logger)
+def _import_image_record_namespace_to_namespace(
+    socket: str,
+    src_ns: str,
+    dst_ns: str,
+    image_name_in_src: str,
+    dst_name: str | None = None,
+) -> str:
+    """
+    Copy an Image record (name + target descriptor) from src_ns to dst_ns.
+    Returns the name used in dst namespace.
+    """
+    dst_name = dst_name or image_name_in_src
+
+    src = ContainerdClient(socket=socket, namespace=src_ns)
+    dst = ContainerdClient(socket=socket, namespace=dst_ns)
+
+    img = src.images.Get(images_pb2.GetImageRequest(name=image_name_in_src)).image
+    _images_create_or_update(dst.images, dst_name, img.target)
+    return dst_name
+
+
+
+class NamespaceInterceptor(
+    grpc.UnaryUnaryClientInterceptor,
+    grpc.UnaryStreamClientInterceptor,
+    grpc.StreamUnaryClientInterceptor,
+    grpc.StreamStreamClientInterceptor,
+):
+    def __init__(self, namespace: str):
+        self.namespace = namespace
+
+    def _augment(self, client_call_details):
+        md = []
+        if client_call_details.metadata is not None:
+            md = list(client_call_details.metadata)
+        md.append(("containerd-namespace", self.namespace))
+
+        return client_call_details._replace(metadata=md)
+
+    def intercept_unary_unary(self, continuation, client_call_details, request):
+        return continuation(self._augment(client_call_details), request)
+
+    def intercept_unary_stream(self, continuation, client_call_details, request):
+        return continuation(self._augment(client_call_details), request)
+
+    def intercept_stream_unary(self, continuation, client_call_details, request_iterator):
+        return continuation(self._augment(client_call_details), request_iterator)
+
+    def intercept_stream_stream(self, continuation, client_call_details, request_iterator):
+        return continuation(self._augment(client_call_details), request_iterator)
+
+
+
+class RegistryV2Client:
+    """
+    Minimal Docker Registry v2 client that supports:
+      - GET manifest (tag or digest)
+      - GET blob
+    Supports Bearer token challenge and Basic auth if provided.
+    """
+
+    @log_to_file(logger)
+    def __init__(self, registry: str, username: str | None = None, password: str | None = None):
+        self.registry = registry
+        self.username = username
+        self.password = password
+        self._bearer_token_cache: dict[str, str] = {}  # scope -> token
+
+    @log_to_file(logger)
+    def _basic_auth_header(self) -> str | None:
+        if self.username is None or self.password is None:
+            return None
+        raw = f"{self.username}:{self.password}".encode("utf-8")
+        return "Basic " + base64.b64encode(raw).decode("utf-8")
+
+    @log_to_file(logger)
+    def _request(self, method: str, url: str, headers: dict[str, str], data: bytes | None = None) -> tuple[int, dict, bytes]:
+        req = urllib.request.Request(url, data=data, method=method)
+        for k, v in headers.items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read()
+                return resp.status, dict(resp.headers), body
+        except urllib.error.HTTPError as e:
+            body = e.read() if hasattr(e, "read") else b""
+            return e.code, dict(e.headers), body
+
+    @log_to_file(logger)
+    def _parse_www_authenticate(self, header_val: str) -> dict[str, str]:
+        # Bearer realm="...",service="...",scope="..."
+        out = {}
+        if not header_val:
+            return out
+        # split scheme + params
+        try:
+            scheme, rest = header_val.split(" ", 1)
+        except ValueError:
+            return out
+        out["scheme"] = scheme
+        for part in rest.split(","):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                out[k.strip()] = v.strip().strip('"')
+        return out
+
+    @log_to_file(logger)
+    def _get_bearer_token(self, realm: str, service: str | None, scope: str | None) -> str | None:
+        cache_key = scope or ""
+        if cache_key in self._bearer_token_cache:
+            return self._bearer_token_cache[cache_key]
+
+        qs = {}
+        if service:
+            qs["service"] = service
+        if scope:
+            qs["scope"] = scope
+        url = realm + ("?" + urllib.parse.urlencode(qs) if qs else "")
+
+        headers = {}
+        basic = self._basic_auth_header()
+        if basic:
+            headers["Authorization"] = basic
+
+        code, _, body = self._request("GET", url, headers=headers)
+        if code != 200:
+            return None
+        try:
+            j = json.loads(body.decode("utf-8"))
+            tok = j.get("token") or j.get("access_token")
+            if tok:
+                self._bearer_token_cache[cache_key] = tok
+            return tok
+        except Exception:
+            return None
+
+    @log_to_file(logger)
+    def _authed_get(self, url: str, headers: dict[str, str], scope: str | None) -> tuple[int, dict, bytes]:
+        # 1) try without token (or with Basic if set)
+        h = dict(headers)
+        basic = self._basic_auth_header()
+        if basic:
+            h["Authorization"] = basic
+
+        code, resp_h, body = self._request("GET", url, headers=h)
+        if code != 401:
+            return code, resp_h, body
+
+        # 2) bearer challenge
+        wa = resp_h.get("Www-Authenticate") or resp_h.get("WWW-Authenticate") or ""
+        parsed = self._parse_www_authenticate(wa)
+        if parsed.get("scheme", "").lower() != "bearer":
+            return code, resp_h, body
+
+        realm = parsed.get("realm")
+        service = parsed.get("service")
+        # if server didn't include scope, use our requested one
+        chal_scope = parsed.get("scope") or scope
+        if not realm:
+            return code, resp_h, body
+
+        token = self._get_bearer_token(realm, service, chal_scope)
+        if not token:
+            return code, resp_h, body
+
+        h2 = dict(headers)
+        h2["Authorization"] = f"Bearer {token}"
+        return self._request("GET", url, headers=h2)
+
+    @log_to_file(logger)
+    def get_manifest(self, repo: str, reference: str) -> tuple[dict, str]:
+        url = f"https://{self.registry}/v2/{repo}/manifests/{reference}"
+        headers = {"Accept": ACCEPT_MANIFEST}
+        scope = f"repository:{repo}:pull"
+        code, resp_h, body = self._authed_get(url, headers, scope)
+        if code != 200:
+            raise RuntimeError(f"manifest fetch failed {code} for {self.registry}/{repo}:{reference}: {body[:200]!r}")
+        mt = (resp_h.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+        j = json.loads(body.decode("utf-8"))
+        return j, mt
+
+    @log_to_file(logger)
+    def get_manifest_with_headers(self, repo: str, reference: str) -> tuple[dict, str, dict, bytes]:
+        url = f"https://{self.registry}/v2/{repo}/manifests/{reference}"
+        headers = {"Accept": ACCEPT_MANIFEST}
+        scope = f"repository:{repo}:pull"
+        code, resp_h, body = self._authed_get(url, headers, scope)
+        if code != 200:
+            raise RuntimeError(f"manifest fetch failed {code} for {self.registry}/{repo}:{reference}: {body[:200]!r}")
+        mt = (resp_h.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+        j = json.loads(body.decode("utf-8"))
+        return j, mt, resp_h, body
+
+    @log_to_file(logger)
+    def get_blob(self, repo: str, digest: str) -> bytes:
+        url = f"https://{self.registry}/v2/{repo}/blobs/{digest}"
+        headers = {}
+        scope = f"repository:{repo}:pull"
+        code, _, body = self._authed_get(url, headers, scope)
+        if code != 200:
+            raise RuntimeError(f"blob fetch failed {code} for {self.registry}/{repo} {digest}: {body[:200]!r}")
+        return body
+
+
+
 @dataclass
 class ContainerSpec:
     name: str
@@ -334,14 +669,104 @@ class ContainerSpec:
     env: Dict[str, str] = field(default_factory=dict)
     resources: Optional[ResourceSpec] = None
 
+@log_to_file(logger)
+def _content_write_and_commit(content_stub, digest: str, data: bytes, labels: dict | None = None):
+    """
+    Stream blob to containerd content store:
+      - WRITE frames with correct offsets
+      - COMMIT frame includes expected + total + offset=total
+    """
+    if _blob_exists(content_stub, digest):
+        return
+
+    CHUNK = 1024 * 1024
+    total = len(data)
+    ref = f"ref-{digest.replace(':', '-')}-{uuid.uuid4().hex[:8]}"
+
+    WriteReq = content_pb2.WriteContentRequest
+    WriteAction = content_pb2.WriteAction
+
+    @log_to_file(logger)
+    def _req_iter():
+        offset = 0
+        while offset < total:
+            chunk = data[offset: offset + CHUNK]
+            r = WriteReq(
+                action=WriteAction.WRITE,
+                ref=ref,
+                expected=digest if offset == 0 else "",
+                total=total if offset == 0 else 0,
+                offset=offset,
+                data=chunk,
+            )
+            if labels and offset == 0:
+                r.labels.update(labels)
+            yield r
+            offset += len(chunk)
+
+        rc = WriteReq(
+            action=WriteAction.COMMIT,
+            ref=ref,
+            expected=digest,
+            total=total,
+            offset=total,
+            data=b"",
+        )
+        if labels:
+            rc.labels.update(labels)
+        yield rc
+
+    try:
+        resp = content_stub.Write(_req_iter())
+        try:
+            for _ in resp:
+                pass
+        except TypeError:
+            # unary response, nothing to drain
+            pass
+    except Exception as e:
+        try:
+            content_stub.Abort(content_pb2.AbortRequest(ref=ref))
+        except Exception:
+            pass
+        raise RuntimeError(f"Content.Write(commit) failed for {digest}: {e}")
+
+    if not _blob_exists(content_stub, digest, retries=8, sleep_sec=0.25):
+        raise RuntimeError(f"Write returned but blob not visible via Info(): {digest}")
+
+@log_to_file(logger)
+def _images_create_or_update(images_stub, name: str, target_desc: descriptor_pb2.Descriptor):
+    """
+    Ensure Images service has an Image record for 'name' in THIS namespace.
+    """
+    img = images_pb2.Image(
+        name=name,
+        target=target_desc,
+        labels={"managed-by": "dibba"},
+    )
+
+    # Prefer Create; if already exists, Update
+    try:
+        images_stub.Create(images_pb2.CreateImageRequest(image=img))
+        return
+    except grpc.RpcError as e:
+        if e.code() != grpc.StatusCode.ALREADY_EXISTS:
+            raise
+
+    # Update path
+    try:
+        images_stub.Update(images_pb2.UpdateImageRequest(image=img))
+    except Exception:
+        # Some stubs require update_mask; keep simplest if yours allows it.
+        images_stub.Update(images_pb2.UpdateImageRequest(image=img))
+
 
 # ---- Content / CRI helpers ----
 @log_to_file(logger)
-def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0.25) -> bool|None:
-    # Use Content.Info which returns NOT_FOUND if the blob is absent under the current namespace.
+def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0.25, md=None) -> bool:
     for i in range(retries + 1):
         try:
-            content_stub.Info(content_pb2.InfoRequest(digest=dgst))
+            content_stub.Info(content_pb2.InfoRequest(digest=dgst),metadata=md)
             return True
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.NOT_FOUND:
@@ -349,7 +774,6 @@ def _blob_exists(content_stub, dgst: str, retries: int = 3, sleep_sec: float = 0
                     time.sleep(sleep_sec)
                     continue
                 return False
-            # for other errors, surface them
             raise
 
 # class _CRIImageClient:
@@ -461,8 +885,10 @@ class ContainerdClient:
         target = _normalize_unix_target(socket)
         self.socket = target
         self.namespace = namespace or NAMESPACE
-        ch = grpc.insecure_channel(target)
-        self._ich = grpc.intercept_channel(ch, _AddNamespaceInterceptor(self.namespace))
+        #ch = grpc.insecure_channel(target)
+        self._raw_ch = grpc.insecure_channel(target)
+        self._ich = grpc.intercept_channel(self._raw_ch, _AddNamespaceInterceptor(self.namespace))
+
 
         #self.channel = grpc.insecure_channel(socket)
         self.images = images_pb2_grpc.ImagesStub(self._ich)
@@ -472,12 +898,32 @@ class ContainerdClient:
         self.tasks = tasks_pb2_grpc.TasksStub(self._ich)
         self.diff = diff_pb2_grpc.DiffStub(self._ich)
         self.leases = leases_pb2_grpc.LeasesStub(self._ich)
-        self.namespaces = namespace_pb2_grpc.NamespacesStub(self._ich)
+        self.namespaces = namespace_pb2_grpc.NamespacesStub(self._raw_ch)
 
     @log_to_file(logger)
-    def md(self, extra: tuple[tuple[str, str], ...] = ()) -> tuple[tuple[str, str], ...]:
-        base = (("containerd-namespace", self.namespace),)
-        return base + tuple(extra)
+    # def md(self, extra: tuple[tuple[str, str], ...] = ()) -> tuple[tuple[str, str], ...]:
+    #     base = (("containerd-namespace", self.namespace),)
+    #     return base + tuple(extra)
+    @log_to_file(logger)
+    def md(self):
+        # containerd uses this metadata key
+        return [("containerd-namespace", self.namespace)]
+
+    @log_to_file(logger)
+    def content_exists(self, digest: str) -> bool:
+        """
+        True if the blob exists in this namespace's content store.
+        """
+        try:
+            self.content.Info(
+                content_pb2.InfoRequest(digest=digest),
+                metadata=self.md(),
+            )
+            return True
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.NOT_FOUND:
+                return False
+            raise
 
 # ========== Image Resolution ==========
 class ImageResolver:
@@ -494,15 +940,42 @@ class ImageResolver:
             except grpc.RpcError as e:
                 if e.code() != grpc.StatusCode.NOT_FOUND:
                     raise
-        raise RuntimeError(f"Image {wanted} not found in namespace {NAMESPACE}")
+        raise RuntimeError(f"Image {wanted} not found in namespace {self.c.namespace}")
+
+    @log_to_file(logger)
+    def delete_image_record(self, image_ref: str) -> None:
+        try:
+            self.c.images.Delete(
+                images_pb2.DeleteImageRequest(name=image_ref),
+                metadata=self.c.md(),
+            )
+            logger.info(f"[images] deleted image record: {image_ref}")
+        except grpc.RpcError as e:
+            if e.code() != grpc.StatusCode.NOT_FOUND:
+                raise
+
+    @log_to_file(logger)
+    def pull_image_ctr(self, image_ref: str, platform: str = "linux/amd64") -> None:
+        ns = self.c.namespace
+        cmd = [
+            "ctr", "-n", ns,
+            "images", "pull",
+            "--platform", platform,
+            image_ref
+        ]
+        logger.info(f"[ctr] pulling image into ns={ns}: {' '.join(cmd)}")
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"ctr pull failed ({p.returncode}): {p.stderr or p.stdout}")
 
     @log_to_file(logger)
     def resolve_manifest(self, image_ref: str, extra_md=None) -> descriptor_pb2.Descriptor:
         resolved = self.resolve_image_name(image_ref)
+        md = self.c.md()  # <- ALWAYS
         img = self.c.images.Get(images_pb2.GetImageRequest(name=resolved)).image
         tgt = img.target
         if _is_index(tgt.media_type):
-            idx = _read_blob_json(self.c.content, tgt.digest, extra_md)
+            idx = _read_blob_json(self.c.content, tgt.digest, md)
             for m in idx.get("manifests", []):
                 plat = m.get("platform", {}) or {}
                 if plat.get("os") == PLATFORM_OS and plat.get("architecture") == PLATFORM_ARCH:
@@ -551,6 +1024,7 @@ class SnapshotManager:
         self.default_snapshotter = default_snapshotter
 
     # --- helper (top-level or inside SnapshotManager) ---
+    @staticmethod
     @log_to_file(logger)
     def _lazy_umount_mounts_under(path: str):
         try:
@@ -610,6 +1084,58 @@ class SnapshotManager:
             pass
 
     @log_to_file(logger)
+    def snapshotter(self) -> str:
+        return self._snapshotter_value_cache or self.default_snapshotter or DEFAULT_SNAPSHOTTER or "overlayfs"
+
+    @log_to_file(logger)
+    def ensure_snapshotter_discovered(self) -> str:
+        """
+        Discover a working snapshotter string early, so unpack + prepare use the same one.
+        """
+        if self._snapshotter_value_cache:
+            return self._snapshotter_value_cache
+
+        # Try List() first (cheap) across candidates
+        for snap_val in self._snapshotter_candidates():
+            try:
+                _ = self.c.snapshots.List(
+                    snapshots_pb2.ListSnapshotsRequest(snapshotter=snap_val)
+                )
+                self._snapshotter_value_cache = snap_val
+                logger.info(f"Discovered snapshotter (via List): '{snap_val}'")
+                return snap_val
+            except grpc.RpcError:
+                continue
+
+        # If List() isn't supported/behaves differently, fall back to a tiny Prepare/Remove probe
+        key = f"probe-{uuid.uuid4().hex[:8]}"
+        for snap_val in self._snapshotter_candidates():
+            try:
+                self.c.snapshots.Prepare(
+                    snapshots_pb2.PrepareSnapshotRequest(
+                        snapshotter=snap_val,
+                        key=key,
+                        parent="",
+                        labels={"managed-by": "dibba", "probe": "true"},
+                    )
+                )
+                # remove the active probe key
+                try:
+                    self.c.snapshots.Remove(
+                        snapshots_pb2.RemoveSnapshotRequest(snapshotter=snap_val, key=key)
+                    )
+                except Exception:
+                    pass
+
+                self._snapshotter_value_cache = snap_val
+                logger.info(f"Discovered snapshotter (via probe): '{snap_val}'")
+                return snap_val
+            except grpc.RpcError:
+                continue
+
+        raise RuntimeError("Unable to discover a working snapshotter via Snapshots API.")
+
+    @log_to_file(logger)
     def prepare_rw_snapshot(
             self,
             parent_chain_id: str,
@@ -654,8 +1180,6 @@ class SnapshotManager:
                 continue
         raise RuntimeError("Unable to select snapshotter for containerd Snapshots API.")
 
-
-
     @log_to_file(logger)
     def grpc_unpack(self, image_ref: str, manifest: dict, cfg: dict, snapshotter: str):
         layers = manifest.get("layers", [])
@@ -665,11 +1189,17 @@ class SnapshotManager:
 
         parent_chain = ""
         for i, layer in enumerate(layers):
-            cur_chain = _compute_chain_id(diff_ids[:i+1])
+            cur_chain = _compute_chain_id(diff_ids[:i + 1])
 
             if self._snap_stat_exists(snapshotter, cur_chain, None):
                 parent_chain = cur_chain
                 continue
+
+            # Ensure blob exists (namespaced content store)
+            dg = layer["digest"]
+            if not _blob_exists(self.c.content, dg, retries=5, sleep_sec=0.2, md=self.c.md()):
+                raise RuntimeError(
+                    f"Missing layer blob in content store: {dg} (image={image_ref}, ns={self.c.namespace})")
 
             prep_key = f"unpack-{uuid.uuid4().hex[:8]}-{i}"
             prep = self.c.snapshots.Prepare(
@@ -677,7 +1207,7 @@ class SnapshotManager:
                     snapshotter=snapshotter,
                     key=prep_key,
                     parent=parent_chain or "",
-                    labels={"containerd.io/gc.root": "true"},
+                    labels={"containerd.io/gc.root": "true", "managed-by": "dibba"},
                 )
             )
             mounts = list(prep.mounts)
@@ -685,18 +1215,27 @@ class SnapshotManager:
             d = descriptor_pb2.Descriptor()
             ParseDict({
                 "media_type": layer.get("mediaType") or layer.get("media_type"),
-                "digest": layer["digest"],
+                "digest": dg,
                 "size": layer.get("size", 0),
-                "annotations": { ANNOTATION_UNCOMPRESSED: diff_ids[i] }
+                "annotations": {ANNOTATION_UNCOMPRESSED: diff_ids[i]}
             }, d)
 
-            self.c.diff.Apply(diff_pb2.ApplyRequest(diff=d, mounts=mounts))
+            try:
+                self.c.diff.Apply(diff_pb2.ApplyRequest(diff=d, mounts=mounts))
+            except grpc.RpcError as e:
+                raise RuntimeError(
+                    f"diff.Apply failed: {e.code().name} {e.details()} | "
+                    f"image={image_ref} layer={i} digest={dg} diff_id={diff_ids[i]} "
+                    f"snapshotter={snapshotter} parent={parent_chain or '<none>'}"
+                )
 
             try:
                 self.c.snapshots.Commit(
                     snapshots_pb2.CommitSnapshotRequest(
-                        snapshotter=snapshotter, name=cur_chain, key=prep_key,
-                        labels={"containerd.io/gc.root": "true"},
+                        snapshotter=snapshotter,
+                        name=cur_chain,
+                        key=prep_key,
+                        labels={"containerd.io/gc.root": "true", "managed-by": "dibba"},
                     )
                 )
             except grpc.RpcError as e:
@@ -709,8 +1248,6 @@ class SnapshotManager:
             parent_chain = cur_chain
 
         return parent_chain
-
-
 
     @log_to_file(logger)
     def list_infos(self, snapshotter: Optional[str] = None) -> List[snapshots_pb2.Info]:
@@ -1098,19 +1635,26 @@ class RuntimeManager:
 
     @log_to_file(logger)
     def list_all_namespaces(self) -> list[str]:
-        """Best-effort: try well-known namespaces by probing a simple call."""
-        guesses = ["k8s.io", "default", "moby", "testKCR"]
-        found = []
-        seen = set()
-        for ns in guesses:
-            try:
-                _ = self._client_for_ns(ns).containers.List(containers_pb2.ListContainersRequest())
-                if ns not in seen:
-                    found.append(ns);
-                    seen.add(ns)
-            except grpc.RpcError:
-                pass
-        return found
+    #     """Best-effort: try well-known namespaces by probing a simple call."""
+    #     guesses = ["k8s.io", "default", "moby", "testKCR"]
+    #     found = []
+    #     seen = set()
+    #     for ns in guesses:
+    #         try:
+    #             _ = self._client_for_ns(ns).containers.List(containers_pb2.ListContainersRequest())
+    #             if ns not in seen:
+    #                 found.append(ns);
+    #                 seen.add(ns)
+    #         except grpc.RpcError:
+    #             pass
+    #     return found
+        try:
+            resp = self.c.namespaces.List(namespace_pb2.ListNamespacesRequest())
+            items = getattr(resp, "namespaces", None) or getattr(resp, "items", None) or []
+            return [n.name for n in items if getattr(n, "name", None)]
+        except Exception:
+            # fallback if API differs
+            return ["k8s.io", "default", "moby"]
 
     @log_to_file(logger)
     def _build_tasks_index(self, client) -> dict[str, dict]:
@@ -1213,6 +1757,30 @@ class RuntimeManager:
             return {"pid": pid, "status": "RUNNING" if (pid and os.path.exists(f"/proc/{pid}")) else "UNKNOWN"}
 
     @log_to_file(logger)
+    def _container_brief(self, client: ContainerdClient, c) -> dict:
+        """Small, robust summary for any container c in a namespace."""
+        cid = getattr(c, "id", "")
+        img = getattr(c, "image", "")
+        # labels is a map<string,string> in proto; make a plain dict defensively
+        labels = {}
+        try:
+            labels = dict(getattr(c, "labels", {}) or {})
+        except Exception:
+            pass
+
+        name = labels.get("app") or labels.get("name") or cid
+        snap = self._task_snapshot(client, cid)  # {'pid':..., 'status':...}
+
+        return {
+            "id": cid,
+            "name": name,
+            "image": img,
+            "labels": labels,
+            "pid": snap.get("pid"),
+            "status": snap.get("status"),
+        }
+
+    @log_to_file(logger)
     def list_pods_in_namespace(self, namespace: str) -> list[dict]:
         """
         Return a list of pause/pod summaries in a namespace.
@@ -1239,29 +1807,51 @@ class RuntimeManager:
                 })
         return pods
 
+
     @log_to_file(logger)
-    def _container_brief(self, client: ContainerdClient, c) -> dict:
-        """Small, robust summary for any container c in a namespace."""
-        cid = getattr(c, "id", "")
-        img = getattr(c, "image", "")
-        # labels is a map<string,string> in proto; make a plain dict defensively
-        labels = {}
+    def stop_and_delete_task_in_client(self, client: ContainerdClient, cid: str,
+                                       kill_signal: int = 15,
+                                       timeouts: Tuple[float, float] = (3.0, 10.0)) -> None:
+        """
+        Same as stop_and_delete_task(), but operates on an explicit namespaced client.
+        This avoids accidentally using the wrong namespace stub.
+        """
+        # Kill
         try:
-            labels = dict(getattr(c, "labels", {}) or {})
+            client.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=kill_signal),
+                              timeout=timeouts[0])
+        except grpc.RpcError:
+            pass
+
+        # Wait
+        try:
+            client.tasks.Wait(tasks_pb2.WaitRequest(container_id=cid), timeout=2.0)
         except Exception:
             pass
 
-        name = labels.get("app") or labels.get("name") or cid
-        snap = self._task_snapshot(client, cid)  # {'pid':..., 'status':...}
+        # Delete task
+        try:
+            del_req_cls = getattr(tasks_pb2, "DeleteTaskRequest", None) or getattr(tasks_pb2, "DeleteRequest", None)
+            if del_req_cls:
+                client.tasks.Delete(del_req_cls(container_id=cid), timeout=timeouts[1])
+        except grpc.RpcError:
+            # fallback SIGKILL + delete
+            try:
+                client.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9), timeout=timeouts[0])
+            except grpc.RpcError:
+                pass
+            try:
+                del_req_cls = getattr(tasks_pb2, "DeleteTaskRequest", None) or getattr(tasks_pb2, "DeleteRequest", None)
+                if del_req_cls:
+                    client.tasks.Delete(del_req_cls(container_id=cid), timeout=timeouts[1])
+            except grpc.RpcError:
+                pass
 
-        return {
-            "id": cid,
-            "name": name,
-            "image": img,
-            "labels": labels,
-            "pid": snap.get("pid"),
-            "status": snap.get("status"),
-        }
+        # Delete container object
+        try:
+            client.containers.Delete(containers_pb2.DeleteContainerRequest(id=cid))
+        except grpc.RpcError:
+            pass
 
     @log_to_file(logger)
     def list_pods_and_apps_in_namespace(self, namespace: str) -> list[dict]:
@@ -1343,7 +1933,7 @@ class RuntimeManager:
                     labels=labels or {},
                     spec=spec_any,
                     runtime=containers_pb2.Container.Runtime(name="io.containerd.runc.v2"),
-                    snapshotter=self.snapshots._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs",
+                    snapshotter=self.snapshots.snapshotter(),
                 )
             )
         )
@@ -1361,35 +1951,43 @@ class RuntimeManager:
         return resp.pid
 
     @log_to_file(logger)
-    def stop_and_delete_task(self, cid: str, kill_signal: int = 15, timeouts: Tuple[float,float] = (3.0, 10.0)) -> None:
+    def stop_and_delete_task(self, cid: str, kill_signal: int = 15,
+                             timeouts: Tuple[float, float] = (3.0, 10.0)) -> None:
         """
-        Best-effort: send signal, then delete the task; finally delete the container.
-        - cid: container ID
-        - kill_signal: 15 (TERM) by default; fallback to 9 (KILL) if needed
+        Best-effort: signal -> wait -> delete task -> delete container
         """
-        # Kill
+        # 1) Kill (TERM by default)
         try:
-            self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=kill_signal),  timeout=timeouts[0])
-            time.sleep(0.5)
-        except grpc.RpcError as e:
-            # If already stopped or not found, we'll continue
+            self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=kill_signal),
+                              timeout=timeouts[0])
+        except grpc.RpcError:
             pass
 
-        # Try delete task
+        # 2) Wait briefly (helps remove shim cleanly)
         try:
-            self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid), timeout=timeouts[1])
-        except grpc.RpcError as e:
-            if e.code().name not in ("NOT_FOUND",):
-                # Try a harder kill then delete again
-                try:
-                    self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9),  timeout=timeouts
-    [0])
-                    self.c.tasks.Delete(tasks_pb2.DeleteTaskRequest(container_id=cid),  timeout=timeouts[1
-    ])
-                except grpc.RpcError:
-                    pass
+            self.c.tasks.Wait(tasks_pb2.WaitRequest(container_id=cid), timeout=2.0)
+        except Exception:
+            pass
 
-        # Delete container object
+        # 3) Delete task
+        try:
+            del_req_cls = getattr(tasks_pb2, "DeleteTaskRequest", None) or getattr(tasks_pb2, "DeleteRequest", None)
+            if del_req_cls:
+                self.c.tasks.Delete(del_req_cls(container_id=cid), timeout=timeouts[1])
+        except grpc.RpcError:
+            # fallback to SIGKILL then delete
+            try:
+                self.c.tasks.Kill(tasks_pb2.KillRequest(container_id=cid, signal=9), timeout=timeouts[0])
+            except grpc.RpcError:
+                pass
+            try:
+                del_req_cls = getattr(tasks_pb2, "DeleteTaskRequest", None) or getattr(tasks_pb2, "DeleteRequest", None)
+                if del_req_cls:
+                    self.c.tasks.Delete(del_req_cls(container_id=cid), timeout=timeouts[1])
+            except grpc.RpcError:
+                pass
+
+        # 4) Delete container object
         try:
             self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=cid))
         except grpc.RpcError:
@@ -1593,7 +2191,7 @@ class PodManager:
         self.cni = CniManager()
 
     @log_to_file(logger)
-    def pull_image(self, image_ref: str) -> dict:
+    def pull_image(self, image_ref: str, username: str | None = None, password: str | None = None ) -> dict:
         """
         Ensure an image is available for this namespace.
 
@@ -1614,158 +2212,348 @@ class PodManager:
                 "message": f"Image available: {resolved}",
                 "source": "containerd",
             }
-        except grpc.RpcError as e:
-            # If it's a real NOT_FOUND, we fall through to CRI.
-            if e.code() != grpc.StatusCode.NOT_FOUND:
-                # Some other gRPC error — log it but still try CRI.
-                logger.warning(
-                    f"[pull_image] containerd Images.Get error for {image_ref} "
-                    f"in ns={self.c.namespace}: {e.code().name}: {e.details()}"
-                )
+
         except Exception as e:
             # Defensive: don't blow up here, just log and try CRI.
             logger.warning(
                 f"[pull_image] unexpected error while resolving {image_ref} "
                 f"in ns={self.c.namespace}: {e}"
             )
+            pass
 
-        # ----- 2) CRI pull fallback (works against the CRI plugin, usually k8s.io) -----
+        # 2) Native pull (Option B)
+        try:
+            res = self.pull_image_native(image_ref, username=username, password=password)
+            if res.get("ok"):
+                return res
+            # if it returned ok=False, fall through (or return directly if you want)
+            logger.warning(f"[pull_image] native pull returned not ok: {res}")
+        except Exception as e:
+            logger.warning(f"[pull_image] native pull failed: {e}", exc_info=True)
+
+        # ----- 3) CRI pull fallback (works against CRI plugin namespace, unknown which) -----
         cri_sock = os.environ.get("CRI_SOCKET", "/run/containerd/containerd.sock")
         cri = _CRIImageClient(socket_target=cri_sock)
 
+        pulled = cri.pull(image_ref)
+        if not pulled:
+            msg = f"Failed to pull image via CRI: {image_ref}"
+            logger.error(msg)
+            return {"ok": False, "image_ref": None, "namespace": ns, "source": "cri",
+                    "message": f"pull failed: {image_ref}"}
+
+        # IMPORTANT:
+        # CRI may have stored the image into some namespace that is NOT self.c.namespace.
+        # So: find it anywhere, then import the Image record into our destination namespace.
+        dst_ns = self.c.namespace
+        sock = self.c.socket
+
         try:
-            pulled = cri.pull(image_ref)
-            if not pulled:
-                # CRI PullImage failed (like your insufficient_scope case)
-                msg = f"Failed to pull image via CRI: {image_ref}"
-                logger.error(msg)
+            src_ns, src_name = _find_image_in_any_namespace(
+                socket=sock,
+                image_ref=pulled,
+                candidates=_candidates_for_ref(pulled),
+                skip={dst_ns},
+                probe_namespace=dst_ns,  # <-- important
+            )
+
+            # If not found by pulled, try by original ref too
+            if not src_ns:
+                src_ns, src_name = _find_image_in_any_namespace(
+                    socket=sock,
+                    image_ref=image_ref,
+                    candidates=_candidates_for_ref(image_ref),
+                    skip={dst_ns},
+                )
+
+            if not src_ns or not src_name:
+                # CRI said success but containerd Images API can't find it anywhere (rare but possible)
+                logger.warning(
+                    f"CRI pulled {pulled}, but Images API can't locate it in any namespace; returning pulled ref anyway")
                 return {
-                    "ok": False,
-                    "image_ref": None,
-                    "namespace": ns,
-                    "message": f"Failed to pull image: {image_ref}",
+                    "ok": True,
+                    "image_ref": pulled,
+                    "namespace": dst_ns,
+                    "message": f"Image pulled via CRI but not visible via Images API; using {pulled}",
                     "source": "cri",
-                    "grpc_code": None,
-                    "grpc_details": None,
-                    "hint": (
-                        "If this is a private repo, configure registry auth for containerd/CRI "
-                        "(hosts.toml or credential helpers)."
-                    ),
+                    "cri_returned": pulled,
+                    "imported_from_namespace": None,
                 }
 
-            # Optionally re-resolve in containerd using the digest-like ref CRI returns
-            final_ref = pulled
-            try:
-                final_ref = self.images.resolve_image_name(pulled)
-            except Exception:
-                # If this fails we still return the pulled ref
-                pass
+            # Import record into destination namespace
+            imported_name = _import_image_record_namespace_to_namespace(
+                socket=sock,
+                src_ns=src_ns,
+                dst_ns=dst_ns,
+                image_name_in_src=src_name,
+                dst_name=image_ref,  # keep the name you requested in dst namespace
+            )
 
-            msg = f"Pulled image via CRI and available as: {final_ref}"
-            logger.info(msg)
+            # Now resolve in our namespace (should succeed)
+            final_ref = self.images.resolve_image_name(imported_name)
+
+            # CRITICAL: import copied only the Image record; blobs may be missing in dst namespace.
+            # Force a native pull into THIS namespace to populate content store.
+            try:
+                fill = self.pull_image_native(final_ref, username=username, password=password)
+                if not fill.get("ok"):
+                    logger.warning(f"[pull_image] native fill after CRI+import returned not ok: {fill}")
+            except Exception as e:
+                logger.warning(f"[pull_image] native fill after CRI+import failed: {e}", exc_info=True)
+
+            logger.info(f"Imported image record from ns={src_ns} -> ns={dst_ns} as {final_ref}")
             return {
                 "ok": True,
                 "image_ref": final_ref,
-                "namespace": ns,
-                "message": f"Image pulled: {final_ref}",
+                "namespace": dst_ns,
+                "message": f"Image pulled via CRI, imported, and content populated in namespace: {final_ref}",
+                "source": "cri+import+filled",
+                "cri_returned": pulled,
+                "imported_from_namespace": src_ns,
+                "imported_from_name": src_name,
+            }
+
+        except Exception as e:
+            logger.warning(f"CRI pull succeeded but import/discovery failed: {e}", exc_info=True)
+            # Still return pulled ref so caller can decide next step
+            return {
+                "ok": True,
+                "image_ref": pulled,
+                "namespace": dst_ns,
+                "message": f"Image pulled via CRI but import failed: {e}",
                 "source": "cri",
                 "cri_returned": pulled,
+                "imported_from_namespace": None,
             }
-        except grpc.RpcError as e:
-            return {
-                "ok": False,
-                "image_ref": None,
-                "namespace": ns,
-                "message": f"CRI PullImage failed for: {image_ref}",
-                "source": "cri",
-                "grpc_code": getattr(e.code(), "name", lambda: str(e.code()))(),
-                "grpc_details": e.details(),
-                "hint": (
-                    "Common causes: private registry auth, wrong repo/tag, or insufficient_scope. "
-                    "Verify the image ref and registry credentials."
-                ),
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "image_ref": None,
-                "namespace": ns,
-                "message": f"Unexpected pull error for: {image_ref}",
-                "source": "cri",
-                "error": str(e),
-            }
-    
-    @log_to_file(logger)
-    def _ensure_unpacked(self, image: str):
-        """
-        Ensure blobs exist in content store and unpack chain into snapshots.
 
-        Flow:
-          - resolve manifest for requested ref
-          - if any layer blob missing, CRI PullImage(image)
-          - ask CRI for manifest digest via ImageStatus; re-resolve via digest
-          - re-check blobs (with a tiny retry), then grpc_unpack
+    @log_to_file(logger)
+    def pull_image_native(self, image_ref: str, username: str | None = None, password: str | None = None) -> dict:
+        ns = self.c.namespace
+
+        # already present?
+        try:
+            resolved = self.images.resolve_image_name(image_ref)
+            return {"ok": True, "image_ref": resolved, "namespace": ns, "source": "containerd",
+                    "message": "already present"}
+        except Exception:
+            pass
+
+        registry, repo, reference = _split_image_ref(image_ref)
+        reg = RegistryV2Client(registry, username=username, password=password)
+
+        # 1) fetch tag (could be index or manifest)
+        tag_doc, tag_mt, tag_headers, tag_body = reg.get_manifest_with_headers(repo, reference)
+        tag_digest = (tag_headers.get("Docker-Content-Digest") or "").strip() or None
+
+        # IMPORTANT: if server returned a digest for the tag object, store that blob too
+        # (This is the index/list blob when tag points to an index)
+        if tag_digest and tag_body:
+            _content_write_and_commit(self.c.content, tag_digest, tag_body, labels={
+                "containerd.io/gc.root": "true",
+                "managed-by": "dibba",
+                "containerd.io/distribution.source.ref": image_ref,
+                "kind": "tag-manifest-or-index",
+            })
+
+        # 2) if index/list -> pick platform manifest and fetch THAT digest
+        if _is_index(tag_mt) or bool(tag_doc.get("manifests")):
+            manifests = tag_doc.get("manifests") or []
+            chosen = None
+            for m in manifests:
+                plat = (m.get("platform") or {})
+                if plat.get("os") == PLATFORM_OS and plat.get("architecture") == PLATFORM_ARCH:
+                    chosen = m
+                    break
+            chosen = chosen or (manifests[0] if manifests else None)
+            if not chosen:
+                return {"ok": False, "namespace": ns, "message": f"no manifests found in index for {image_ref}"}
+
+            manifest_ref = chosen["digest"]  # digest to fetch
+            man_doc, man_mt, man_headers, man_body = reg.get_manifest_with_headers(repo, manifest_ref)
+            manifest_digest = (man_headers.get("Docker-Content-Digest") or "").strip() or manifest_ref
+        else:
+            # concrete manifest already
+            man_doc, man_mt, man_headers, man_body = tag_doc, tag_mt, tag_headers, tag_body
+            # For a normal manifest, Docker-Content-Digest is authoritative
+            manifest_digest = (man_headers.get("Docker-Content-Digest") or "").strip() or tag_digest
+            if not manifest_digest:
+                return {"ok": False, "namespace": ns, "message": f"could not determine manifest digest for {image_ref}"}
+
+        # 2b) ALWAYS store the selected manifest blob itself
+        if manifest_digest and man_body:
+            _content_write_and_commit(self.c.content, manifest_digest, man_body, labels={
+                "containerd.io/gc.root": "true",
+                "managed-by": "dibba",
+                "containerd.io/distribution.source.ref": image_ref,
+                "kind": "manifest",
+            })
+
+        # 3) fetch config + layers
+        cfg_desc = man_doc["config"]
+        cfg_digest = cfg_desc["digest"]
+        cfg_bytes = reg.get_blob(repo, cfg_digest)
+
+        layer_descs = man_doc.get("layers") or []
+        layer_digests = [l["digest"] for l in layer_descs]
+
+        # 4) write config + layers into content store (namespaced)
+        _content_write_and_commit(self.c.content, cfg_digest, cfg_bytes, labels={
+            "containerd.io/gc.root": "true",
+            "managed-by": "dibba",
+            "containerd.io/distribution.source.ref": image_ref,
+        })
+        for dg in layer_digests:
+            blob = reg.get_blob(repo, dg)
+            _content_write_and_commit(self.c.content, dg, blob, labels={
+                "containerd.io/gc.root": "true",
+                "managed-by": "dibba",
+                "containerd.io/distribution.source.ref": image_ref,
+            })
+
+        # 5) create image record pointing at MANIFEST digest (authoritative)
+        target = descriptor_pb2.Descriptor()
+        ParseDict({
+            "media_type": man_mt,
+            "digest": manifest_digest,
+            "size": 0
+        }, target)
+
+        _images_create_or_update(self.c.images, image_ref, target)
+
+        resolved = self.images.resolve_image_name(image_ref)
+        return {"ok": True, "image_ref": resolved, "namespace": ns, "source": "native",
+                "message": "pulled into namespace"}
+
+    @log_to_file(logger)
+    def _ensure_unpacked(self, image_ref: str) -> None:
+        """
+        Ensure the image is:
+          1) present as an Images record in THIS namespace
+          2) has config+layer blobs present in THIS namespace content store
+          3) unpacked into snapshots (chain IDs) for THIS namespace snapshotter
+
+        This method is defensive about the common “pulled via CRI but blobs/record are in a
+        different namespace” problem by *always* doing a native fill pull into the target
+        namespace when blobs are missing.
         """
 
         @log_to_file(logger)
         def _layers_from_manifest(m: dict) -> list[str]:
-            return [l["digest"] for l in (m.get("layers") or [])]
+            return [l.get("digest") for l in (m.get("layers") or []) if l.get("digest")]
 
-        # 1) Resolve current manifest+config for the tag/ref we were given
-        manifest_desc = self.images.resolve_manifest(image)
-        manifest, cfg = self.images.load_manifest_and_config(manifest_desc)
-        layer_digests = _layers_from_manifest(manifest)
+        @log_to_file(logger)
+        def _config_digest_from_manifest(m: dict) -> str | None:
+            cfg = (m.get("config") or {})
+            return cfg.get("digest")
 
-        missing = [dg for dg in layer_digests if not _blob_exists(self.c.content, dg)]
-        if missing:
-            logger.info("Some blobs missing in content store; invoking CRI pull...")
-            cri = _CRIImageClient(
-                socket_target=os.environ.get("CRI_SOCKET", "/run/containerd/containerd.sock")
-                # You can also reuse your CONTAINERD_SOCKET env/config here; the normalizer handles both.
-            )
-            pulled_ref = cri.pull(image)  # digest-like ref, e.g., 'sha256:07ccdb...'
-            if not pulled_ref:
-                raise RuntimeError(f"CRI PullImage failed; missing blobs start with: {missing[0]}")
+        # 0) Make sure snapshotter is stable before any unpack work
+        snap = self.snaps.ensure_snapshotter_discovered()
 
-            # 2) Ask CRI what manifest digest it actually resolved (more authoritative than the tag)
-            digest_ref = cri.image_status(pulled_ref) or pulled_ref
+        # 1) Ensure Images record exists in THIS namespace (and attempt to import if CRI was used)
+        pres = self.pull_image(image_ref)
+        if not pres.get("ok"):
+            raise RuntimeError(pres.get("message") or f"pull_image failed: {image_ref}")
 
-            # 3) Re-resolve manifest using the digest ref (then fall back to original if needed)
-            last_err = None
-            for ref in (digest_ref, pulled_ref, image):
-                try:
-                    manifest_desc = self.images.resolve_manifest(ref)
-                    manifest, cfg = self.images.load_manifest_and_config(manifest_desc)
-                    layer_digests = _layers_from_manifest(manifest)
-                    break
-                except Exception as e:
-                    last_err = e
+        # Use the best ref we have (often normalized / fully qualified)
+        image_ref = pres.get("image_ref") or image_ref
+
+        # 2A) Guard: ensure the image target (manifest list/index or manifest) blob exists in THIS namespace.
+        #     Your error is: content digest <target.digest> not found during resolve_manifest() -> Content.Read().
+        try:
+            img = self.c.images.Get(
+                images_pb2.GetImageRequest(name=image_ref),
+                metadata=self.c.md(),
+            ).image
+            tgt = img.target  # descriptor: digest + mediaType
+            if tgt and tgt.digest and not self.c.content_exists(tgt.digest):
+                logger.warning(
+                    f"[ensure_unpacked] image target blob missing in ns={self.c.namespace} "
+                    f"(digest={tgt.digest}). Doing native pull to populate content store."
+                )
+                fill = self.pull_image_native(image_ref)
+                if not fill.get("ok"):
+                    raise RuntimeError(f"Native fill pull failed while fixing missing target blob: {fill}")
+                image_ref = fill.get("image_ref") or image_ref
+        except Exception as e:
+            # If we can't even read image metadata, fall back to your existing native fill path.
+            logger.warning(f"[ensure_unpacked] could not validate target digest for {image_ref}: {e}; trying native fill")
+            fill = self.pull_image_native(image_ref)
+            if not fill.get("ok"):
+                raise RuntimeError(f"Native fill pull failed after target digest validation error: {fill}")
+            image_ref = fill.get("image_ref") or image_ref
+
+
+        # 2) Resolve manifest+config descriptors via Images API (namespaced)
+        #    If this fails after pull_image, we try one more native fill.
+        # 2) Resolve manifest+config descriptors via Images API
+        try:
+            manifest_desc = self.images.resolve_manifest(image_ref)
+            manifest, cfg = self.images.load_manifest_and_config(manifest_desc)
+
+        except grpc.RpcError as e:
+            # If the *target digest* is missing in content store, the image record is stale/broken.
+            msg = str(e)
+            if "content digest" in msg and "not found" in msg:
+                logger.warning(
+                    f"[ensure_unpacked] resolve_manifest failed due to missing content in ns={self.c.namespace}. "
+                    f"Deleting image record and forcing ctr pull: {image_ref}"
+                )
+                self.images.delete_image_record(image_ref)   # add helper belowa
+                self.images.pull_image_ctr(image_ref)               # add helper below
+
+                # retry after hard repair
+                manifest_desc = self.images.resolve_manifest(image_ref)
+                manifest, cfg = self.images.load_manifest_and_config(manifest_desc)
             else:
-                raise RuntimeError(f"After CRI pull, failed to resolve manifest: {last_err}")
+                raise
 
-            # 4) Re-check presence with a short backoff to avoid tiny commit races
-            still_missing = [dg for dg in layer_digests if
-                             not _blob_exists(self.c.content, dg, retries=5, sleep_sec=0.3)]
+
+        # 3) Verify content store has config + all layers (namespaced content store!)
+        layer_digests = _layers_from_manifest(manifest)
+        cfg_digest = _config_digest_from_manifest(manifest) or (cfg.get("rootfs") and None)
+
+        missing = []
+        if cfg_digest and not _blob_exists(self.c.content, cfg_digest, retries=2, sleep_sec=0.2,md=self.c.md()):
+            missing.append(cfg_digest)
+        for dg in layer_digests:
+            if not _blob_exists(self.c.content, dg, retries=2, sleep_sec=0.2,md=self.c.md()):
+                missing.append(dg)
+
+        if missing:
+            # The single most important fix: do a native pull into THIS namespace to populate blobs.
+            logger.info(
+                f"[ensure_unpacked] missing {len(missing)} blob(s) in ns={self.c.namespace}; "
+                f"native pulling to populate content store (example={missing[0]})"
+            )
+            fill = self.pull_image_native(image_ref)
+            if not fill.get("ok"):
+                raise RuntimeError(f"Native pull failed while fixing missing blobs: {fill}")
+
+            # Re-resolve and re-load after native pull
+            image_ref = fill.get("image_ref") or image_ref
+            manifest_desc = self.images.resolve_manifest(image_ref)
+            manifest, cfg = self.images.load_manifest_and_config(manifest_desc)
+
+            # Re-check (with small retries)
+            layer_digests = _layers_from_manifest(manifest)
+            cfg_digest = _config_digest_from_manifest(manifest)
+
+            still_missing = []
+            if cfg_digest and not _blob_exists(self.c.content, cfg_digest, retries=6, sleep_sec=0.25,md=self.c.md()):
+                still_missing.append(cfg_digest)
+            for dg in layer_digests:
+                if not _blob_exists(self.c.content, dg, retries=6, sleep_sec=0.25,md=self.c.md()):
+                    still_missing.append(dg)
+
             if still_missing:
-                ns = NAMESPACE
-                example = still_missing[0]
                 raise RuntimeError(
-                    "Content still missing after CRI pull.\n"
-                    f"- Namespace: {ns}\n"
-                    f"- CRI manifest: {digest_ref}\n"
-                    f"- Example missing digest: {example}\n"
-                    "Checks:\n"
-                    "  • Ensure your gRPC calls use the same namespace as CRI (usually k8s.io).\n"
-                    "  • `ctr -n k8s.io content ls | grep <digest>` should show the blob.\n"
-                    "  • Make sure unpack runs under a lease (prevents GC during apply).\n"
-                    "  • Very rarely, a mirror returns a variant manifest—retry with the digest ref above."
+                    f"Content still missing after native pull in ns={self.c.namespace}. "
+                    f"Example missing digest: {still_missing[0]}"
                 )
 
-        # 5) Unpack into the snapshotter you discovered
-        self.snaps.grpc_unpack(
-            image, manifest, cfg,
-            self.snaps._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
-        )
+        # 4) Unpack into snapshots (chain IDs) for THIS namespace snapshotter
+        #    grpc_unpack() will skip layers whose chain snapshot already exists.
+        self.snaps.grpc_unpack(image_ref, manifest, cfg, snapshotter=snap)
 
     @log_to_file(logger)
     def _build_runtime_pod_struct(self, namespace: str, pod_name: str,
@@ -1890,6 +2678,7 @@ class PodManager:
         except Exception as e:
             logger.warning(f"[cleanup] CNI DEL warning: {e}", exc_info=True)
 
+
     @log_to_file(logger)
     def _remove_active_snapshots_matching(self, namespace: str, candidates: list[str]):
         """
@@ -1917,6 +2706,8 @@ class PodManager:
                         logger.debug(f"[cleanup] removed snapshot key: {key}")
                     except Exception as e:
                         logger.warning(f"[cleanup] snapshot remove warning ({key}): {e}", exc_info=True)
+
+
 
     @log_to_file(logger)
     def create_pod(self, name: str, pause_image: str = "registry.k8s.io/pause:3.9",
@@ -1963,6 +2754,12 @@ class PodManager:
             logger.info(f"CNI attached: {cni_result if isinstance(cni_result, dict) else 'ok'}")
         except Exception as e:
             logger.error(f"CNI attach failed: {e}", exc_info=True)
+            self.runtime.stop_and_delete_task(cid)
+            try:
+                self.snaps._snap_remove_active(self._snapshotter_name(), snap_key)
+            except Exception:
+                pass
+            return {"ok": False, "error": f"CNI attach failed: {e}"}
 
         return {"name": name, "pause": {"cid": cid, "pid": pid}, "ns": ns_paths,
                 "cni": {"network": cni_network, "ifname": cni_ifname},
@@ -2032,7 +2829,7 @@ class PodManager:
 
     @log_to_file(logger)
     def _snapshotter_name(self) -> str:
-        return self.snaps._snapshotter_value_cache or DEFAULT_SNAPSHOTTER or "overlayfs"
+        return self.snaps.snapshotter()
 
     @log_to_file(logger)
     def delete_container(self, app: Dict) -> None:
@@ -2218,7 +3015,7 @@ class PodManager:
         """
         Gracefully terminate a pod (pause + its apps) in the given containerd namespace.
         """
-        client = ContainerdClient( namespace=namespace)
+        client = ContainerdClient(socket=self.c.socket, namespace=namespace)
         pm = PodManager(client)
 
         pod, apps = self._build_runtime_pod_struct(namespace, pod_name, cni_network, ifname)
@@ -2278,15 +3075,11 @@ class PodManager:
     def destroy_container_by_id(self, namespace: str, cid: str) -> dict:
         """
         Stop/delete a single container by id in a namespace.
-        Removes its active snapshot key only if we can infer it (not always known).
+        Namespace-safe (does NOT mutate self.runtime.c).
         """
         client = self.runtime._client_for_ns(namespace)
-        # Try to stop task + delete container
         try:
-            self.runtime.c = client
-            self.runtime.stop_and_delete_task(cid)
-            # We usually don't know the active snapshot key for arbitrary cids here,
-            # so we leave snapshot GC to containerd (the committed chain is shared).
+            self.runtime.stop_and_delete_task_in_client(client, cid)
             return {"ok": True, "message": f"container {cid} removed from ns='{namespace}'"}
         except Exception as e:
             return {"ok": False, "message": f"failed to remove {cid}: {e}"}
@@ -2309,7 +3102,7 @@ class PodManager:
             for tid in stopped:
                 self.runtime.delete_task_only(tid)
                 try:
-                    self.c.containers.Delete(containers_pb2.DeleteContainerRequest(id=tid))
+                    client.containers.Delete(containers_pb2.DeleteContainerRequest(id=tid))
                 except grpc.RpcError:
                     pass
                 purged.append(tid)
@@ -2424,9 +3217,11 @@ class PodManager:
 #     # pods.delete_pod(pod, apps=list(apps.values()))
 
 if __name__ == "__main__":
-    client = ContainerdClient()
-    pod_mgr = PodManager(client)
+    #client = ContainerdClient()
+    #pod_mgr = PodManager(client)
 
-    status = pod_mgr.destroy_pod("testKCR", "ed726e5104bd4a32")
-    logger.info(f"Status: {status}")
+    client = ContainerdClient(namespace="testKCR1")
+    pm = PodManager(client)
+    print(pm.pull_image("docker.io/library/alpine:latest"))
+    print(pm.images.resolve_image_name("docker.io/library/alpine:latest"))
     #check_status = pod_mgr.runtime.prune_namespace("testKCR")

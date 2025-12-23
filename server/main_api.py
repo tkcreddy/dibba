@@ -488,7 +488,7 @@ async def list_namespaces_and_pods_api(request: ContainerdHostRequest, user: str
 async def list_pods_by_namespace_api(request: PodNamespaceHostRequest, user: str = Depends(get_current_user)):
     result = submit_celery_task(
         task=list_pods_by_namespace_task,
-        args=([request.namespace],),
+        args=([request.namespace]),
         queue_info=create_host_queue_info(request.host_name, ue),
         operation_name="list_pods_by_namespace",
         error_code="LIST_PODS_BY_NAMESPACE_ERROR",

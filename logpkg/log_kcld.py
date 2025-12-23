@@ -74,12 +74,12 @@ class LogKCld(metaclass=Singleton):
     def debug(self, msg, extra=None, **kwargs):
         self.logger.debug(msg, extra=self._sanitize_extra(extra), **kwargs)
 
-    def warning(self, msg, extra=None, **kwargs):
-        self.logger.warning(msg, extra=self._sanitize_extra(extra), **kwargs)
-
     # back-compat alias
     def warn(self, msg, extra=None, **kwargs):
         self.logger.warning(msg, extra=self._sanitize_extra(extra), **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        return self.warn(msg, *args, **kwargs) if hasattr(self, "warn") else self.info(f"WARNING: {msg}")
 
 
 def log_to_file(logger: LogKCld):

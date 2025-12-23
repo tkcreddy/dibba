@@ -272,7 +272,7 @@ def list_pods_by_namespace_task(namespace: str) -> Dict[str, Any]:
     ns =  DEFAULT_NAMESPACE
 
     try:
-        client = ContainerdClient(socket=sock)
+        client = ContainerdClient(socket=sock, namespace=namespace)
         pod_mgr = PodManager(client)
 
         namespaces: List[str] = pod_mgr.runtime.list_all_namespaces()
