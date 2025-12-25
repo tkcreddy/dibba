@@ -1,17 +1,37 @@
 from fastapi import FastAPI, Depends, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, ValidationError as PydanticValidationError
-from server.api_models import CreatePodsRequest
-
-from utils.celery.tasks.worker_node_tasks import *  # noqa
-from utils.celery.tasks.containerd_tasks import *   # noqa
+from server.api_models import CreatePodsRequest, ScheduleDeploymentRequest
+from server.scheduler.scheduler import schedule_deployment_from_yaml
+from utils.redis.host_pod_store import HostPodStore  # adjust path to where you saved that class
 from utils.celery.tasks.aws_tasks import create_worker_nodes, terminate_worker_node
 
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.redis.redis_interface import RedisInterface
 from utils.ReadConfig import ReadConfig as rc
 from utils.celery.celery_config import celery_app
+
+
+from utils.celery.tasks.worker_node_tasks import (
+    get_worker_node_info,
+    get_host_ip,
+    get_usage,
+)
+from utils.celery.tasks.containerd_tasks import (
+    create_pod_task,
+    list_namespaces_and_pods_task,
+    list_pods_by_namespace_task,
+    terminate_pod_task,
+    terminate_pod_by_pause_cid_task,
+    destroy_all_pods_task,
+    destroy_container_by_id_task,
+    purge_stopped_tasks_and_containers_task,
+    prune_namespace_task,
+    get_container_info_task,
+    cleanup_tasks_by_pod_prefix_task,
+)
 
 from utils.exceptions import (
     DibbaBaseException,
@@ -47,6 +67,18 @@ app = FastAPI(
     contact={"name": "Dibba Contributors", "url": "https://github.com/tkcreddy/dibba"},
     license_info={"name": "Apache 2.0"},
 )
+
+# Mount static files for UI (use existing dibba-ui/dist)
+import os
+ui_dist_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dibba-ui", "dist")
+if os.path.exists(ui_dist_dir):
+    app.mount("/dibba", StaticFiles(directory=ui_dist_dir, html=True), name="dibba-ui")
+    
+    @app.get("/", tags=["UI"])
+    async def root():
+        """Redirect to UI."""
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/dibba/")
 
 # ==================== Error Handlers ====================
 
@@ -119,7 +151,7 @@ if not SECRET_KEY:
 
 # Queue Information
 aws_queue_info = create_queue_info("aws_interface", utilities_extension=ue)
-
+store = HostPodStore(rd)
 
 # ==================== Models ====================
 
@@ -328,50 +360,69 @@ async def get_task_status(task_id: str, user: str = Depends(get_current_user)) -
 
 # ==================== Worker Node Endpoints (query params) ====================
 
+# @log_to_file(logger)
+# @handle_async_errors("get_worker_node_data", "TASK_SUBMISSION_ERROR")
+# @app.get("/get_worker_node_data/", tags=["Worker Nodes"])
+# async def get_worker_node_data(host_name: str, user: str = Depends(get_current_user)):
+#     host_queue_info = create_host_queue_info(host_name, ue)
+#     result = submit_celery_task(
+#         task=get_worker_node_info,
+#         queue_info=host_queue_info,
+#         operation_name="get_worker_node_data",
+#         error_code="GET_WORKER_NODE_DATA_ERROR",
+#         additional_data={"host_name": host_name},
+#     )
+#     # submit_celery_task already returns your standard shape (if you wrote it that way),
+#     # but to guarantee the contract, we normalize here:
+#     return _envelope_success("Task submitted successfully", result.get("data", result))
+
 @log_to_file(logger)
 @handle_async_errors("get_worker_node_data", "TASK_SUBMISSION_ERROR")
 @app.get("/get_worker_node_data/", tags=["Worker Nodes"])
 async def get_worker_node_data(host_name: str, user: str = Depends(get_current_user)):
-    host_queue_info = create_host_queue_info(host_name, ue)
-    result = submit_celery_task(
-        task=get_worker_node_info,
-        queue_info=host_queue_info,
-        operation_name="get_worker_node_data",
-        error_code="GET_WORKER_NODE_DATA_ERROR",
-        additional_data={"host_name": host_name},
-    )
-    # submit_celery_task already returns your standard shape (if you wrote it that way),
-    # but to guarantee the contract, we normalize here:
-    return _envelope_success("Task submitted successfully", result.get("data", result))
+    host = store.get_host(host_name) or {}
+    return _envelope_success("Worker node data retrieved from Redis", host)
 
+
+# @log_to_file(logger)
+# @app.get("/get_worker_node_ip/", tags=["Worker Nodes"])
+# async def get_worker_node_ip(host_name: str, user: str = Depends(get_current_user)):
+#     host_queue_info = create_host_queue_info(host_name, ue)
+#     result = submit_celery_task(
+#         task=get_host_ip,
+#         queue_info=host_queue_info,
+#         operation_name="get_worker_node_ip",
+#         error_code="GET_WORKER_NODE_IP_ERROR",
+#         additional_data={"host_name": host_name},
+#     )
+#     return _envelope_success("Task submitted successfully", result.get("data", result))
 
 @log_to_file(logger)
 @app.get("/get_worker_node_ip/", tags=["Worker Nodes"])
 async def get_worker_node_ip(host_name: str, user: str = Depends(get_current_user)):
-    host_queue_info = create_host_queue_info(host_name, ue)
-    result = submit_celery_task(
-        task=get_host_ip,
-        queue_info=host_queue_info,
-        operation_name="get_worker_node_ip",
-        error_code="GET_WORKER_NODE_IP_ERROR",
-        additional_data={"host_name": host_name},
-    )
-    return _envelope_success("Task submitted successfully", result.get("data", result))
+    host = store.get_host(host_name) or {}
+    return _envelope_success("Worker node IP retrieved from Redis", {"ip_address": host.get("ip_address")})
 
+#
+# @log_to_file(logger)
+# @app.get("/get_worker_usage_data/", tags=["Worker Nodes"])
+# async def get_worker_usage_data(host_name: str, user: str = Depends(get_current_user)):
+#     host_queue_info = create_host_queue_info(host_name, ue)
+#     result = submit_celery_task(
+#         task=get_usage,
+#         queue_info=host_queue_info,
+#         operation_name="get_worker_usage_data",
+#         error_code="GET_WORKER_USAGE_DATA_ERROR",
+#         additional_data={"host_name": host_name},
+#     )
+#     return _envelope_success("Task submitted successfully", result.get("data", result))
+#
 
 @log_to_file(logger)
 @app.get("/get_worker_usage_data/", tags=["Worker Nodes"])
 async def get_worker_usage_data(host_name: str, user: str = Depends(get_current_user)):
-    host_queue_info = create_host_queue_info(host_name, ue)
-    result = submit_celery_task(
-        task=get_usage,
-        queue_info=host_queue_info,
-        operation_name="get_worker_usage_data",
-        error_code="GET_WORKER_USAGE_DATA_ERROR",
-        additional_data={"host_name": host_name},
-    )
-    return _envelope_success("Task submitted successfully", result.get("data", result))
-
+    host = store.get_host(host_name) or {}
+    return _envelope_success("Worker usage retrieved from Redis", host.get("usage_metrics") or {})
 
 # ==================== AWS Management ====================
 
@@ -412,8 +463,10 @@ async def create_instances(request: CreateInstanceRequest, user: str = Depends(g
 @log_to_file(logger)
 @handle_async_errors("terminate_namespace", "TASK_SUBMISSION_ERROR")
 @app.post("/terminate-namespace/", tags=["AWS Management"])
-async def terminate_namespace(request: TerminateInstanceRequest, user: str = Depends(get_current_user
-)):
+async def terminate_namespace(
+    request: TerminateInstanceRequest,
+    user: str = Depends(get_current_user)
+):
     instances_to_terminate = rd.get_instance_ids_namespace(request.namespace)
     if not instances_to_terminate:
         raise NotFoundError(
@@ -470,31 +523,92 @@ async def create_pods(request: CreatePodsRequest, user: str = Depends(get_curren
     return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
+# @log_to_file(logger)
+# @app.post("/containerd/list_namespaces_and_pods/", tags=["Containerd - Pods"])
+# async def list_namespaces_and_pods_api(request: ContainerdHostRequest, user: str = Depends(get_current_user)):
+#     result = submit_celery_task(
+#         task=list_namespaces_and_pods_task,
+#         queue_info=create_host_queue_info(request.host_name, ue),
+#         operation_name="list_namespaces_and_pods",
+#         error_code="LIST_NAMESPACES_PODS_ERROR",
+#         additional_data={"host_name": request.host_name},
+#     )
+#     return _envelope_success("Task submitted successfully", result.get("data", result))
+#
+
 @log_to_file(logger)
 @app.post("/containerd/list_namespaces_and_pods/", tags=["Containerd - Pods"])
-async def list_namespaces_and_pods_api(request: ContainerdHostRequest, user: str = Depends(get_current_user)):
-    result = submit_celery_task(
-        task=list_namespaces_and_pods_task,
-        queue_info=create_host_queue_info(request.host_name, ue),
-        operation_name="list_namespaces_and_pods",
-        error_code="LIST_NAMESPACES_PODS_ERROR",
-        additional_data={"host_name": request.host_name},
-    )
-    return _envelope_success("Task submitted successfully", result.get("data", result))
+async def list_namespaces_and_pods_api(
+    request: ContainerdHostRequest,
+    user: str = Depends(get_current_user),
+):
+    # Host scoped view (what UI uses)
+    pods = store.get_pods_by_host(request.host_name)
+
+    # Build namespaces + inventory grouped by namespace
+    inventory: Dict[str, Any] = {}
+    namespaces = set()
+
+    for p in pods:
+        ns = p.get("namespace") or "default"
+        namespaces.add(ns)
+
+        # Normalize pod record for UI (you can add/remove fields here)
+        pod_view = {
+            "pod_id": p.get("pod_id"),
+            "pod_name": p.get("pod_name") or p.get("pod_id"),
+            "namespace": ns,
+            "hostname": p.get("hostname") or request.host_name,
+            "ip_address": p.get("ip_address"),
+            "status": p.get("status") or "unknown",
+            "pause_container": p.get("pause_container"),
+            "containers": p.get("containers") or [],
+        }
+
+        inventory.setdefault(ns, []).append(pod_view)
+
+    payload = {
+        "host_name": request.host_name,
+        "namespaces": sorted(list(namespaces)),
+        "inventory": inventory,
+        "pod_count": sum(len(v) for v in inventory.values()),
+    }
+    return _envelope_success("Namespaces and pods retrieved from Redis", payload)
 
 
+
+# @log_to_file(logger)
+# @app.post("/containerd/list_pods_by_namespace/", tags=["Containerd - Pods"])
+# async def list_pods_by_namespace_api(request: PodNamespaceHostRequest, user: str = Depends(get_current_user)):
+#     result = submit_celery_task(
+#         task=list_pods_by_namespace_task,
+#         args=([request.namespace]),
+#         queue_info=create_host_queue_info(request.host_name, ue),
+#         operation_name="list_pods_by_namespace",
+#         error_code="LIST_PODS_BY_NAMESPACE_ERROR",
+#         additional_data={"host_name": request.host_name, "namespace": request.namespace},
+#     )
+#     return _envelope_success("Task submitted successfully", result.get("data", result))
 @log_to_file(logger)
 @app.post("/containerd/list_pods_by_namespace/", tags=["Containerd - Pods"])
-async def list_pods_by_namespace_api(request: PodNamespaceHostRequest, user: str = Depends(get_current_user)):
-    result = submit_celery_task(
-        task=list_pods_by_namespace_task,
-        args=([request.namespace]),
-        queue_info=create_host_queue_info(request.host_name, ue),
-        operation_name="list_pods_by_namespace",
-        error_code="LIST_PODS_BY_NAMESPACE_ERROR",
-        additional_data={"host_name": request.host_name, "namespace": request.namespace},
-    )
-    return _envelope_success("Task submitted successfully", result.get("data", result))
+async def list_pods_by_namespace_api(
+    request: PodNamespaceHostRequest,
+    user: str = Depends(get_current_user),
+):
+    # If you want host+namespace scoped list:
+    pods = store.get_pods_by_host_and_namespace(request.host_name, request.namespace)
+
+    # If you want namespace-wide across all hosts, use:
+    # pods = store.get_pods_by_namespace(request.namespace)
+
+    payload = {
+        "host_name": request.host_name,
+        "namespace": request.namespace,
+        "pods": pods,
+        "pod_count": len(pods),
+    }
+    return _envelope_success("Pods retrieved from Redis", payload)
+
 
 
 @log_to_file(logger)
@@ -539,6 +653,56 @@ async def destroy_all_pods_api(request: DestroyAllPodsRequest, user: str = Depen
         additional_data={"host_name": request.host_name, "namespace": request.namespace},
     )
     return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+# ==================== Deployment Scheduler ====================
+
+@log_to_file(logger)
+@handle_async_errors("schedule_deployment", "SCHEDULER_ERROR")
+@app.post("/scheduler/deploy/", tags=["Deployment Scheduler"])
+async def schedule_deployment(
+    request: ScheduleDeploymentRequest,
+    use_chain: bool = True,
+    user: str = Depends(get_current_user)
+):
+    """Schedule a deployment from Kubernetes-like YAML using Celery chain.
+    
+    This endpoint uses a Celery chain of tasks:
+    1. evaluate_deployment_requirements_task - Parses YAML, evaluates resources
+    2. create_aws_nodes_if_needed_task - Creates AWS nodes if needed
+    3. place_and_create_pods_task - Places and creates pods on hosts
+    
+    Args:
+        request: ScheduleDeploymentRequest with YAML content
+        use_chain: Use Celery chain tasks (default: True)
+        user: Authenticated user
+        
+    Returns:
+        Task submission result with task_id for monitoring
+    """
+    try:
+        result = schedule_deployment_from_yaml(request.yaml_content, use_chain=use_chain)
+        
+        if result.get('status') == 'submitted':
+            # Chain task was submitted
+            return _envelope_success(
+                "Deployment scheduling chain submitted",
+                {
+                    'task_id': result.get('task_id'),
+                    'message': 'Use /task/{task_id} to check status',
+                }
+            )
+        else:
+            # Synchronous result
+            return _envelope_success("Deployment scheduled successfully", result)
+    
+    except Exception as e:
+        logger.error(f"Failed to schedule deployment: {e}", exc_info=True)
+        return create_error_response(
+            error_code="SCHEDULER_ERROR",
+            message=f"Failed to schedule deployment: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 # ==================== Containerd - Containers ====================
@@ -588,7 +752,9 @@ async def prune_namespace_api(request: PruneNamespaceRequest, user: str = Depend
 
 @log_to_file(logger)
 @app.post("/containerd/get_container_info/", tags=["Containerd - Containers"])
-async def get_container_info_api(request: ContainerInfoRequest, user: str = Depends(get_current_user)
+async def get_container_info_api(
+    request: ContainerInfoRequest,
+    user: str = Depends(get_current_user)
 ):
     result = submit_celery_task(
         task=get_container_info_task,
