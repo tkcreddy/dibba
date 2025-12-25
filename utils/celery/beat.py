@@ -52,5 +52,16 @@ celery_app.conf.update(
         'task': 'utils.celery.tasks.refresh_health_check_arguments',
         'schedule': 10.0,  # Refresh args every 30 seconds
     },
+    'collect-host-pod-info-every-30-seconds': {
+        'task': 'utils.celery.tasks.host_pod_sync_tasks.collect_and_send_host_pod_info',
+        'schedule': 30.0,  # Run every 30 seconds
+        'options': {
+            'queue': 'host_pod_sync',  # Dedicated queue for sync tasks
+            'exchange': secure_exchange,
+            'routing_key': 'host_pod_sync',
+            'delivery_mode': 2,
+            'expires': 60,  # Expire if not processed within 60 seconds
+        }
+    },
     },
 )

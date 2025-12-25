@@ -75,3 +75,9 @@ class CreatePodsRequest(BaseModel):
     host_name: str
     namespace: str = "k8s.io"
     containers: List[ContainerSpec]
+
+
+class ScheduleDeploymentRequest(BaseModel):
+    """Request model for scheduling a deployment from YAML."""
+    model_config = ConfigDict(extra="forbid")
+    yaml_content: str = Field(..., description="Kubernetes-like deployment YAML content")

@@ -176,7 +176,7 @@ class RedisInterface:
         Returns:
             List of node names
         """
-        return self._extracted_from_get_node_config_more_mem_2("cpu", cpu)
+        return self._get_nodes_by_field_threshold("cpu", cpu)
 
     @log_to_file(logger)
     def get_node_config_more_mem(self, memory: Union[int, float, str]) -> List[str]:
@@ -188,13 +188,16 @@ class RedisInterface:
         Returns:
             List of node names
         """
-        return self._extracted_from_get_node_config_more_mem_2("memory", memory)
+        return self._get_nodes_by_field_threshold("memory", memory)
 
 
 
-    # TODO Rename this here and in `get_node_config_more_cpu` and `get_node_config_more_mem`
     @log_to_file(logger)
-    def _extracted_from_get_node_config_more_mem_2(self, field: str, value: Union[int, float, str]) -> List[str]:
+    def _get_nodes_by_field_threshold(
+        self,
+        field: str,
+        value: Union[int, float, str]
+    ) -> List[str]:
         """Helper method to get nodes with field value greater than specified.
         
         Args:
