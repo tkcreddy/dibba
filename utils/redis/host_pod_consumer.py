@@ -219,6 +219,51 @@ class HostPodConsumer:
                 for namespace, pods_list in pods_by_namespace.items():
                     if isinstance(pods_list, list):
                         try:
+                            # Get current pod IDs from the sync message
+                            current_pod_ids = set()
+                            for pod_data in pods_list:
+                                if isinstance(pod_data, dict):
+                                    pod_id = pod_data.get("pod_id")
+                                    if pod_id and isinstance(pod_id, str):
+                                        current_pod_ids.add(pod_id)
+                            
+                            # Get existing pod IDs from Redis for this host/namespace
+                            existing_pods = self.store.get_pods_by_host_and_namespace(hostname, namespace)
+                            existing_pod_ids = {p.get("pod_id") for p in existing_pods if p.get("pod_id")}
+                            
+                            # Find pods that are in Redis but not in current sync (terminated pods)
+                            terminated_pod_ids = existing_pod_ids - current_pod_ids
+                            
+                            # Remove terminated pods from Redis
+                            for pod_id in terminated_pod_ids:
+                                try:
+                                    self.integration.remove_pod(pod_id)
+                                    logger.info(
+                                        f"Removed terminated pod {pod_id} from Redis "
+                                        f"(host: {hostname}, namespace: {namespace})"
+                                    )
+                                except Exception as remove_err:
+                                    logger.warning(
+                                        f"Failed to remove terminated pod {pod_id}: {remove_err}",
+                                        exc_info=True
+                                    )
+                            
+                            # Update/add current pods
+                            # Check each pod's status and set startup_time if it just became running
+                            for pod_data in pods_list:
+                                if isinstance(pod_data, dict):
+                                    pod_id = pod_data.get("pod_id")
+                                    if pod_id and isinstance(pod_id, str):
+                                        # Get existing pod data to check if startup_time needs to be set
+                                        existing_pod = self.store.get_pod(pod_id)
+                                        pod_status = pod_data.get("pause", {}).get("status") or pod_data.get("status", "unknown")
+                                        
+                                        # If pod is running and startup_time is not set, add it to pod_data
+                                        if pod_status in ["running", "RUNNING"] and existing_pod:
+                                            if not existing_pod.get("startup_time"):
+                                                pod_data["startup_time"] = datetime.now(timezone.utc).isoformat()
+                            
+                            # Update/add current pods (normal update - will preserve startup_time if set above)
                             self.integration.update_pod_from_list_result(
                                 pods_list=pods_list,
                                 hostname=hostname,
@@ -227,7 +272,8 @@ class HostPodConsumer:
                         except Exception as e:
                             logger.warning(
                                 f"Failed to update pods for {hostname} "
-                                f"in namespace {namespace}: {e}"
+                                f"in namespace {namespace}: {e}",
+                                exc_info=True
                             )
         
         logger.debug(f"Successfully processed message for host {hostname}")

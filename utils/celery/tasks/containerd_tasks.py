@@ -152,10 +152,15 @@ def _ctr_task_kill_rm(namespace: str, task_id: str) -> Dict[str, Any]:
 @celery_app.task
 @log_to_file(logger)
 def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwargs):
+    from datetime import datetime, timezone
+    
     ns = app_namespace or DEFAULT_NAMESPACE
     sock = DEFAULT_CONTAINERD_SOCKET
     cni_net = DEFAULT_CNI_NET_NAME
     cni_dev = DEFAULT_IFNAME
+    
+    # Capture creation time when pod creation starts
+    creation_time = datetime.now(timezone.utc).isoformat()
 
     try:
         client = ContainerdClient(socket=sock, namespace=ns)
@@ -219,6 +224,9 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwa
         # 5) Add app containers into the same pod namespaces
         # -------------------------------------------------
         apps = pods.add_containers(pod, container_specs)
+        
+        # Capture startup time when all containers are added (pod is running)
+        startup_time = datetime.now(timezone.utc).isoformat()
 
         return _safe_json({
             "namespace": ns,
@@ -227,6 +235,8 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwa
             "pod": pod,
             "pod_ipv4": pod_ipv4,
             "apps": apps,
+            "creation_time": creation_time,
+            "startup_time": startup_time,
         })
 
     except Exception as err:

@@ -174,16 +174,28 @@ def stop_sync_thread() -> None:
             logger.info("Sync thread stopped successfully")
 
 
+# Export celery_app for Celery CLI
+# This allows: celery -A utils.celery.worker_node worker
+app = celery_app
+
 # Celery worker signals to start/stop sync thread
-@celery_app.signals.worker_process_init.connect
-def worker_process_init_handler(sender=None, **kwargs):
-    """Called when a worker process starts."""
-    logger.info("Worker process initialized, starting host/pod sync thread...")
-    start_sync_thread()
+# Use standard signal imports to avoid attribute errors during app discovery
+try:
+    from celery.signals import worker_process_init, worker_process_shutdown
+    
+    @worker_process_init.connect
+    def worker_process_init_handler(sender=None, **kwargs):
+        """Called when a worker process starts."""
+        logger.info("Worker process initialized, starting host/pod sync thread...")
+        start_sync_thread()
 
-
-@celery_app.signals.worker_process_shutdown.connect
-def worker_process_shutdown_handler(sender=None, **kwargs):
-    """Called when a worker process shuts down."""
-    logger.info("Worker process shutting down, stopping host/pod sync thread...")
-    stop_sync_thread()
+    @worker_process_shutdown.connect
+    def worker_process_shutdown_handler(sender=None, **kwargs):
+        """Called when a worker process shuts down."""
+        logger.info("Worker process shutting down, stopping host/pod sync thread...")
+        stop_sync_thread()
+except (ImportError, AttributeError) as e:
+    # If signals can't be imported, log a warning but don't fail
+    # The sync thread can be started manually if needed
+    logger.warning(f"Could not register Celery signals: {e}")
+    logger.info("Sync thread will need to be started manually if signals are unavailable.")

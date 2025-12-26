@@ -22,6 +22,14 @@ class CeleryAppConfig:
             result_serializer='json',
             timezone='UTC',
             enable_utc=True)
+        self.app.conf.broker_transport_options = {
+            "socket_connect_timeout": 3,
+            "socket_timeout": 3,
+            "retry_on_timeout": False,
+        }
+        self.app.conf.redis_socket_connect_timeout = 3
+        self.app.conf.redis_socket_timeout = 3
+        self.app.conf.broker_connection_timeout = 3
 
 # Initialize Celery app
 celery_app = CeleryAppConfig().app

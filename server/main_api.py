@@ -491,6 +491,42 @@ async def terminate_namespace(
     return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
+# ==================== Hosts ====================
+
+@log_to_file(logger)
+@app.get("/hosts/", tags=["Hosts"])
+async def get_all_hosts(user: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """Get all hosts from Redis.
+    
+    Returns:
+        Dictionary with list of hosts and their information
+    """
+    try:
+        hosts = store.get_all_hosts()
+        
+        # Format hosts for UI (extract key fields)
+        host_list = []
+        for host in hosts:
+            host_list.append({
+                "hostname": host.get("hostname"),
+                "ip_address": host.get("ip_address"),
+                "status": host.get("status", "unknown"),
+                "last_updated": host.get("last_updated"),
+            })
+        
+        # Sort by hostname for consistent ordering
+        host_list.sort(key=lambda x: x.get("hostname", ""))
+        
+        payload = {
+            "hosts": host_list,
+            "host_count": len(host_list),
+        }
+        return _envelope_success("Hosts retrieved from Redis", payload)
+    except Exception as e:
+        logger.error(f"Failed to get hosts: {e}", exc_info=True)
+        raise
+
+
 # ==================== Containerd - Pods ====================
 
 @log_to_file(logger)
@@ -563,6 +599,8 @@ async def list_namespaces_and_pods_api(
             "status": p.get("status") or "unknown",
             "pause_container": p.get("pause_container"),
             "containers": p.get("containers") or [],
+            "creation_time": p.get("creation_time") or p.get("created_at"),
+            "startup_time": p.get("startup_time"),
         }
 
         inventory.setdefault(ns, []).append(pod_view)
@@ -611,9 +649,9 @@ async def list_pods_by_namespace_api(
 
 
 
-@log_to_file(logger)
-@app.post("/containerd/terminate_pod/", tags=["Containerd - Pods"])
+@app.post("/containerd/terminate_pod/")
 async def terminate_pod_api(request: TerminatePodRequest, user: str = Depends(get_current_user)):
+    # DO NOT call worker or redis or grpc here beyond enqueueing.
     result = submit_celery_task(
         task=terminate_pod_task,
         args=(request.namespace, request.pod_name),
@@ -621,7 +659,7 @@ async def terminate_pod_api(request: TerminatePodRequest, user: str = Depends(ge
         queue_info=create_host_queue_info(request.host_name, ue),
         operation_name="terminate_pod",
         error_code="TERMINATE_POD_ERROR",
-        additional_data={"host_name": request.host_name, "namespace": request.namespace, "pod_name":request.pod_name},
+        additional_data={...},
     )
     return _envelope_success("Task submitted successfully", result.get("data", result))
 

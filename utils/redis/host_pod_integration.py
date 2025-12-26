@@ -163,6 +163,10 @@ class HostPodIntegration:
             if not isinstance(labels, dict):
                 labels = {}
             
+            # Extract creation_time and startup_time from task result
+            creation_time = pod_result.get("creation_time")
+            startup_time = pod_result.get("startup_time")
+            
             # Save pod information
             self.store.save_pod(
                 pod_id=pod_id,
@@ -174,7 +178,9 @@ class HostPodIntegration:
                 containers=containers,
                 cni_network=cni,
                 labels=labels,
-                status="running"
+                status="running",
+                creation_time=creation_time,
+                startup_time=startup_time
             )
             
             logger.info(
@@ -263,6 +269,10 @@ class HostPodIntegration:
                     }
                     containers.append(container_info)
                 
+                # Extract creation_time and startup_time from pod_data if available
+                creation_time = pod_data.get("creation_time")
+                startup_time = pod_data.get("startup_time")
+                
                 # Save pod information
                 try:
                     self.store.save_pod(
@@ -271,7 +281,9 @@ class HostPodIntegration:
                         hostname=hostname,
                         pause_container=pause,
                         containers=containers,
-                        status=pause.get("status", "unknown")
+                        status=pause.get("status", "unknown"),
+                        creation_time=creation_time,
+                        startup_time=startup_time
                     )
                     updated_count += 1
                 except Exception as e:

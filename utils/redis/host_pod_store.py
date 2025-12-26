@@ -288,7 +288,9 @@ class HostPodStore:
         cni_network: Optional[Dict[str, Any]] = None,
         resources: Optional[Dict[str, Any]] = None,
         labels: Optional[Dict[str, str]] = None,
-        status: str = "running"
+        status: str = "running",
+        creation_time: Optional[str] = None,
+        startup_time: Optional[str] = None
     ) -> None:
         """Save or update pod information.
         
@@ -304,6 +306,8 @@ class HostPodStore:
             resources: Resource specifications
             labels: Pod labels (used to extract application name)
             status: Pod status
+            creation_time: ISO format timestamp when pod was created (optional)
+            startup_time: ISO format timestamp when pod became running (optional)
         """
         if not pod_id or not isinstance(pod_id, str) or not pod_id.strip():
             raise ValueError("pod_id must be a non-empty string")
@@ -329,6 +333,21 @@ class HostPodStore:
                 "pod_id": pod_id,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
+        
+        # Set creation_time if provided, otherwise preserve existing or use created_at
+        if creation_time:
+            pod_data["creation_time"] = creation_time
+        elif "creation_time" not in pod_data:
+            # Use created_at as fallback for creation_time if not set
+            pod_data["creation_time"] = pod_data.get("created_at", datetime.now(timezone.utc).isoformat())
+        
+        # Set startup_time if provided and pod is running, or preserve existing
+        if startup_time:
+            pod_data["startup_time"] = startup_time
+        elif status == "running" and "startup_time" not in pod_data:
+            # If pod is running and startup_time not set, set it now
+            pod_data["startup_time"] = datetime.now(timezone.utc).isoformat()
+        # If status is not running, don't update startup_time (preserve existing)
         
         # Update fields
         if pod_name:
