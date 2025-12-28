@@ -1,9 +1,57 @@
 import random
-from logpkg.log_kcld import LogKCld
+from typing import Optional, List, Dict, Any
+from logpkg.log_kcld import LogKCld,log_to_file
+from utils.redis.redis_interface import RedisInterface
+from utils.redis.host_pod_store import HostPodStore, HostStatus
 
 logger = LogKCld()
 
+@log_to_file(logger)
+def get_worker_nodes_from_redis(
+    redis_interface: Optional[RedisInterface] = None
+) -> List[Dict[str, Any]]:
+    """Get worker nodes from Redis host_pod_store.
+    
+    This function retrieves all online hosts from Redis and returns them
+    as a list of host information dictionaries.
+    
+    Args:
+        redis_interface: Optional RedisInterface instance. If None, creates a new one.
+        
+    Returns:
+        List of host dictionaries with hostname, ip_address, and status.
+        Returns empty list if no hosts found or on error.
+    """
+    try:
+        if redis_interface is None:
+            redis_interface = RedisInterface()
+        
+        store = HostPodStore(redis_interface)
+        hosts = store.get_all_hosts()
+        
+        if not hosts:
+            logger.warning("No hosts found in Redis")
+            return []
+        
+        # Filter to only online hosts and return basic info
+        worker_nodes = []
+        for host in hosts:
+            if host.get("status") == HostStatus.ONLINE.value:
+                worker_nodes.append({
+                    "hostname": host.get("hostname"),
+                    "ip_address": host.get("ip_address"),
+                    "status": host.get("status"),
+                })
+        
+        logger.info(f"Retrieved {len(worker_nodes)} worker nodes from Redis")
+        return worker_nodes
+        
+    except Exception as e:
+        logger.error(f"Failed to get worker nodes from Redis: {e}", exc_info=True)
+        return []
 
+
+@log_to_file(logger)
 def distribute_pods(nodes, applications) -> list[dict]:
     """Distributes application varieties across evenly balanced nodes.
 

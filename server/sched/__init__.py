@@ -1,6 +1,6 @@
-"""Deployment scheduler module."""
+"""Deployment sched module."""
 
-from server.scheduler.scheduler import (
+from server.sched.scheduler import (
     DeploymentScheduler,
     schedule_deployment_from_yaml,
     ResourceConverter,

@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, ValidationError as PydanticValidationError
 from server.api_models import CreatePodsRequest, ScheduleDeploymentRequest
-from server.scheduler.scheduler import schedule_deployment_from_yaml
+from server.sched.scheduler import schedule_deployment_from_yaml
 from utils.redis.host_pod_store import HostPodStore  # adjust path to where you saved that class
 from utils.celery.tasks.aws_tasks import create_worker_nodes, terminate_worker_node
 
@@ -659,7 +659,11 @@ async def terminate_pod_api(request: TerminatePodRequest, user: str = Depends(ge
         queue_info=create_host_queue_info(request.host_name, ue),
         operation_name="terminate_pod",
         error_code="TERMINATE_POD_ERROR",
-        additional_data={...},
+        additional_data={
+            "namespace": request.namespace,
+            "pod_name": request.pod_name,
+            "host_name": request.host_name,
+        },
     )
     return _envelope_success("Task submitted successfully", result.get("data", result))
 
@@ -719,15 +723,30 @@ async def schedule_deployment(
         Task submission result with task_id for monitoring
     """
     try:
+        logger.info("=" * 80)
+        logger.info("DEPLOYMENT SCHEDULING REQUEST RECEIVED")
+        logger.info(f"YAML length: {len(request.yaml_content)} characters")
+        logger.info("=" * 80)
+        
         result = schedule_deployment_from_yaml(request.yaml_content, use_chain=use_chain)
         
         if result.get('status') == 'submitted':
             # Chain task was submitted
+            task_id = result.get('task_id')
+            logger.info(f"Deployment scheduling chain submitted with task_id: {task_id}")
+            logger.info("Chain tasks: 1) evaluate_deployment_requirements, 2) create_aws_nodes_if_needed, 3) place_and_create_pods")
+            logger.info("NOTE: This chain does NOT terminate any pods or nodes")
+            
             return _envelope_success(
                 "Deployment scheduling chain submitted",
                 {
-                    'task_id': result.get('task_id'),
+                    'task_id': task_id,
                     'message': 'Use /task/{task_id} to check status',
+                    'chain_tasks': [
+                        'evaluate_deployment_requirements',
+                        'create_aws_nodes_if_needed',
+                        'place_and_create_pods'
+                    ]
                 }
             )
         else:

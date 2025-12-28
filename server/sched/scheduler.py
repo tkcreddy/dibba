@@ -1,7 +1,7 @@
 """
 Deployment Scheduler for Dibba
 
-This scheduler:
+This sched:
 1. Parses Kubernetes-like deployment YAML
 2. Queries Redis for available resources on worker nodes
 3. Uses cluster_worker_distribution and initial_load_distribution for placement
@@ -15,8 +15,7 @@ from dataclasses import dataclass
 from logpkg.log_kcld import LogKCld, log_to_file
 from utils.redis.redis_interface import RedisInterface
 from utils.redis.host_pod_store import HostPodStore, HostStatus
-from server.nodes.cluster_worker_distribution import ClusterWorkerDistribution
-from server.nodes.initial_load_distribution import distribute_pods
+from server.nodes.distribute_nodes_services import get_worker_nodes_from_redis,ClusterWorkerDistribution
 from utils.celery.tasks.aws_tasks import create_worker_nodes
 from utils.celery.tasks.containerd_tasks import create_pod_task
 from utils.celery.queue_utils import create_host_queue_info, submit_celery_task
@@ -124,13 +123,34 @@ class ResourceConverter:
     def parse_resources(resources: Dict[str, Any]) -> ResourceRequirements:
         """Parse Kubernetes resources dict.
         
+        Supports two formats:
+        1. Kubernetes-style: resources: { limits: { cpu: "500m", memory: "256Mi" }, requests: {...} }
+        2. Direct format: resources: { cpu_millicores: 500, memory: "256Mi" }
+        
         Args:
-            resources: Resources dict with 'requests' and/or 'limits'
+            resources: Resources dict with 'requests' and/or 'limits', or direct cpu_millicores/memory
             
         Returns:
             ResourceRequirements object
         """
-        # Use limits if available, otherwise requests
+        # Check for direct format first (cpu_millicores and memory directly in resources)
+        if 'cpu_millicores' in resources or ('memory' in resources and 'limits' not in resources and 'requests' not in resources):
+            # Direct format
+            cpu_millicores = resources.get('cpu_millicores', 0)
+            if isinstance(cpu_millicores, str):
+                cpu_millicores = ResourceConverter.parse_cpu(cpu_millicores)
+            memory_str = resources.get('memory', '0')
+            memory_mb, memory_bytes = ResourceConverter.parse_memory(memory_str)
+            cpu_cores = cpu_millicores / 1000.0
+            
+            return ResourceRequirements(
+                cpu_millicores=cpu_millicores,
+                memory_mb=memory_mb,
+                cpu_cores=cpu_cores,
+                memory_bytes=memory_bytes
+            )
+        
+        # Kubernetes-style format: use limits if available, otherwise requests
         cpu_str = None
         memory_str = None
         
@@ -208,7 +228,8 @@ class DeploymentParser:
 
 class HostResourceCalculator:
     """Calculate available resources on hosts from Redis."""
-    
+
+    @log_to_file(logger)
     def __init__(self, host_pod_store: HostPodStore):
         """Initialize with HostPodStore.
         
@@ -298,10 +319,10 @@ class HostResourceCalculator:
 
 
 class DeploymentScheduler:
-    """Main scheduler class."""
+    """Main sched class."""
     
     def __init__(self):
-        """Initialize scheduler."""
+        """Initialize sched."""
         self.redis_interface = RedisInterface()
         self.host_store = HostPodStore(self.redis_interface)
         self.resource_calculator = HostResourceCalculator(self.host_store)
@@ -536,7 +557,7 @@ class DeploymentScheduler:
         
         return results
 
-
+@log_to_file(logger)
 def schedule_deployment_from_yaml(yaml_content: str, use_chain: bool = True) -> Dict[str, Any]:
     """Convenience function to schedule a deployment from YAML.
     
@@ -558,7 +579,7 @@ def schedule_deployment_from_yaml(yaml_content: str, use_chain: bool = True) -> 
             'message': 'Deployment scheduling chain submitted. Use task_id to check status.',
         }
     else:
-        # Use synchronous scheduler
+        # Use synchronous sched
         scheduler = DeploymentScheduler()
         return scheduler.schedule_deployment(yaml_content)
 
@@ -596,6 +617,6 @@ spec:
         - containerPort: 80
 """
     
-    result = schedule_deployment_from_yaml(example_yaml)
+    result = schedule_deployment_from_yaml(example_yaml, use_chain=True)
     logger.info(f"Scheduling result: {result}")
 

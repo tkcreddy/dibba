@@ -10,10 +10,14 @@ read_config = rc()
 key = read_config.encryption_config['key']
 encode_util = UtilitiesExtension(key)
 aws_interface_queue_name = encode_util.encode_hostname_with_key('aws_interface')
+scheduler_queue_name = encode_util.encode_hostname_with_key('scheduler')
 
 celery_app.conf.task_queues = [
+    Queue(aws_interface_queue_name, exchange=secure_exchange, routing_key=aws_interface_queue_name),
+    Queue(scheduler_queue_name, exchange=secure_exchange, routing_key=scheduler_queue_name),
+]
 
-            Queue(aws_interface_queue_name, exchange=secure_exchange, routing_key=aws_interface_queue_name),
-
-        ]
 celery_app.autodiscover_tasks(['utils.celery.tasks.aws_tasks'])
+celery_app.conf.include = [
+    "utils.celery.tasks.scheduler_tasks"
+]
