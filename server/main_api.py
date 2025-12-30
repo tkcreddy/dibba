@@ -809,14 +809,23 @@ async def list_namespaces_and_pods_api(
                 
                 if app_label and ns:
                     # Try to find deployment by namespace and app_label (most efficient)
+                    logger.debug(f"Looking for deployment with app_label={app_label}, namespace={ns} for pod {pod_id}")
                     deployments = deployment_store.get_deployments_by_namespace(ns)
+                    logger.debug(f"Found {len(deployments)} deployments in namespace {ns}")
                     for deployment in deployments:
-                        if deployment.get("app_label") == app_label and deployment.get("namespace") == ns:
+                        dep_app_label = deployment.get("app_label")
+                        dep_namespace = deployment.get("namespace")
+                        logger.debug(f"Checking deployment: app_label={dep_app_label}, namespace={dep_namespace}")
+                        if dep_app_label == app_label and dep_namespace == ns:
                             deployment_spec = deployment.get("deployment_spec", {})
+                            logger.debug(f"Deployment spec keys: {list(deployment_spec.keys())}")
                             containers_spec = deployment_spec.get("containers", [])
+                            logger.debug(f"Found {len(containers_spec)} containers in deployment spec")
                             for container_spec in containers_spec:
                                 if isinstance(container_spec, dict):
+                                    logger.debug(f"Container spec keys: {list(container_spec.keys())}")
                                     container_ports = container_spec.get("ports", [])
+                                    logger.debug(f"Container {container_spec.get('name')} has ports: {container_ports}")
                                     if isinstance(container_ports, list):
                                         for port in container_ports:
                                             if isinstance(port, dict):
@@ -824,8 +833,10 @@ async def list_namespaces_and_pods_api(
                                                 protocol = port.get("protocol", "TCP")
                                                 if port_num:
                                                     ports.append(f"{port_num}/{protocol}")
+                                                    logger.debug(f"Added port {port_num}/{protocol} for pod {pod_id}")
                                             elif isinstance(port, (int, str)):
                                                 ports.append(str(port))
+                                                logger.debug(f"Added port {port} for pod {pod_id}")
                             if ports:
                                 logger.info(f"Found ports {ports} for pod {pod_id} from deployment store (app: {app_label}, namespace: {ns})")
                                 break
@@ -912,6 +923,172 @@ async def list_namespaces_and_pods_api(
         "pod_count": sum(len(v) for v in inventory.values()),
     }
     return _envelope_success("Namespaces and pods retrieved from Redis", payload)
+
+
+@log_to_file(logger)
+@app.get("/containerd/list_pods_by_filter/", tags=["Containerd - Pods"])
+async def list_pods_by_filter_api(
+    namespace: Optional[str] = None,
+    app_name: Optional[str] = None,
+    user: str = Depends(get_current_user),
+):
+    """List pods filtered by namespace and/or app_name across all hosts.
+    
+    Args:
+        namespace: Optional namespace filter
+        app_name: Optional app name filter
+        user: Authenticated user
+        
+    Returns:
+        List of pods matching the filters with IP address, ports, creation time, and startup time
+    """
+    try:
+        from utils.redis.deployment_store import DeploymentStore
+        
+        deployment_store = DeploymentStore(rd)
+        
+        # Get all hosts
+        all_hosts = store.get_all_hosts()
+        all_pods = []
+        seen_pod_ids = set()  # Track seen pod IDs to avoid duplicates
+        
+        # Collect pods from all hosts, deduplicating by pod_id
+        for host in all_hosts:
+            hostname = host.get("hostname")
+            if hostname:
+                host_pods = store.get_pods_by_host(hostname)
+                for p in host_pods:
+                    pod_id = p.get("pod_id")
+                    if pod_id and pod_id not in seen_pod_ids:
+                        seen_pod_ids.add(pod_id)
+                        all_pods.append(p)
+        
+        # Apply filters
+        filtered_pods = []
+        for p in all_pods:
+            pod_ns = p.get("namespace") or "default"
+            pod_labels = p.get("labels", {})
+            pod_app_label = None
+            
+            if isinstance(pod_labels, dict):
+                pod_app_label = pod_labels.get("app")
+            
+            # If not in labels, try reverse lookup from pod index
+            if not pod_app_label:
+                pod_id = p.get("pod_id")
+                if pod_id:
+                    try:
+                        app_index_pattern = "pod:index:app:*"
+                        for app_index_key in rd.redis_client.scan_iter(match=app_index_pattern):
+                            if rd.redis_client.sismember(app_index_key, pod_id):
+                                pod_app_label = app_index_key.split(":")[-1]
+                                break
+                    except Exception:
+                        pass
+            
+            # Apply namespace filter
+            if namespace and pod_ns != namespace:
+                continue
+            
+            # Apply app_name filter
+            if app_name and pod_app_label != app_name:
+                continue
+            
+            # Extract IP address (same logic as list_namespaces_and_pods_api)
+            ip_address = p.get("ip_address")
+            pod_id = p.get("pod_id")
+            hostname = p.get("hostname")
+            
+            # Try etcd if IP not found
+            if not ip_address:
+                try:
+                    from utils.etcd.etcd_interface import get_etcd_interface_from_config
+                    etcd_interface = get_etcd_interface_from_config()
+                    if etcd_interface and pod_id and hostname:
+                        etcd_pod_ips = etcd_interface.get_pods_by_node(hostname)
+                        if etcd_pod_ips:
+                            if pod_id in etcd_pod_ips:
+                                ip_address = etcd_pod_ips[pod_id]
+                            else:
+                                for etcd_pod_name, etcd_ip in etcd_pod_ips.items():
+                                    if pod_id in etcd_pod_name or etcd_pod_name in pod_id:
+                                        ip_address = etcd_ip
+                                        break
+                except Exception:
+                    pass
+            
+            # Extract ports (same logic as list_namespaces_and_pods_api)
+            containers = p.get("containers") or []
+            ports = []
+            for container in containers:
+                if isinstance(container, dict):
+                    container_ports = container.get("ports") or []
+                    if isinstance(container_ports, list):
+                        for port in container_ports:
+                            if isinstance(port, dict):
+                                port_num = port.get("containerPort") or port.get("port")
+                                protocol = port.get("protocol", "TCP")
+                                if port_num:
+                                    ports.append(f"{port_num}/{protocol}")
+                            elif isinstance(port, (int, str)):
+                                ports.append(str(port))
+            
+            # Try to get ports from deployment store if not found
+            if not ports and pod_app_label and pod_ns:
+                try:
+                    deployments = deployment_store.get_deployments_by_namespace(pod_ns)
+                    for deployment in deployments:
+                        if deployment.get("app_label") == pod_app_label:
+                            deployment_spec = deployment.get("deployment_spec", {})
+                            containers_spec = deployment_spec.get("containers", [])
+                            for container_spec in containers_spec:
+                                if isinstance(container_spec, dict):
+                                    container_ports = container_spec.get("ports", [])
+                                    if isinstance(container_ports, list):
+                                        for port in container_ports:
+                                            if isinstance(port, dict):
+                                                port_num = port.get("containerPort") or port.get("port")
+                                                protocol = port.get("protocol", "TCP")
+                                                if port_num:
+                                                    ports.append(f"{port_num}/{protocol}")
+                                            elif isinstance(port, (int, str)):
+                                                ports.append(str(port))
+                            if ports:
+                                break
+                except Exception:
+                    pass
+            
+            # Build pod view
+            pod_view = {
+                "pod_id": pod_id,
+                "pod_name": p.get("pod_name") or pod_id,
+                "namespace": pod_ns,
+                "hostname": hostname,
+                "ip_address": ip_address,
+                "ports": sorted(list(set(ports))),
+                "status": p.get("status") or "unknown",
+                "containers": [c.get("name") for c in containers if isinstance(c, dict)],
+                "creation_time": p.get("creation_time") or p.get("created_at"),
+                "startup_time": p.get("startup_time"),
+                "app_label": pod_app_label,
+            }
+            
+            filtered_pods.append(pod_view)
+        
+        return _envelope_success("Pods filtered successfully", {
+            "namespace": namespace,
+            "app_name": app_name,
+            "pods": filtered_pods,
+            "pod_count": len(filtered_pods)
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to filter pods: {e}", exc_info=True)
+        return create_error_response(
+            error_code="FILTER_PODS_ERROR",
+            message=f"Failed to filter pods: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 
