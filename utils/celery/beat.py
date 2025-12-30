@@ -63,5 +63,16 @@ celery_app.conf.update(
             'expires': 60,  # Expire if not processed within 60 seconds
         }
     },
+    'recover-missing-replicas-every-60-seconds': {
+        'task': 'deployment.recover_missing_replicas',
+        'schedule': 60.0,  # Run every 60 seconds
+        'options': {
+            'queue': scheduler_queue_name,
+            'exchange': secure_exchange,
+            'routing_key': scheduler_queue_name,
+            'delivery_mode': 2,
+            'expires': 120,  # Expire if not processed within 120 seconds
+        }
+    },
     },
 )

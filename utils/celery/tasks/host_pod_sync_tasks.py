@@ -5,6 +5,7 @@ This module provides tasks that run on worker nodes to collect host and pod
 information and send it to a Redis queue for processing by a consumer service.
 """
 import json
+import subprocess
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 from socket import gethostname
@@ -104,6 +105,37 @@ def collect_and_send_host_pod_info(
 
 
 @log_to_file(logger)
+def _extract_ip_from_netns(pid: int, ifname: str = "eth0") -> Optional[str]:
+    """Extract IPv4 address from network namespace using pause container PID.
+    
+    Args:
+        pid: Process ID of the pause container
+        ifname: Interface name (default: "eth0")
+        
+    Returns:
+        IP address string or None if extraction fails
+    """
+    try:
+        out = subprocess.check_output(
+            ["nsenter", f"--target={pid}", "--net", "ip", "-j", "addr", "show", "dev", ifname],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        )
+        data = json.loads(out)
+        if data:
+            for ifc in data:
+                for addr in ifc.get("addr_info", []):
+                    if addr.get("family") == "inet" and addr.get("local"):
+                        return addr["local"]
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+        logger.debug(f"Could not extract IP from network namespace (PID: {pid}): {e}")
+    except Exception as e:
+        logger.debug(f"Error extracting IP from network namespace (PID: {pid}): {e}")
+    return None
+
+
+@log_to_file(logger)
 def _collect_host_info(hostname: str) -> Optional[Dict[str, Any]]:
     """Collect host system information.
     
@@ -178,7 +210,25 @@ def _collect_pod_info(
             try:
                 pod_summaries = pod_mgr.runtime.list_pods_and_apps_in_namespace(ns)
                 if isinstance(pod_summaries, list):
-                    pods_by_namespace[ns] = pod_summaries
+                    # Enrich pods with IP addresses from network namespace
+                    enriched_pods = []
+                    for pod_summary in pod_summaries:
+                        if isinstance(pod_summary, dict):
+                            # Try to extract IP from pause container's network namespace
+                            pause_info = pod_summary.get("pause", {})
+                            pause_pid = pause_info.get("pid")
+                            
+                            if isinstance(pause_pid, int) and pause_pid > 0:
+                                pod_ip = _extract_ip_from_netns(pause_pid)
+                                if pod_ip:
+                                    pod_summary["ip_address"] = pod_ip
+                                    logger.debug(f"Extracted IP {pod_ip} for pod {pod_summary.get('pod_id')} from network namespace (PID: {pause_pid})")
+                            
+                            enriched_pods.append(pod_summary)
+                        else:
+                            enriched_pods.append(pod_summary)
+                    
+                    pods_by_namespace[ns] = enriched_pods
                 else:
                     pods_by_namespace[ns] = []
             except Exception as e:

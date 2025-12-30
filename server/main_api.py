@@ -437,9 +437,9 @@ async def create_instances(request: CreateInstanceRequest, user: str = Depends(g
     result = submit_celery_task(
         task=create_worker_nodes,
         args=(
-            aws_config["aws_access_key_id"],
-            aws_config["aws_secret_access_key"],
-            aws_config["region"],
+            None,  # aws_access_key - deprecated, read from config
+            None,  # aws_secret_key - deprecated, read from config
+            aws_config["region"],  # Optional region override
             request.instance_type,
             request.ami_id,
             request.key_name,
@@ -478,9 +478,9 @@ async def terminate_namespace(
     result = submit_celery_task(
         task=terminate_worker_node,
         args=(
-            aws_config["aws_access_key_id"],
-            aws_config["aws_secret_access_key"],
-            aws_config["region"],
+            None,  # aws_access_key - deprecated, read from config
+            None,  # aws_secret_key - deprecated, read from config
+            aws_config["region"],  # Optional region override
             instances_to_terminate,
         ),
         queue_info=aws_queue_info,
@@ -498,15 +498,61 @@ async def terminate_namespace(
 async def get_all_hosts(user: str = Depends(get_current_user)) -> Dict[str, Any]:
     """Get all hosts from Redis.
     
+    Filters out hosts that haven't been updated in the last 180 seconds (3 minutes)
+    and optionally deletes stale hosts from Redis.
+    
     Returns:
-        Dictionary with list of hosts and their information
+        Dictionary with list of active hosts and their information
     """
+    from datetime import datetime, timezone, timedelta
+    
     try:
         hosts = store.get_all_hosts()
         
-        # Format hosts for UI (extract key fields)
-        host_list = []
+        # Calculate cutoff time (180 seconds ago)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=180)
+        stale_hosts = []
+        active_hosts = []
+        
+        # Filter hosts by last_updated timestamp
         for host in hosts:
+            hostname = host.get("hostname")
+            last_updated_str = host.get("last_updated")
+            
+            if not last_updated_str:
+                # If no last_updated, consider it stale
+                logger.warning(f"Host {hostname} has no last_updated timestamp, marking as stale")
+                stale_hosts.append(hostname)
+                continue
+            
+            try:
+                # Parse ISO format timestamp
+                last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
+                
+                # Check if host is stale (not updated in last 180 seconds)
+                if last_updated < cutoff_time:
+                    logger.info(f"Host {hostname} is stale (last updated: {last_updated_str}, cutoff: {cutoff_time.isoformat()})")
+                    stale_hosts.append(hostname)
+                else:
+                    active_hosts.append(host)
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Failed to parse last_updated for host {hostname}: {last_updated_str}, error: {e}")
+                # If we can't parse the timestamp, consider it stale
+                stale_hosts.append(hostname)
+        
+        # Delete stale hosts from Redis
+        if stale_hosts:
+            logger.info(f"Deleting {len(stale_hosts)} stale hosts from Redis: {stale_hosts}")
+            for hostname in stale_hosts:
+                try:
+                    store.delete_host(hostname)
+                    logger.info(f"Deleted stale host {hostname} from Redis")
+                except Exception as e:
+                    logger.error(f"Failed to delete stale host {hostname}: {e}", exc_info=True)
+        
+        # Format active hosts for UI (extract key fields)
+        host_list = []
+        for host in active_hosts:
             host_list.append({
                 "hostname": host.get("hostname"),
                 "ip_address": host.get("ip_address"),
@@ -520,6 +566,7 @@ async def get_all_hosts(user: str = Depends(get_current_user)) -> Dict[str, Any]
         payload = {
             "hosts": host_list,
             "host_count": len(host_list),
+            "stale_hosts_deleted": len(stale_hosts),
         }
         return _envelope_success("Hosts retrieved from Redis", payload)
     except Exception as e:
@@ -585,20 +632,273 @@ async def list_namespaces_and_pods_api(
     inventory: Dict[str, Any] = {}
     namespaces = set()
 
+    # Try to initialize etcd interface for IP lookup fallback
+    etcd_interface = None
+    try:
+        from utils.etcd.etcd_interface import get_etcd_interface_from_config
+        etcd_interface = get_etcd_interface_from_config()
+    except Exception as e:
+        logger.debug(f"ETCD interface not available for IP lookup: {e}")
+
     for p in pods:
         ns = p.get("namespace") or "default"
         namespaces.add(ns)
 
+        # Get IP address - try Redis first, then etcd, then network namespace
+        ip_address = p.get("ip_address")
+        pod_id = p.get("pod_id")
+        hostname = p.get("hostname") or request.host_name
+        
+        # Log IP retrieval for debugging
+        if ip_address:
+            logger.info(f"Retrieved IP {ip_address} from Redis for pod {pod_id}")
+        else:
+            logger.debug(f"No IP address in Redis for pod {pod_id}, will try fallback methods")
+        
+        if not ip_address:
+            # Try etcd first
+            if etcd_interface:
+                try:
+                    if pod_id and hostname:
+                        # Try to get IP from etcd
+                        etcd_pod_ips = etcd_interface.get_pods_by_node(hostname)
+                        if etcd_pod_ips:
+                            logger.debug(f"Found {len(etcd_pod_ips)} pod IPs in etcd for node {hostname}")
+                            # Try exact match first
+                            if pod_id in etcd_pod_ips:
+                                ip_address = etcd_pod_ips[pod_id]
+                                logger.info(f"Found IP {ip_address} for pod {pod_id} via exact match in etcd")
+                            else:
+                                # Try partial match
+                                for etcd_pod_name, etcd_ip in etcd_pod_ips.items():
+                                    if pod_id in etcd_pod_name or etcd_pod_name in pod_id:
+                                        ip_address = etcd_ip
+                                        logger.info(f"Found IP {ip_address} for pod {pod_id} via partial match with {etcd_pod_name} in etcd")
+                                        break
+                        else:
+                            logger.debug(f"No pod IPs found in etcd for node {hostname}")
+                except Exception as e:
+                    logger.warning(f"Failed to get IP from etcd for pod {pod_id}: {e}", exc_info=True)
+            
+            # Fallback: Extract IP from CNI network info stored in Redis
+            if not ip_address:
+                try:
+                    cni_network = p.get("cni_network", {})
+                    if isinstance(cni_network, dict):
+                        # Try to extract IP from CNI result (similar to containerd_tasks._extract_ipv4_from_cni_result)
+                        ifname = cni_network.get("ifname", "eth0")
+                        cni_result = cni_network.get("cni_result") or cni_network
+                        
+                        # Extract IP from CNI result structure
+                        ips = cni_result.get("ips") or []
+                        for ip in ips:
+                            addr = ip.get("address")
+                            version = ip.get("version")
+                            if addr and (version == "4" or ":" not in addr):
+                                ip_address = addr.split("/", 1)[0]
+                                logger.info(f"Extracted IP {ip_address} from CNI network info for pod {pod_id}")
+                                # Save it to Redis for future use
+                                try:
+                                    store.save_pod(
+                                        pod_id=pod_id,
+                                        namespace=ns,
+                                        hostname=hostname,
+                                        ip_address=ip_address,
+                                        pause_container=p.get("pause_container"),
+                                        containers=p.get("containers"),
+                                        status=p.get("status", "running")
+                                    )
+                                except Exception as save_err:
+                                    logger.debug(f"Failed to save IP to Redis: {save_err}")
+                                break
+                        
+                        # If not found in ips, try interfaces
+                        if not ip_address:
+                            ifaces = cni_result.get("interfaces") or []
+                            for itf in ifaces:
+                                if itf.get("name") == ifname:
+                                    for addr in (itf.get("addresses") or itf.get("address") or []):
+                                        if isinstance(addr, str) and ":" not in addr:
+                                            ip_address = addr.split("/", 1)[0]
+                                            logger.info(f"Extracted IP {ip_address} from CNI interface info for pod {pod_id}")
+                                            # Save it to Redis
+                                            try:
+                                                store.save_pod(
+                                                    pod_id=pod_id,
+                                                    namespace=ns,
+                                                    hostname=hostname,
+                                                    ip_address=ip_address,
+                                                    pause_container=p.get("pause_container"),
+                                                    containers=p.get("containers"),
+                                                    status=p.get("status", "running")
+                                                )
+                                            except Exception as save_err:
+                                                logger.debug(f"Failed to save IP to Redis: {save_err}")
+                                            break
+                                        elif isinstance(addr, dict) and "address" in addr and ":" not in addr["address"]:
+                                            ip_address = addr["address"].split("/", 1)[0]
+                                            logger.info(f"Extracted IP {ip_address} from CNI interface dict for pod {pod_id}")
+                                            # Save it to Redis
+                                            try:
+                                                store.save_pod(
+                                                    pod_id=pod_id,
+                                                    namespace=ns,
+                                                    hostname=hostname,
+                                                    ip_address=ip_address,
+                                                    pause_container=p.get("pause_container"),
+                                                    containers=p.get("containers"),
+                                                    status=p.get("status", "running")
+                                                )
+                                            except Exception as save_err:
+                                                logger.debug(f"Failed to save IP to Redis: {save_err}")
+                                            break
+                                    if ip_address:
+                                        break
+                except Exception as e:
+                    logger.debug(f"Failed to extract IP from CNI network info for pod {pod_id}: {e}")
+        else:
+            logger.debug(f"Pod {pod_id} already has IP {ip_address} in Redis")
+
+        # Extract ports from containers
+        containers = p.get("containers") or []
+        ports = []
+        for container in containers:
+            if isinstance(container, dict):
+                # Check for ports in container dict
+                container_ports = container.get("ports") or []
+                if isinstance(container_ports, list):
+                    for port in container_ports:
+                        if isinstance(port, dict):
+                            port_num = port.get("containerPort") or port.get("port")
+                            protocol = port.get("protocol", "TCP")
+                            if port_num:
+                                ports.append(f"{port_num}/{protocol}")
+                        elif isinstance(port, (int, str)):
+                            ports.append(str(port))
+        
+        # If no ports found in containers, try to get from deployment store
+        if not ports:
+            try:
+                from utils.redis.deployment_store import DeploymentStore
+                from utils.redis.host_pod_store import RedisKeyPatterns as PodRedisKeyPatterns
+                deployment_store = DeploymentStore(store.redis_interface)
+                
+                # Try to get app_label from pod labels or pod data
+                app_label = None
+                pod_labels = p.get("labels")
+                if isinstance(pod_labels, dict):
+                    app_label = pod_labels.get("app")
+                
+                # If not found in labels, try to get from pod data directly
+                if not app_label:
+                    app_label = p.get("app_label")
+                
+                # If still not found, try reverse lookup from pod index
+                if not app_label and pod_id:
+                    try:
+                        # Get all app indexes and check which one contains this pod
+                        app_index_pattern = "pod:index:app:*"
+                        for app_index_key in store.redis_interface.redis_client.scan_iter(match=app_index_pattern):
+                            if store.redis_interface.redis_client.sismember(app_index_key, pod_id):
+                                # Extract app_name from key pattern: pod:index:app:{app_name}
+                                app_label = app_index_key.split(":")[-1]
+                                logger.debug(f"Found app_label {app_label} for pod {pod_id} via reverse lookup")
+                                break
+                    except Exception as lookup_err:
+                        logger.debug(f"Failed to reverse lookup app_label for pod {pod_id}: {lookup_err}")
+                
+                if app_label and ns:
+                    # Try to find deployment by namespace and app_label (most efficient)
+                    deployments = deployment_store.get_deployments_by_namespace(ns)
+                    for deployment in deployments:
+                        if deployment.get("app_label") == app_label and deployment.get("namespace") == ns:
+                            deployment_spec = deployment.get("deployment_spec", {})
+                            containers_spec = deployment_spec.get("containers", [])
+                            for container_spec in containers_spec:
+                                if isinstance(container_spec, dict):
+                                    container_ports = container_spec.get("ports", [])
+                                    if isinstance(container_ports, list):
+                                        for port in container_ports:
+                                            if isinstance(port, dict):
+                                                port_num = port.get("containerPort") or port.get("port")
+                                                protocol = port.get("protocol", "TCP")
+                                                if port_num:
+                                                    ports.append(f"{port_num}/{protocol}")
+                                            elif isinstance(port, (int, str)):
+                                                ports.append(str(port))
+                            if ports:
+                                logger.info(f"Found ports {ports} for pod {pod_id} from deployment store (app: {app_label}, namespace: {ns})")
+                                break
+                    
+                    # Fallback: Try to find by app_label only if namespace search didn't work
+                    if not ports:
+                        deployments = deployment_store.get_deployments_by_app(app_label)
+                        for deployment in deployments:
+                            deployment_spec = deployment.get("deployment_spec", {})
+                            containers_spec = deployment_spec.get("containers", [])
+                            for container_spec in containers_spec:
+                                if isinstance(container_spec, dict):
+                                    container_ports = container_spec.get("ports", [])
+                                    if isinstance(container_ports, list):
+                                        for port in container_ports:
+                                            if isinstance(port, dict):
+                                                port_num = port.get("containerPort") or port.get("port")
+                                                protocol = port.get("protocol", "TCP")
+                                                if port_num:
+                                                    ports.append(f"{port_num}/{protocol}")
+                                            elif isinstance(port, (int, str)):
+                                                ports.append(str(port))
+                            if ports:
+                                logger.info(f"Found ports {ports} for pod {pod_id} from deployment store (app: {app_label})")
+                                break
+                elif ns:
+                    # Last resort: Try all deployments in namespace and match by container name/image
+                    deployments = deployment_store.get_deployments_by_namespace(ns)
+                    for deployment in deployments:
+                        deployment_spec = deployment.get("deployment_spec", {})
+                        containers_spec = deployment_spec.get("containers", [])
+                        # Try to match by container name or image
+                        for container in containers:
+                            if isinstance(container, dict):
+                                container_name = container.get("name")
+                                container_image = container.get("image")
+                                for container_spec in containers_spec:
+                                    if isinstance(container_spec, dict):
+                                        spec_name = container_spec.get("name")
+                                        spec_image = container_spec.get("image")
+                                        if (container_name and spec_name and container_name == spec_name) or \
+                                           (container_image and spec_image and container_image == spec_image):
+                                            container_ports = container_spec.get("ports", [])
+                                            if isinstance(container_ports, list):
+                                                for port in container_ports:
+                                                    if isinstance(port, dict):
+                                                        port_num = port.get("containerPort") or port.get("port")
+                                                        protocol = port.get("protocol", "TCP")
+                                                        if port_num:
+                                                            ports.append(f"{port_num}/{protocol}")
+                                                    elif isinstance(port, (int, str)):
+                                                        ports.append(str(port))
+                                            if ports:
+                                                logger.info(f"Found ports {ports} for pod {pod_id} from deployment store by container match (namespace: {ns})")
+                                                break
+                                if ports:
+                                    break
+                        if ports:
+                            break
+            except Exception as e:
+                logger.debug(f"Could not fetch ports from deployment store for pod {pod_id}: {e}")
+        
         # Normalize pod record for UI (you can add/remove fields here)
         pod_view = {
             "pod_id": p.get("pod_id"),
             "pod_name": p.get("pod_name") or p.get("pod_id"),
             "namespace": ns,
             "hostname": p.get("hostname") or request.host_name,
-            "ip_address": p.get("ip_address"),
+            "ip_address": ip_address,  # Use the IP we fetched (from Redis or etcd)
+            "ports": ports,
             "status": p.get("status") or "unknown",
             "pause_container": p.get("pause_container"),
-            "containers": p.get("containers") or [],
+            "containers": containers,
             "creation_time": p.get("creation_time") or p.get("created_at"),
             "startup_time": p.get("startup_time"),
         }
@@ -841,7 +1141,7 @@ async def cleanup_tasks_by_pod_prefix_api(request: CleanupTasksByPodPrefixReques
 
 def run_server():
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run( "server.main_api:app", host="0.0.0.0", port=8000,workers=1)
 
 
 if __name__ == "__main__":

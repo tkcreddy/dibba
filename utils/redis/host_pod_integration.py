@@ -273,18 +273,30 @@ class HostPodIntegration:
                 creation_time = pod_data.get("creation_time")
                 startup_time = pod_data.get("startup_time")
                 
+                # Extract IP address if available (from etcd, network namespace, or pod_data)
+                ip_address = pod_data.get("ip_address")
+                
+                # Log IP extraction for debugging
+                if ip_address:
+                    logger.info(f"Extracted IP {ip_address} for pod {pod_id} from pod_data")
+                else:
+                    logger.debug(f"No IP address found in pod_data for pod {pod_id}")
+                
                 # Save pod information
                 try:
                     self.store.save_pod(
                         pod_id=pod_id,
                         namespace=namespace,
                         hostname=hostname,
+                        ip_address=ip_address,
                         pause_container=pause,
                         containers=containers,
                         status=pause.get("status", "unknown"),
                         creation_time=creation_time,
                         startup_time=startup_time
                     )
+                    if ip_address:
+                        logger.info(f"Saved IP {ip_address} to Redis for pod {pod_id}")
                     updated_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to save pod {pod_id}: {e}")

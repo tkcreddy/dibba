@@ -66,6 +66,9 @@ class _ReadConfig:
     @property
     def redis_queue_config(self):
         return self._config_data['redis_queue']
+    @property
+    def etcd_config(self):
+        return self._config_data.get('etcd', {})
 
 class ReadConfig(_ReadConfig, metaclass=Singleton):
     pass

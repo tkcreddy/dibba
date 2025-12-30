@@ -41,7 +41,8 @@ class HostPodConsumer:
         self,
         redis_interface: RedisInterface,
         batch_size: int = BATCH_SIZE,
-        poll_interval: float = POLL_INTERVAL
+        poll_interval: float = POLL_INTERVAL,
+        enable_etcd: bool = True
     ) -> None:
         """Initialize the consumer.
         
@@ -49,6 +50,7 @@ class HostPodConsumer:
             redis_interface: RedisInterface instance
             batch_size: Number of messages to process in each batch
             poll_interval: Seconds to wait between queue polls
+            enable_etcd: Whether to enable etcd integration for pod IP fetching
         """
         self.redis = redis_interface.redis_client
         self.store = HostPodStore(redis_interface)
@@ -56,12 +58,33 @@ class HostPodConsumer:
         self.batch_size = batch_size
         self.poll_interval = poll_interval
         
+        # Initialize etcd interface if enabled (lazy import to avoid protobuf compatibility issues)
+        self.etcd_interface = None
+        if enable_etcd:
+            try:
+                # Lazy import to avoid protobuf compatibility issues if etcd3 is not properly installed
+                from utils.etcd.etcd_interface import get_etcd_interface_from_config
+                self.etcd_interface = get_etcd_interface_from_config()
+                if self.etcd_interface:
+                    logger.info("ETCD interface initialized for pod IP fetching")
+                else:
+                    logger.warning("ETCD interface not available (not configured or etcd3 not installed)")
+            except ImportError as import_err:
+                logger.warning(f"ETCD interface not available (etcd3 library not installed or incompatible): {import_err}")
+                self.etcd_interface = None
+            except Exception as e:
+                logger.warning(f"Failed to initialize etcd interface: {e}. Continuing without etcd.")
+                self.etcd_interface = None
+        else:
+            self.etcd_interface = None
+        
         # Statistics
         self.stats = {
             "processed": 0,
             "errors": 0,
             "last_processed": None,
-            "start_time": datetime.now(timezone.utc).isoformat()
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "etcd_ips_fetched": 0
         }
     
     @log_to_file(logger)
@@ -263,6 +286,12 @@ class HostPodConsumer:
                                             if not existing_pod.get("startup_time"):
                                                 pod_data["startup_time"] = datetime.now(timezone.utc).isoformat()
                             
+                            # Enrich pods with IP addresses from etcd if available
+                            if self.etcd_interface:
+                                pods_list = self._enrich_pods_with_etcd_ips(
+                                    pods_list, hostname, namespace
+                                )
+                            
                             # Update/add current pods (normal update - will preserve startup_time if set above)
                             self.integration.update_pod_from_list_result(
                                 pods_list=pods_list,
@@ -296,6 +325,81 @@ class HostPodConsumer:
             self.redis.expire(ERROR_QUEUE_NAME, 86400)  # 24 hours
         except Exception as e:
             logger.error(f"Failed to send message to error queue: {e}", exc_info=True)
+    
+    @log_to_file(logger)
+    def _enrich_pods_with_etcd_ips(
+        self,
+        pods_list: List[Dict[str, Any]],
+        hostname: str,
+        namespace: str
+    ) -> List[Dict[str, Any]]:
+        """Enrich pod list with IP addresses from Calico etcd.
+        
+        Args:
+            pods_list: List of pod dictionaries
+            hostname: Host where pods are running
+            namespace: Namespace name
+            
+        Returns:
+            Updated pods list with IP addresses
+        """
+        if not self.etcd_interface:
+            return pods_list
+        
+        try:
+            # Get all pod IPs from etcd for this node
+            etcd_pod_ips = self.etcd_interface.get_pods_by_node(hostname)
+            
+            if not etcd_pod_ips:
+                logger.debug(f"No pod IPs found in etcd for node {hostname}")
+                return pods_list
+            
+            # Map pod names to IPs
+            enriched_count = 0
+            for pod_data in pods_list:
+                if not isinstance(pod_data, dict):
+                    continue
+                
+                pod_id = pod_data.get("pod_id")
+                if not pod_id:
+                    continue
+                
+                # Try to find IP for this pod
+                # Calico workload endpoint names might differ from pod_id
+                # Try exact match first, then partial match
+                pod_ip = None
+                
+                # Try exact match
+                if pod_id in etcd_pod_ips:
+                    pod_ip = etcd_pod_ips[pod_id]
+                else:
+                    # Try partial match (pod_id might be part of Calico workload endpoint name)
+                    for etcd_pod_name, etcd_ip in etcd_pod_ips.items():
+                        if pod_id in etcd_pod_name or etcd_pod_name in pod_id:
+                            pod_ip = etcd_ip
+                            break
+                
+                # If found, add IP to pod data
+                if pod_ip:
+                    pod_data["ip_address"] = pod_ip
+                    enriched_count += 1
+                    logger.debug(f"Enriched pod {pod_id} with IP {pod_ip} from etcd")
+            
+            if enriched_count > 0:
+                self.stats["etcd_ips_fetched"] += enriched_count
+                logger.info(
+                    f"Enriched {enriched_count}/{len(pods_list)} pods with IP addresses "
+                    f"from etcd for host {hostname} in namespace {namespace}"
+                )
+        
+        except Exception as e:
+            logger.warning(
+                f"Failed to enrich pods with etcd IPs for {hostname}: {e}",
+                exc_info=True
+            )
+            # Return original list on error
+        
+        return pods_list
     
     @log_to_file(logger)
     def get_queue_size(self) -> int:

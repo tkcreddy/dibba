@@ -10,8 +10,11 @@ import yaml
 from typing import Dict, Any, List, Optional, Tuple
 from logpkg.log_kcld import LogKCld, log_to_file
 from utils.celery.celery_config import celery_app
+from celery.result import AsyncResult
+from time import sleep
 from utils.redis.redis_interface import RedisInterface
 from utils.redis.host_pod_store import HostPodStore, HostStatus
+from utils.redis.deployment_store import DeploymentStore
 from server.nodes.distribute_nodes_services import ClusterWorkerDistribution,get_worker_nodes_from_redis
 from server.sched.scheduler import (
     DeploymentParser,
@@ -22,9 +25,10 @@ from server.sched.scheduler import (
 )
 from utils.celery.tasks.aws_tasks import create_worker_nodes
 from utils.celery.tasks.containerd_tasks import create_pod_task
-from utils.celery.queue_utils import create_host_queue_info, submit_celery_task
+from utils.celery.queue_utils import create_host_queue_info, create_queue_info, submit_celery_task
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.ReadConfig import ReadConfig as rc
+from utils.exceptions import AWSError
 
 logger = LogKCld()
 
@@ -32,6 +36,24 @@ logger = LogKCld()
 @celery_app.task(name="sched.evaluate_deployment_requirements")
 @log_to_file(logger)
 def evaluate_deployment_requirements_task(yaml_content: str) -> Dict[str, Any]:
+    """Evaluate deployment requirements and check existing resources.
+    
+    This is the first task in the DEPLOYMENT SCHEDULING chain. It:
+    1. Parses the deployment YAML
+    2. Checks available resources from Redis
+    3. Determines if AWS nodes are needed
+    4. Calculates pod placement
+    
+    NOTE: This task is part of the deployment scheduling workflow.
+    It does NOT terminate any pods or nodes.
+    
+    Args:
+        yaml_content: Deployment YAML string
+        
+    Returns:
+        Dictionary with evaluation results including deployment spec, available hosts,
+        placement details, and AWS node requirements
+    """
     """Evaluate deployment requirements and check existing resources.
     
     This is the first task in the DEPLOYMENT SCHEDULING chain. It:
@@ -216,11 +238,14 @@ def evaluate_deployment_requirements_task(yaml_content: str) -> Dict[str, Any]:
         
         result = {
             'status': 'evaluated',
+            'original_yaml': yaml_content,  # Pass YAML through chain for Redis storage
             'deployment': {
                 'name': deployment.name,
                 'namespace': deployment.namespace,
                 'app_label': deployment.app_label,
                 'replicas': deployment.replicas,
+                'min_replicas': getattr(deployment, 'min_replicas', deployment.replicas),
+                'max_replicas': getattr(deployment, 'max_replicas', deployment.replicas),
                 'containers': deployment.containers,
                 'resource_requirements': {
                     'cpu_millicores': deployment.resource_requirements.cpu_millicores,
@@ -300,14 +325,20 @@ def create_aws_nodes_if_needed_task(evaluation_result: Dict[str, Any]) -> Dict[s
         read_config = rc()
         aws_config = read_config.aws_config
         
+        # Create AWS queue info for routing to AWS worker
+        key = read_config.encryption_config['key']
+        encode_util = UtilitiesExtension(key)
+        aws_queue_info = create_queue_info("aws_interface", utilities_extension=encode_util)
+        logger.info(f"Step 2: Routing AWS node creation to queue: {aws_queue_info.get('queue')}")
+        
         # Submit AWS node creation task
         try:
             aws_result = submit_celery_task(
                 task=create_worker_nodes,
                 args=(
-                    aws_config.get("aws_access_key_id"),
-                    aws_config.get("aws_secret_access_key"),
-                    aws_config.get("region"),
+                    None,  # aws_access_key - deprecated, read from config
+                    None,  # aws_secret_key - deprecated, read from config
+                    aws_config.get("region"),  # Optional region override
                 ),
                 kwargs={
                     'instance_type': aws_config.get('instance_type', 't3.medium'),
@@ -318,25 +349,99 @@ def create_aws_nodes_if_needed_task(evaluation_result: Dict[str, Any]) -> Dict[s
                     'namespace': namespace,
                     'MaxCount': required_nodes,
                 },
+                queue_info=aws_queue_info,  # Route to AWS worker queue
                 operation_name="create_aws_nodes",
                 error_code="AWS_NODE_CREATION_ERROR",
             )
             
-            logger.info(f"Step 2: AWS nodes creation task submitted: {aws_result.get('task_id')}")
+            # Extract task_id from response (submit_celery_task returns {"data": {"task_id": ...}})
+            task_id = aws_result.get('data', {}).get('task_id') if isinstance(aws_result, dict) else None
+            logger.info(f"Step 2: AWS nodes creation task submitted with task_id: {task_id}")
             
             # Update evaluation result with AWS info
-            evaluation_result['aws_task_id'] = aws_result.get('task_id')
+            evaluation_result['aws_task_id'] = task_id
             evaluation_result['aws_nodes_created'] = required_nodes
             evaluation_result['aws_status'] = 'submitted'
             
-            # Note: In production, you might want to wait for nodes to be ready
-            # For now, we'll proceed and let the next task handle it
+            # Wait for AWS node creation task to complete
+            if task_id:
+                logger.info(f"Step 2: Waiting for AWS node creation task {task_id} to complete...")
+                aws_task = AsyncResult(task_id, app=celery_app)
+                max_wait_time = 300  # 5 minutes max wait
+                wait_interval = 2  # Check every 2 seconds
+                waited = 0
+                
+                while not aws_task.ready() and waited < max_wait_time:
+                    sleep(wait_interval)
+                    waited += wait_interval
+                    logger.info(f"Step 2: Waiting for AWS nodes... ({waited}s/{max_wait_time}s)")
+                
+                if aws_task.ready():
+                    if aws_task.successful():
+                        logger.info(f"Step 2: AWS node creation completed successfully")
+                        evaluation_result['aws_status'] = 'success'
+                        # Give nodes a moment to register in Redis
+                        logger.info(f"Step 2: Waiting 10 seconds for nodes to register in Redis...")
+                        sleep(10)
+                    else:
+                        error_msg = f"AWS node creation failed: {aws_task.info}"
+                        logger.error(f"Step 2: {error_msg}")
+                        evaluation_result['aws_status'] = 'error'
+                        evaluation_result['aws_error'] = str(aws_task.info)
+                        # Raise exception to stop the chain
+                        raise AWSError(
+                            message=error_msg,
+                            error_code="AWS_NODE_CREATION_FAILED",
+                            details={"task_id": task_id, "task_info": str(aws_task.info)}
+                        )
+                else:
+                    error_msg = f"AWS node creation task did not complete within {max_wait_time}s"
+                    logger.error(f"Step 2: {error_msg}")
+                    evaluation_result['aws_status'] = 'timeout'
+                    evaluation_result['aws_error'] = error_msg
+                    # Raise exception to stop the chain
+                    raise AWSError(
+                        message=error_msg,
+                        error_code="AWS_NODE_CREATION_TIMEOUT",
+                        details={"task_id": task_id, "max_wait_time": max_wait_time}
+                    )
+            else:
+                error_msg = "No task_id returned from AWS node creation, cannot wait for completion"
+                logger.error(f"Step 2: {error_msg}")
+                evaluation_result['aws_status'] = 'error'
+                evaluation_result['aws_error'] = error_msg
+                # Raise exception to stop the chain
+                raise AWSError(
+                    message=error_msg,
+                    error_code="AWS_NODE_CREATION_NO_TASK_ID",
+                    details={"aws_result": aws_result}
+                )
             
+        except AWSError:
+            # Re-raise AWSError to stop the chain
+            raise
         except Exception as e:
             logger.error(f"Step 2: Failed to create AWS nodes: {e}", exc_info=True)
             evaluation_result['aws_status'] = 'error'
             evaluation_result['aws_error'] = str(e)
-            # Continue anyway - might have some existing nodes
+            # Raise exception to stop the chain
+            raise AWSError(
+                message=f"Failed to create AWS nodes: {str(e)}",
+                error_code="AWS_NODE_CREATION_EXCEPTION",
+                details={"original_error": str(e)},
+                cause=e
+            ) from e
+        
+        # Check if AWS status indicates failure
+        aws_status = evaluation_result.get('aws_status')
+        if aws_status in ('error', 'timeout'):
+            error_msg = evaluation_result.get('aws_error', 'AWS node creation failed')
+            logger.error(f"Step 2: AWS node creation failed with status: {aws_status}")
+            raise AWSError(
+                message=error_msg,
+                error_code="AWS_NODE_CREATION_FAILED",
+                details={"aws_status": aws_status, "required_nodes": required_nodes}
+            )
         
         return evaluation_result
     
@@ -371,9 +476,29 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
         logger.info("DEPLOYMENT SCHEDULING CHAIN - Step 3: Placing and Creating Pods")
         logger.info("=" * 80)
         logger.info(f"Step 3: Received evaluation_result type: {type(evaluation_result)}, keys: {list(evaluation_result.keys()) if isinstance(evaluation_result, dict) else 'Not a dict'}")
+        
+        # Check for errors from previous steps
         if evaluation_result.get('status') == 'error':
-            logger.error("Step 3: Skipping pod creation due to previous error")
-            return evaluation_result
+            error_msg = evaluation_result.get('error', 'Previous step failed')
+            logger.error(f"Step 3: Skipping pod creation due to previous error: {error_msg}")
+            return {
+                'status': 'error',
+                'error': error_msg,
+                'deployment': evaluation_result.get('deployment', {}).get('name', 'unknown'),
+            }
+        
+        # Check if AWS node creation failed
+        aws_status = evaluation_result.get('aws_status')
+        if aws_status in ('error', 'timeout'):
+            error_msg = evaluation_result.get('aws_error', 'AWS node creation failed')
+            logger.error(f"Step 3: Cannot proceed - AWS node creation failed with status: {aws_status}, error: {error_msg}")
+            return {
+                'status': 'error',
+                'error': f"AWS node creation failed: {error_msg}",
+                'deployment': evaluation_result.get('deployment', {}).get('name', 'unknown'),
+                'aws_status': aws_status,
+                'aws_error': error_msg,
+            }
         
         logger.info("Step 3: Placing and creating pods...")
         logger.info(f"Step 3: Received evaluation_result with placement_details: {bool(evaluation_result.get('placement_details'))}, placement: {bool(evaluation_result.get('placement'))}")
@@ -688,6 +813,29 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                             'status': 'error',
                             'error': str(e)
                         })
+        
+        # Save deployment configuration to Redis for persistence and recovery
+        try:
+            yaml_content = evaluation_result.get('original_yaml', '')
+            if yaml_content:
+                redis_interface = RedisInterface()
+                deployment_store = DeploymentStore(redis_interface)
+                deployment_store.save_deployment(
+                    name=deployment_name,
+                    namespace=namespace,
+                    app_label=app_label,
+                    yaml_content=yaml_content,
+                    deployment_spec=deployment_data,
+                    replicas=replicas,
+                    min_replicas=deployment_data.get('min_replicas'),
+                    max_replicas=deployment_data.get('max_replicas'),
+                )
+                logger.info(f"Step 3: Saved deployment {namespace}/{deployment_name} to Redis for persistence")
+            else:
+                logger.warning(f"Step 3: No YAML content available to save deployment {namespace}/{deployment_name} to Redis")
+        except Exception as e:
+            logger.error(f"Step 3: Failed to save deployment to Redis: {e}", exc_info=True)
+            # Don't fail the entire deployment if Redis save fails
         
         # Return final result
         return {

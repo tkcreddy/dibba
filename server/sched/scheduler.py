@@ -43,6 +43,8 @@ class DeploymentSpec:
     replicas: int
     containers: List[Dict[str, Any]]
     resource_requirements: ResourceRequirements
+    min_replicas: Optional[int] = None  # Minimum replicas (for auto-scaling)
+    max_replicas: Optional[int] = None  # Maximum replicas (for auto-scaling)
 
 
 class ResourceConverter:
@@ -212,11 +214,68 @@ class DeploymentParser:
             resources_dict = container.get('resources', {})
             resource_reqs = ResourceConverter.parse_resources(resources_dict)
             
+            # Parse replicas configuration (support multiple formats)
+            # Format 1: replicas: 2, minReplicas: 1, maxReplicas: 5
+            # Format 2: replicas: { min: 2, max: 10 }
+            replicas_value = spec.get('replicas', 1)
+            
+            # Check if replicas is a dict (Format 2: replicas: { min: 2, max: 10 })
+            if isinstance(replicas_value, dict):
+                logger.info(f"Parsing replicas as dict format: {replicas_value}")
+                min_replicas = replicas_value.get('min')
+                max_replicas = replicas_value.get('max')
+                # Use min as default replicas, or average if both are provided
+                if min_replicas is not None and max_replicas is not None:
+                    replicas = min_replicas  # Start with min
+                    logger.info(f"Using replicas dict format: min={min_replicas}, max={max_replicas}, starting with replicas={replicas}")
+                elif min_replicas is not None:
+                    replicas = min_replicas
+                    max_replicas = min_replicas
+                    logger.info(f"Only min provided in replicas dict: min={min_replicas}, setting max={max_replicas}")
+                elif max_replicas is not None:
+                    replicas = max_replicas
+                    min_replicas = max_replicas
+                    logger.info(f"Only max provided in replicas dict: max={max_replicas}, setting min={min_replicas}")
+                else:
+                    replicas = 1
+                    min_replicas = 1
+                    max_replicas = 1
+                    logger.warning("Replicas dict provided but no min/max found, defaulting to 1")
+            else:
+                # Format 1: replicas is a number, check for separate minReplicas/maxReplicas
+                replicas = int(replicas_value) if replicas_value else 1
+                min_replicas = spec.get('minReplicas') or spec.get('min_replicas')
+                max_replicas = spec.get('maxReplicas') or spec.get('max_replicas')
+                
+                logger.info(f"Parsing replicas as number format: replicas={replicas}, minReplicas={min_replicas}, maxReplicas={max_replicas}")
+                
+                # If minReplicas/maxReplicas are provided, use them
+                # Otherwise, use replicas as both min and max
+                if min_replicas is None:
+                    min_replicas = replicas
+                if max_replicas is None:
+                    max_replicas = replicas
+            
+            # Ensure min <= replicas <= max
+            if min_replicas > replicas:
+                logger.warning(f"min_replicas ({min_replicas}) > replicas ({replicas}), adjusting min_replicas to {replicas}")
+                min_replicas = replicas
+            if max_replicas < replicas:
+                logger.warning(f"max_replicas ({max_replicas}) < replicas ({replicas}), adjusting max_replicas to {replicas}")
+                max_replicas = replicas
+            if min_replicas > max_replicas:
+                logger.warning(f"min_replicas ({min_replicas}) > max_replicas ({max_replicas}), adjusting min_replicas to {max_replicas}")
+                min_replicas = max_replicas
+            
+            logger.info(f"Final replicas configuration: replicas={replicas}, min_replicas={min_replicas}, max_replicas={max_replicas}")
+            
             return DeploymentSpec(
                 name=metadata.get('name', 'unknown'),
                 namespace=metadata.get('namespace', 'default'),
                 app_label=app_label,
-                replicas=spec.get('replicas', 1),
+                replicas=replicas,
+                min_replicas=min_replicas,
+                max_replicas=max_replicas,
                 containers=containers,
                 resource_requirements=resource_reqs
             )
@@ -428,9 +487,9 @@ class DeploymentScheduler:
             result = submit_celery_task(
                 task=create_worker_nodes,
                 args=(
-                    self.aws_config.get("aws_access_key_id"),
-                    self.aws_config.get("aws_secret_access_key"),
-                    self.aws_config.get("region"),
+                    None,  # aws_access_key - deprecated, read from config
+                    None,  # aws_secret_key - deprecated, read from config
+                    self.aws_config.get("region"),  # Optional region override
                 ),
                 kwargs={
                     'instance_type': self.aws_config.get('instance_type', 't3.medium'),

@@ -19,5 +19,6 @@ celery_app.conf.task_queues = [
 
 celery_app.autodiscover_tasks(['utils.celery.tasks.aws_tasks'])
 celery_app.conf.include = [
-    "utils.celery.tasks.scheduler_tasks"
+    "utils.celery.tasks.scheduler_tasks",
+    "utils.celery.tasks.deployment_recovery_tasks"
 ]

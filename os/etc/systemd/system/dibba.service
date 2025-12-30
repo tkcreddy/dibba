@@ -1,0 +1,17 @@
+[Unit]
+Description=My Dibba Server
+After=network.target
+
+[Service]
+Type=forking
+User=root
+PIDFile=/var/run/dibba.pid
+WorkingDirectory=/opt/dibba
+ExecStart=/opt/dibba/scripts/start_dibba.sh
+Restart=on-failure
+RestartSec=5
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
+

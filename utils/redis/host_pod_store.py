@@ -358,6 +358,9 @@ class HostPodStore:
             pod_data["hostname"] = hostname
         if ip_address:
             pod_data["ip_address"] = ip_address
+            logger.info(f"Saving IP {ip_address} for pod {pod_id} to Redis")
+        else:
+            logger.debug(f"No IP address provided for pod {pod_id}")
         if pause_container:
             pod_data["pause_container"] = pause_container
         if containers:
