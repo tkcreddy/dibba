@@ -158,8 +158,13 @@ class HostPodIntegration:
                 }
                 containers.append(container_info)
             
-            # Extract labels if available (from original request)
+            # Extract labels if available (from task result, additional_data, or use empty dict)
             labels = pod_result.get("labels", {})
+            # Also check additional_data for labels (passed from scheduler)
+            if not labels or not isinstance(labels, dict):
+                additional_data = pod_result.get("additional_data", {})
+                if isinstance(additional_data, dict):
+                    labels = additional_data.get("labels", {})
             if not isinstance(labels, dict):
                 labels = {}
             
@@ -273,6 +278,94 @@ class HostPodIntegration:
                 creation_time = pod_data.get("creation_time")
                 startup_time = pod_data.get("startup_time")
                 
+                # Preserve existing labels from Redis if pod already exists
+                existing_pod = self.store.get_pod(pod_id)
+                labels = {}
+                if existing_pod and existing_pod.get("labels"):
+                    labels = existing_pod.get("labels")
+                    logger.debug(f"Preserving existing labels for pod {pod_id}: {labels}")
+                
+                # If no labels exist, try multiple strategies to find app_label
+                if not labels or not labels.get("app"):
+                    # Strategy 1: Check pod index for app_label (reverse lookup)
+                    try:
+                        app_index_pattern = "pod:index:app:*"
+                        for app_index_key in self.store.redis_interface.redis_client.scan_iter(match=app_index_pattern):
+                            if self.store.redis_interface.redis_client.sismember(app_index_key, pod_id):
+                                app_label = app_index_key.split(":")[-1]
+                                if app_label:
+                                    labels = {
+                                        "app": app_label,
+                                        "app_label": app_label,
+                                    }
+                                    logger.info(f"Found app_label {app_label} for pod {pod_id} via pod index reverse lookup")
+                                    break
+                        if labels.get("app"):
+                            pass  # Found via index, skip other strategies
+                    except Exception as e:
+                        logger.debug(f"Could not check pod index for app_label for pod {pod_id}: {e}")
+                    
+                    # Strategy 2: Try to get from deployment store based on namespace and container info
+                    if not labels or not labels.get("app"):
+                        try:
+                            from utils.redis.deployment_store import DeploymentStore
+                            deployment_store = DeploymentStore(self.store.redis_interface)
+                            
+                            # Get deployments in the namespace
+                            deployments = deployment_store.get_deployments_by_namespace(namespace)
+                            logger.debug(f"Found {len(deployments)} deployments in namespace {namespace} for pod {pod_id}")
+                            
+                            # If only one deployment in namespace, use it (simplest case)
+                            if len(deployments) == 1:
+                                deployment = deployments[0]
+                                app_label = deployment.get("app_label")
+                                if app_label:
+                                    labels = {
+                                        "app": app_label,
+                                        "app_label": app_label,
+                                    }
+                                    logger.info(f"Found app_label {app_label} for pod {pod_id} from single deployment in namespace {namespace}")
+                            elif len(deployments) > 1:
+                                # Multiple deployments - need to match by container
+                                # Try to match by container name or image
+                                for deployment in deployments:
+                                    deployment_spec = deployment.get("deployment_spec", {})
+                                    containers_spec = deployment_spec.get("containers", [])
+                                    logger.debug(f"Checking deployment {deployment.get('name')} with {len(containers_spec)} containers")
+                                    
+                                    # Try to match by container name or image
+                                    for container in containers:
+                                        if isinstance(container, dict):
+                                            container_name = container.get("name")
+                                            container_image = container.get("image")
+                                            logger.debug(f"Pod container: name={container_name}, image={container_image}")
+                                            
+                                            for container_spec in containers_spec:
+                                                if isinstance(container_spec, dict):
+                                                    spec_name = container_spec.get("name")
+                                                    spec_image = container_spec.get("image")
+                                                    logger.debug(f"Deployment container spec: name={spec_name}, image={spec_image}")
+                                                    
+                                                    # Match by name or image (exact or partial)
+                                                    name_match = container_name and spec_name and (container_name == spec_name or container_name in spec_name or spec_name in container_name)
+                                                    image_match = container_image and spec_image and (container_image == spec_image or container_image in spec_image or spec_image in container_image)
+                                                    
+                                                    if name_match or image_match:
+                                                        app_label = deployment.get("app_label")
+                                                        if app_label:
+                                                            labels = {
+                                                                "app": app_label,
+                                                                "app_label": app_label,
+                                                            }
+                                                            logger.info(f"Found app_label {app_label} for pod {pod_id} from deployment store by container match (name_match={name_match}, image_match={image_match})")
+                                                            break
+                                            if labels.get("app"):
+                                                break
+                                    if labels.get("app"):
+                                        break
+                        except Exception as e:
+                            logger.warning(f"Could not get labels from deployment store for pod {pod_id}: {e}", exc_info=True)
+                
                 # Extract IP address if available (from etcd, network namespace, or pod_data)
                 ip_address = pod_data.get("ip_address")
                 
@@ -291,6 +384,7 @@ class HostPodIntegration:
                         ip_address=ip_address,
                         pause_container=pause,
                         containers=containers,
+                        labels=labels,  # Include labels (preserved from existing pod or from deployment store)
                         status=pause.get("status", "unknown"),
                         creation_time=creation_time,
                         startup_time=startup_time

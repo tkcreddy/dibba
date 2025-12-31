@@ -697,12 +697,20 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                     # Submit pod creation task
                     host_queue_info = create_host_queue_info(hostname, encode_util)
                     
+                    # Prepare labels with app_label for pod identification
+                    pod_labels = {
+                        'app': app_label,
+                        'app_label': app_label,
+                        'instance': str(instance_num),
+                    }
+                    
                     try:
                         result = submit_celery_task(
                             task=create_pod_task,
                             kwargs={
                                 'containers': container_specs,
                                 'app_namespace': namespace,
+                                'labels': pod_labels,  # Pass labels to create_pod_task
                             },
                             queue_info=host_queue_info,
                             operation_name=f"create_pod_{app_label}_{instance_num}",
@@ -715,6 +723,7 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                                 'namespace': namespace,
                                 'cpu_millicores': pod_cpu,
                                 'memory_mb': pod_memory,
+                                'labels': pod_labels,  # Also include in additional_data
                             }
                         )
                         
@@ -769,6 +778,13 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                         }
                         container_specs.append(container_spec)
                     
+                    # Prepare labels with app_label for pod identification
+                    pod_labels = {
+                        'app': app_label,
+                        'app_label': app_label,
+                        'instance': str(instance_num),
+                    }
+                    
                     # Submit pod creation task
                     host_queue_info = create_host_queue_info(hostname, encode_util)
                     
@@ -778,6 +794,7 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                             kwargs={
                                 'containers': container_specs,
                                 'app_namespace': namespace,
+                                'labels': pod_labels,  # Pass labels to create_pod_task
                             },
                             queue_info=host_queue_info,
                             operation_name="create_pod",
@@ -786,6 +803,7 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                                 'deployment': deployment_name,
                                 'replica': instance_num,
                                 'hostname': hostname,
+                                'labels': pod_labels,  # Also include in additional_data
                             }
                         )
                         
@@ -815,13 +833,16 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                         })
         
         # Save deployment configuration to Redis for persistence and recovery
+        # deployment_name comes from metadata.name in the YAML (extracted in parse_yaml)
         try:
             yaml_content = evaluation_result.get('original_yaml', '')
             if yaml_content:
                 redis_interface = RedisInterface()
                 deployment_store = DeploymentStore(redis_interface)
+                # deployment_name is metadata.name from the YAML (stored in deployment.name from DeploymentSpec)
+                logger.info(f"Step 3: Saving deployment to Redis - name={deployment_name} (from metadata.name), namespace={namespace}, app_label={app_label}")
                 deployment_store.save_deployment(
-                    name=deployment_name,
+                    name=deployment_name,  # This is metadata.name from the YAML
                     namespace=namespace,
                     app_label=app_label,
                     yaml_content=yaml_content,
@@ -830,7 +851,7 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                     min_replicas=deployment_data.get('min_replicas'),
                     max_replicas=deployment_data.get('max_replicas'),
                 )
-                logger.info(f"Step 3: Saved deployment {namespace}/{deployment_name} to Redis for persistence")
+                logger.info(f"Step 3: Saved deployment {namespace}/{deployment_name} (metadata.name) to Redis for persistence")
             else:
                 logger.warning(f"Step 3: No YAML content available to save deployment {namespace}/{deployment_name} to Redis")
         except Exception as e:

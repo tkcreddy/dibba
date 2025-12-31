@@ -269,8 +269,12 @@ class DeploymentParser:
             
             logger.info(f"Final replicas configuration: replicas={replicas}, min_replicas={min_replicas}, max_replicas={max_replicas}")
             
+            # Extract metadata.name - this is the deployment name that will be stored in Redis
+            deployment_name = metadata.get('name', 'unknown')
+            logger.info(f"Parsed deployment name (metadata.name): {deployment_name}, app_label: {app_label}")
+            
             return DeploymentSpec(
-                name=metadata.get('name', 'unknown'),
+                name=deployment_name,  # metadata.name from YAML - this is stored in Redis as the deployment name
                 namespace=metadata.get('namespace', 'default'),
                 app_label=app_label,
                 replicas=replicas,

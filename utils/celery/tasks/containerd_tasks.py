@@ -151,13 +151,16 @@ def _ctr_task_kill_rm(namespace: str, task_id: str) -> Dict[str, Any]:
 
 @celery_app.task
 @log_to_file(logger)
-def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwargs):
+def create_pod_task(containers, app_namespace: Optional[str] = None, labels: Optional[Dict[str, str]] = None, **extra_kwargs):
     from datetime import datetime, timezone
     
     ns = app_namespace or DEFAULT_NAMESPACE
     sock = DEFAULT_CONTAINERD_SOCKET
     cni_net = DEFAULT_CNI_NET_NAME
     cni_dev = DEFAULT_IFNAME
+    
+    # Extract labels from kwargs if not provided directly
+    pod_labels = labels or extra_kwargs.get('labels') or {}
     
     # Capture creation time when pod creation starts
     creation_time = datetime.now(timezone.utc).isoformat()
@@ -237,6 +240,7 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, **extra_kwa
             "apps": apps,
             "creation_time": creation_time,
             "startup_time": startup_time,
+            "labels": pod_labels,  # Include labels in result for Redis storage
         })
 
     except Exception as err:

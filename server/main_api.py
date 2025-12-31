@@ -53,7 +53,7 @@ from utils.celery.queue_utils import (
 
 from typing import Optional, Dict, Any, Union
 import jwt
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 from logpkg.log_kcld import LogKCld, log_to_file
 from dataclasses import is_dataclass, asdict
 
@@ -257,7 +257,7 @@ def authenticate_user(username: str, password: str) -> Union[str, bool]:
 @log_to_file(logger)
 def create_access_token(data: Dict[str, Any], expires_delta: timedelta) -> str:
     to_encode = data.copy()
-    expire = datetime.now(UTC) + expires_delta
+    expire = datetime.now(timezone.utc) + expires_delta
     to_encode["exp"] = expire
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -348,14 +348,48 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @log_to_file(logger)
 @app.get("/task/{task_id}", tags=["Task Management"])
 async def get_task_status(task_id: str, user: str = Depends(get_current_user)) -> Dict[str, Any]:
-    task = celery_app.AsyncResult(task_id)
-    payload = {
-        "task_id": task.id,
-        "status": task.status,
-        "result": task.result if task.ready() else None,
-        "progress": task.info if task.state == "PROGRESS" else None,
-    }
-    return _envelope_success(message="Task status retrieved", data=payload)
+    """Get task status from Celery.
+    
+    This endpoint queries Celery for task status in a non-blocking way.
+    For detailed task monitoring, use /flower/task/{task_id}.
+    """
+    try:
+        task = celery_app.AsyncResult(task_id)
+        
+        # Get status without blocking
+        task_status = task.state
+        
+        # Get result only if task is ready (SUCCESS or FAILURE)
+        task_result = None
+        if task.ready():
+            try:
+                task_result = task.result
+            except Exception as e:
+                logger.debug(f"Could not get task result for {task_id}: {e}")
+                task_result = str(e) if task_status == "FAILURE" else None
+        
+        # Get progress info if available
+        progress_info = None
+        if task_status == "PROGRESS":
+            try:
+                progress_info = task.info
+            except Exception:
+                pass
+        
+        payload = {
+            "task_id": task.id,
+            "status": task_status,
+            "result": task_result,
+            "progress": progress_info,
+        }
+        return _envelope_success("Task status retrieved", payload)
+    except Exception as e:
+        logger.error(f"Failed to get task status for {task_id}: {e}", exc_info=True)
+        return create_error_response(
+            error_code="GET_TASK_STATUS_ERROR",
+            message=f"Failed to get task status: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 # ==================== Worker Node Endpoints (query params) ====================
@@ -899,6 +933,79 @@ async def list_namespaces_and_pods_api(
             except Exception as e:
                 logger.debug(f"Could not fetch ports from deployment store for pod {pod_id}: {e}")
         
+        # Extract app_label for grouping
+        app_label = None
+        pod_labels = p.get("labels")
+        if isinstance(pod_labels, dict):
+            app_label = pod_labels.get("app")
+        
+        # If not in labels, try pod data directly
+        if not app_label:
+            app_label = p.get("app_label")
+        
+        # If still not found, try reverse lookup from pod index
+        if not app_label and pod_id:
+            try:
+                app_index_pattern = "pod:index:app:*"
+                for app_index_key in store.redis_interface.redis_client.scan_iter(match=app_index_pattern):
+                    if store.redis_interface.redis_client.sismember(app_index_key, pod_id):
+                        app_label = app_index_key.split(":")[-1]
+                        logger.debug(f"Found app_label {app_label} for pod {pod_id} via reverse lookup in list_namespaces_and_pods_api")
+                        break
+            except Exception as lookup_err:
+                logger.debug(f"Failed to reverse lookup app_label for pod {pod_id}: {lookup_err}")
+        
+        # Get deployment name if available (use metadata.name from deployment YAML)
+        deployment_name = None
+        if ns:
+            try:
+                from utils.redis.deployment_store import DeploymentStore
+                deployment_store = DeploymentStore(store.redis_interface)
+                
+                # First try to match by app_label if we have it
+                if app_label:
+                    deployments = deployment_store.get_deployments_by_namespace(ns)
+                    for deployment in deployments:
+                        if deployment.get("app_label") == app_label:
+                            deployment_name = deployment.get("name")
+                            logger.debug(f"Matched pod {pod_id} to deployment {deployment_name} by app_label {app_label} in list_namespaces_and_pods_api")
+                            break
+                    if not deployment_name:
+                        # Fallback: try by app_label only
+                        deployments_by_app = deployment_store.get_deployments_by_app(app_label)
+                        for deployment in deployments_by_app:
+                            if deployment.get("namespace") == ns:
+                                deployment_name = deployment.get("name")
+                                logger.debug(f"Matched pod {pod_id} to deployment {deployment_name} by app_label {app_label} (fallback) in list_namespaces_and_pods_api")
+                                break
+                
+                # If still no match and we have containers, try to match by container name/image
+                if not deployment_name:
+                    deployments = deployment_store.get_deployments_by_namespace(ns)
+                    for deployment in deployments:
+                        deployment_spec = deployment.get("deployment_spec", {})
+                        containers_spec = deployment_spec.get("containers", [])
+                        # Try to match by container name or image
+                        for container in containers:
+                            if isinstance(container, dict):
+                                container_name = container.get("name")
+                                container_image = container.get("image")
+                                for container_spec in containers_spec:
+                                    if isinstance(container_spec, dict):
+                                        spec_name = container_spec.get("name")
+                                        spec_image = container_spec.get("image")
+                                        if (container_name and spec_name and container_name == spec_name) or \
+                                           (container_image and spec_image and container_image == spec_image):
+                                            deployment_name = deployment.get("name")
+                                            logger.info(f"Matched pod {pod_id} to deployment {deployment_name} by container match (name={container_name}, image={container_image}) in list_namespaces_and_pods_api")
+                                            break
+                                if deployment_name:
+                                    break
+                        if deployment_name:
+                            break
+            except Exception as e:
+                logger.debug(f"Failed to get deployment_name for pod {pod_id} in list_namespaces_and_pods_api: {e}", exc_info=True)
+        
         # Normalize pod record for UI (you can add/remove fields here)
         pod_view = {
             "pod_id": p.get("pod_id"),
@@ -906,12 +1013,14 @@ async def list_namespaces_and_pods_api(
             "namespace": ns,
             "hostname": p.get("hostname") or request.host_name,
             "ip_address": ip_address,  # Use the IP we fetched (from Redis or etcd)
-            "ports": ports,
+            "ports": sorted(list(set(ports))),  # Ensure unique and sorted ports
             "status": p.get("status") or "unknown",
             "pause_container": p.get("pause_container"),
             "containers": containers,
             "creation_time": p.get("creation_time") or p.get("created_at"),
             "startup_time": p.get("startup_time"),
+            "app_label": app_label,  # Include app_label for UI grouping
+            "deployment_name": deployment_name,  # Use metadata.name from deployment YAML
         }
 
         inventory.setdefault(ns, []).append(pod_view)
@@ -990,9 +1099,36 @@ async def list_pods_by_filter_api(
             if namespace and pod_ns != namespace:
                 continue
             
-            # Apply app_name filter
-            if app_name and pod_app_label != app_name:
-                continue
+            # Apply app_name filter - match by app_label or deployment_name
+            if app_name:
+                # First try to match by app_label
+                if pod_app_label == app_name:
+                    pass  # Match found
+                else:
+                    # Try to match by deployment_name
+                    pod_deployment_name = None
+                    if pod_ns:
+                        try:
+                            # Get deployment name from deployment store
+                            deployments = deployment_store.get_deployments_by_namespace(pod_ns)
+                            for deployment in deployments:
+                                dep_app_label = deployment.get("app_label")
+                                if dep_app_label == pod_app_label:
+                                    pod_deployment_name = deployment.get("name")
+                                    break
+                            # If not found, try by app_label only
+                            if not pod_deployment_name and pod_app_label:
+                                deployments_by_app = deployment_store.get_deployments_by_app(pod_app_label)
+                                for deployment in deployments_by_app:
+                                    if deployment.get("namespace") == pod_ns:
+                                        pod_deployment_name = deployment.get("name")
+                                        break
+                        except Exception:
+                            pass
+                    
+                    # If still no match, skip this pod
+                    if pod_deployment_name != app_name:
+                        continue
             
             # Extract IP address (same logic as list_namespaces_and_pods_api)
             ip_address = p.get("ip_address")
@@ -1036,9 +1172,43 @@ async def list_pods_by_filter_api(
             # Try to get ports from deployment store if not found
             if not ports and pod_app_label and pod_ns:
                 try:
+                    logger.debug(f"Looking for ports in deployment store for pod {pod_id}: app_label={pod_app_label}, namespace={pod_ns}")
                     deployments = deployment_store.get_deployments_by_namespace(pod_ns)
+                    logger.debug(f"Found {len(deployments)} deployments in namespace {pod_ns}")
                     for deployment in deployments:
-                        if deployment.get("app_label") == pod_app_label:
+                        dep_app_label = deployment.get("app_label")
+                        dep_namespace = deployment.get("namespace")
+                        logger.debug(f"Checking deployment: app_label={dep_app_label}, namespace={dep_namespace}")
+                        if dep_app_label == pod_app_label and dep_namespace == pod_ns:
+                            deployment_spec = deployment.get("deployment_spec", {})
+                            logger.debug(f"Deployment spec keys: {list(deployment_spec.keys())}")
+                            containers_spec = deployment_spec.get("containers", [])
+                            logger.debug(f"Found {len(containers_spec)} containers in deployment spec")
+                            for container_spec in containers_spec:
+                                if isinstance(container_spec, dict):
+                                    container_name = container_spec.get("name", "unknown")
+                                    container_ports = container_spec.get("ports", [])
+                                    logger.debug(f"Container {container_name} has ports: {container_ports}")
+                                    if isinstance(container_ports, list):
+                                        for port in container_ports:
+                                            if isinstance(port, dict):
+                                                port_num = port.get("containerPort") or port.get("port")
+                                                protocol = port.get("protocol", "TCP")
+                                                if port_num:
+                                                    ports.append(f"{port_num}/{protocol}")
+                                                    logger.debug(f"Added port {port_num}/{protocol} for pod {pod_id}")
+                                            elif isinstance(port, (int, str)):
+                                                ports.append(str(port))
+                                                logger.debug(f"Added port {port} for pod {pod_id}")
+                            if ports:
+                                logger.info(f"Found ports {ports} for pod {pod_id} from deployment store (app: {pod_app_label}, namespace: {pod_ns})")
+                                break
+                    
+                    # Fallback: Try to find by app_label only if namespace search didn't work
+                    if not ports:
+                        logger.debug(f"Trying fallback search by app_label only: {pod_app_label}")
+                        deployments = deployment_store.get_deployments_by_app(pod_app_label)
+                        for deployment in deployments:
                             deployment_spec = deployment.get("deployment_spec", {})
                             containers_spec = deployment_spec.get("containers", [])
                             for container_spec in containers_spec:
@@ -1054,9 +1224,58 @@ async def list_pods_by_filter_api(
                                             elif isinstance(port, (int, str)):
                                                 ports.append(str(port))
                             if ports:
+                                logger.info(f"Found ports {ports} for pod {pod_id} from deployment store (app: {pod_app_label}, fallback)")
                                 break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Could not fetch ports from deployment store for pod {pod_id}: {e}", exc_info=True)
+            
+            # Get deployment name if available (use metadata.name from deployment YAML)
+            deployment_name = None
+            if pod_ns:
+                try:
+                    # First try to match by app_label if we have it
+                    if pod_app_label:
+                        deployments = deployment_store.get_deployments_by_namespace(pod_ns)
+                        for deployment in deployments:
+                            if deployment.get("app_label") == pod_app_label:
+                                deployment_name = deployment.get("name")
+                                logger.debug(f"Matched pod {pod_id} to deployment {deployment_name} by app_label {pod_app_label}")
+                                break
+                        if not deployment_name:
+                            # Fallback: try by app_label only
+                            deployments_by_app = deployment_store.get_deployments_by_app(pod_app_label)
+                            for deployment in deployments_by_app:
+                                if deployment.get("namespace") == pod_ns:
+                                    deployment_name = deployment.get("name")
+                                    logger.debug(f"Matched pod {pod_id} to deployment {deployment_name} by app_label {pod_app_label} (fallback)")
+                                    break
+                    
+                    # If still no match and we have containers, try to match by container name/image
+                    if not deployment_name:
+                        deployments = deployment_store.get_deployments_by_namespace(pod_ns)
+                        for deployment in deployments:
+                            deployment_spec = deployment.get("deployment_spec", {})
+                            containers_spec = deployment_spec.get("containers", [])
+                            # Try to match by container name or image
+                            for container in containers:
+                                if isinstance(container, dict):
+                                    container_name = container.get("name")
+                                    container_image = container.get("image")
+                                    for container_spec in containers_spec:
+                                        if isinstance(container_spec, dict):
+                                            spec_name = container_spec.get("name")
+                                            spec_image = container_spec.get("image")
+                                            if (container_name and spec_name and container_name == spec_name) or \
+                                               (container_image and spec_image and container_image == spec_image):
+                                                deployment_name = deployment.get("name")
+                                                logger.info(f"Matched pod {pod_id} to deployment {deployment_name} by container match (name={container_name}, image={container_image})")
+                                                break
+                                    if deployment_name:
+                                        break
+                            if deployment_name:
+                                break
+                except Exception as e:
+                    logger.debug(f"Failed to get deployment_name for pod {pod_id}: {e}", exc_info=True)
             
             # Build pod view
             pod_view = {
@@ -1071,6 +1290,7 @@ async def list_pods_by_filter_api(
                 "creation_time": p.get("creation_time") or p.get("created_at"),
                 "startup_time": p.get("startup_time"),
                 "app_label": pod_app_label,
+                "deployment_name": deployment_name,  # Use metadata.name from deployment YAML
             }
             
             filtered_pods.append(pod_view)
@@ -1090,6 +1310,562 @@ async def list_pods_by_filter_api(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
+
+@log_to_file(logger)
+@app.get("/deployments/", tags=["Deployment"])
+async def get_all_deployments_api(
+    user: str = Depends(get_current_user),
+):
+    """Get all deployments from Redis DeploymentStore.
+    
+    Returns:
+        List of all deployment configurations
+    """
+    try:
+        from utils.redis.deployment_store import DeploymentStore
+        
+        deployment_store = DeploymentStore(rd)
+        deployments = deployment_store.get_all_deployments()
+        
+        # Format deployments for UI display
+        deployment_list = []
+        for deployment in deployments:
+            # Extract ports from deployment spec
+            ports = []
+            deployment_spec = deployment.get("deployment_spec", {})
+            containers_spec = deployment_spec.get("containers", [])
+            for container_spec in containers_spec:
+                if isinstance(container_spec, dict):
+                    container_ports = container_spec.get("ports", [])
+                    if isinstance(container_ports, list):
+                        for port in container_ports:
+                            if isinstance(port, dict):
+                                port_num = port.get("containerPort") or port.get("port")
+                                protocol = port.get("protocol", "TCP")
+                                if port_num:
+                                    ports.append(f"{port_num}/{protocol}")
+                            elif isinstance(port, (int, str)):
+                                ports.append(str(port))
+            
+            deployment_list.append({
+                "name": deployment.get("name"),
+                "namespace": deployment.get("namespace"),
+                "app_label": deployment.get("app_label"),
+                "replicas": deployment.get("replicas", 0),
+                "min_replicas": deployment.get("min_replicas"),
+                "max_replicas": deployment.get("max_replicas"),
+                "ports": sorted(list(set(ports))),  # Unique and sorted ports
+                "yaml_content": deployment.get("yaml_content"),  # Include full YAML
+                "created_at": deployment.get("created_at"),
+                "last_updated": deployment.get("last_updated"),
+            })
+        
+        # Sort by namespace, then by name
+        deployment_list.sort(key=lambda x: (x.get("namespace", ""), x.get("name", "")))
+        
+        return _envelope_success(
+            f"Retrieved {len(deployment_list)} deployments",
+            {
+                "deployments": deployment_list,
+                "count": len(deployment_list),
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to get all deployments: {e}", exc_info=True)
+        return create_error_response(
+            error_code="GET_ALL_DEPLOYMENTS_ERROR",
+            message=f"Failed to get deployments: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.put("/deployment/replicas/", tags=["Deployment"])
+async def update_deployment_replicas_api(
+    name: str,
+    namespace: str,
+    min_replicas: Optional[int] = None,
+    max_replicas: Optional[int] = None,
+    user: str = Depends(get_current_user),
+):
+    """Update min/max replicas for a deployment and trigger scaling.
+    
+    Args:
+        name: Deployment name
+        namespace: Namespace
+        min_replicas: New minimum replicas (optional)
+        max_replicas: New maximum replicas (optional)
+        user: Authenticated user
+        
+    Returns:
+        Updated deployment data
+    """
+    try:
+        from utils.redis.deployment_store import DeploymentStore
+        from utils.celery.tasks.deployment_recovery_tasks import scale_deployment_task
+        
+        deployment_store = DeploymentStore(rd)
+        deployment = deployment_store.get_deployment(name, namespace)
+        
+        if not deployment:
+            return create_error_response(
+                error_code="DEPLOYMENT_NOT_FOUND",
+                message=f"Deployment {namespace}/{name} not found",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Update replicas if provided
+        updated = False
+        if min_replicas is not None:
+            deployment["min_replicas"] = min_replicas
+            updated = True
+        if max_replicas is not None:
+            deployment["max_replicas"] = max_replicas
+            updated = True
+        
+        if updated:
+            deployment["last_updated"] = datetime.now(timezone.utc).isoformat()
+            # Save updated deployment
+            deployment_store.save_deployment(
+                name=deployment["name"],
+                namespace=deployment["namespace"],
+                app_label=deployment["app_label"],
+                yaml_content=deployment.get("yaml_content", ""),
+                deployment_spec=deployment.get("deployment_spec", {}),
+                replicas=deployment.get("replicas", 0),
+                min_replicas=deployment.get("min_replicas"),
+                max_replicas=deployment.get("max_replicas"),
+            )
+            
+            # Trigger scaling task on scheduler queue
+            try:
+                from utils.extensions.utilities_extention import UtilitiesExtension
+                from utils.ReadConfig import ReadConfig as rc
+                
+                read_config = rc()
+                key = read_config.encryption_config['key']
+                utilities = UtilitiesExtension(key)
+                scheduler_queue_info = create_queue_info('scheduler', utilities_extension=utilities)
+                
+                # Use apply_async to route to scheduler queue
+                result = scale_deployment_task.apply_async(
+                    args=(name, namespace),
+                    queue=scheduler_queue_info['queue'],
+                    routing_key=scheduler_queue_info['routing_key'],
+                    exchange=scheduler_queue_info['exchange']
+                )
+                logger.info(f"Triggered scaling task for deployment {namespace}/{name} (task_id: {result.id}, queue: {scheduler_queue_info['queue']})")
+            except Exception as e:
+                logger.error(f"Failed to trigger scaling task: {e}", exc_info=True)
+        
+        return _envelope_success(
+            f"Deployment {namespace}/{name} updated",
+            {
+                "name": deployment["name"],
+                "namespace": deployment["namespace"],
+                "min_replicas": deployment.get("min_replicas"),
+                "max_replicas": deployment.get("max_replicas"),
+                "replicas": deployment.get("replicas"),
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to update deployment replicas: {e}", exc_info=True)
+        return create_error_response(
+            error_code="UPDATE_REPLICAS_ERROR",
+            message=f"Failed to update replicas: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.delete("/deployment/", tags=["Deployment"])
+async def delete_deployment_api(
+    name: str,
+    namespace: str,
+    user: str = Depends(get_current_user),
+):
+    """Delete a deployment from Redis.
+    
+    Args:
+        name: Deployment name
+        namespace: Namespace
+        user: Authenticated user
+        
+    Returns:
+        Success message
+    """
+    try:
+        from utils.redis.deployment_store import DeploymentStore
+        
+        deployment_store = DeploymentStore(rd)
+        deployment = deployment_store.get_deployment(name, namespace)
+        
+        if not deployment:
+            return create_error_response(
+                error_code="DEPLOYMENT_NOT_FOUND",
+                message=f"Deployment {namespace}/{name} not found",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        deployment_store.delete_deployment(name, namespace)
+        logger.info(f"Deleted deployment {namespace}/{name} from Redis")
+        
+        return _envelope_success(f"Deployment {namespace}/{name} deleted", {})
+        
+    except Exception as e:
+        logger.error(f"Failed to delete deployment: {e}", exc_info=True)
+        return create_error_response(
+            error_code="DELETE_DEPLOYMENT_ERROR",
+            message=f"Failed to delete deployment: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.post("/deployment/terminate-pods/", tags=["Deployment"])
+async def terminate_deployment_pods_api(
+    name: str,
+    namespace: str,
+    user: str = Depends(get_current_user),
+):
+    """Terminate all pods for a deployment.
+    
+    Args:
+        name: Deployment name
+        namespace: Namespace
+        user: Authenticated user
+        
+    Returns:
+        Task ID for termination
+    """
+    try:
+        from utils.redis.deployment_store import DeploymentStore
+        from utils.redis.host_pod_store import HostPodStore
+        
+        deployment_store = DeploymentStore(rd)
+        deployment = deployment_store.get_deployment(name, namespace)
+        
+        if not deployment:
+            return create_error_response(
+                error_code="DEPLOYMENT_NOT_FOUND",
+                message=f"Deployment {namespace}/{name} not found",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        app_label = deployment.get("app_label")
+        deployment_spec = deployment.get("deployment_spec", {})
+        containers_spec = deployment_spec.get("containers", [])
+        
+        # Get all pods in the namespace
+        host_pod_store = HostPodStore(rd)
+        namespace_pods = host_pod_store.get_pods_by_namespace(namespace)
+        
+        # Filter pods that match this deployment
+        matching_pods = []
+        
+        # Strategy 1: Match by app_label if available
+        if app_label:
+            pods_by_app = host_pod_store.get_pods_by_application(app_label)
+            matching_pods = [p for p in pods_by_app if p.get("namespace") == namespace]
+            logger.info(f"Found {len(matching_pods)} pods by app_label {app_label} in namespace {namespace}")
+        
+        # Strategy 2: If no pods found by app_label, try matching by container name/image
+        if not matching_pods and containers_spec:
+            logger.info(f"No pods found by app_label, trying container matching for {len(containers_spec)} containers")
+            for pod in namespace_pods:
+                pod_containers = pod.get("containers", [])
+                if not pod_containers:
+                    continue
+                
+                # Check if any pod container matches any deployment container
+                for pod_container in pod_containers:
+                    if not isinstance(pod_container, dict):
+                        continue
+                    
+                    pod_container_name = pod_container.get("name")
+                    pod_container_image = pod_container.get("image")
+                    
+                    for container_spec in containers_spec:
+                        if not isinstance(container_spec, dict):
+                            continue
+                        
+                        spec_name = container_spec.get("name")
+                        spec_image = container_spec.get("image")
+                        
+                        # Match by name or image
+                        if (pod_container_name and spec_name and pod_container_name == spec_name) or \
+                           (pod_container_image and spec_image and pod_container_image == spec_image):
+                            # Check if pod is already in matching_pods
+                            pod_id = pod.get("pod_id")
+                            if pod_id and not any(p.get("pod_id") == pod_id for p in matching_pods):
+                                matching_pods.append(pod)
+                                logger.info(f"Matched pod {pod_id} by container (name={pod_container_name}, image={pod_container_image})")
+                            break
+                    if any(p.get("pod_id") == pod.get("pod_id") for p in matching_pods):
+                        break
+        
+        # Strategy 3: If still no matches and only one deployment in namespace, assume all pods belong to it
+        if not matching_pods:
+            from utils.redis.deployment_store import DeploymentStore
+            deployment_store = DeploymentStore(rd)
+            all_deployments = deployment_store.get_deployments_by_namespace(namespace)
+            if len(all_deployments) == 1:
+                # Only one deployment in namespace, assume all pods belong to it
+                matching_pods = namespace_pods
+                logger.info(f"Only one deployment in namespace {namespace}, assuming all {len(matching_pods)} pods belong to it")
+        
+        namespace_pods = matching_pods
+        
+        if not namespace_pods:
+            return _envelope_success("No pods found for deployment", {"pods_terminated": 0})
+        
+        # Submit termination tasks for each pod
+        terminated_count = 0
+        task_ids = []
+        
+        for pod in namespace_pods:
+            pod_id = pod.get("pod_id")
+            hostname = pod.get("hostname")
+            
+            if not pod_id or not hostname:
+                continue
+            
+            try:
+                # Encode hostname for queue
+                encoded_hostname = utilities.encode_hostname_with_key(hostname)
+                host_queue_info = create_host_queue_info(encoded_hostname)
+                
+                result = submit_celery_task(
+                    task=terminate_pod_task,
+                    args=(pod_id, namespace),
+                    kwargs={"host_name": hostname},
+                    queue_info=host_queue_info,
+                    operation_name="terminate_pod",
+                    error_code="TERMINATE_POD_TASK_ERROR",
+                    additional_data={
+                        "namespace": namespace,
+                        "pod_name": pod_id,
+                        "host_name": hostname,
+                        "deployment_name": name,
+                    }
+                )
+                
+                task_id = result.get("data", {}).get("task_id")
+                if task_id:
+                    task_ids.append(task_id)
+                    terminated_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to submit termination task for pod {pod_id}: {e}")
+        
+        return _envelope_success(
+            f"Terminated {terminated_count} pods for deployment {namespace}/{name}",
+            {
+                "pods_terminated": terminated_count,
+                "task_ids": task_ids,
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to terminate deployment pods: {e}", exc_info=True)
+        return create_error_response(
+            error_code="TERMINATE_PODS_ERROR",
+            message=f"Failed to terminate pods: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.post("/deployment/reassociate-pods/", tags=["Deployment"])
+async def reassociate_deployment_pods_api(
+    name: str,
+    namespace: str,
+    user: str = Depends(get_current_user),
+):
+    """Re-associate pods with a deployment by matching container info.
+    
+    This is useful when pods exist but aren't properly indexed by app_label.
+    
+    Args:
+        name: Deployment name
+        namespace: Namespace
+        user: Authenticated user
+        
+    Returns:
+        Number of pods re-associated
+    """
+    try:
+        from utils.redis.deployment_store import DeploymentStore
+        from utils.redis.host_pod_store import HostPodStore
+        
+        deployment_store = DeploymentStore(rd)
+        host_pod_store = HostPodStore(rd)
+        
+        deployment = deployment_store.get_deployment(name, namespace)
+        if not deployment:
+            return create_error_response(
+                error_code="DEPLOYMENT_NOT_FOUND",
+                message=f"Deployment {namespace}/{name} not found",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        app_label = deployment.get("app_label")
+        deployment_spec = deployment.get("deployment_spec", {})
+        containers_spec = deployment_spec.get("containers", [])
+        
+        # Get all pods in the namespace
+        namespace_pods = host_pod_store.get_pods_by_namespace(namespace)
+        
+        # Find pods that match this deployment by container info
+        matched_pods = []
+        for pod in namespace_pods:
+            pod_containers = pod.get("containers", [])
+            if not pod_containers:
+                continue
+            
+            # Check if any pod container matches any deployment container
+            for pod_container in pod_containers:
+                if not isinstance(pod_container, dict):
+                    continue
+                
+                pod_container_name = pod_container.get("name")
+                pod_container_image = pod_container.get("image")
+                
+                for container_spec in containers_spec:
+                    if not isinstance(container_spec, dict):
+                        continue
+                    
+                    spec_name = container_spec.get("name")
+                    spec_image = container_spec.get("image")
+                    
+                    # Match by name or image
+                    if (pod_container_name and spec_name and pod_container_name == spec_name) or \
+                       (pod_container_image and spec_image and pod_container_image == spec_image):
+                        pod_id = pod.get("pod_id")
+                        if pod_id and not any(p.get("pod_id") == pod_id for p in matched_pods):
+                            matched_pods.append(pod)
+                            break
+                if any(p.get("pod_id") == pod.get("pod_id") for p in matched_pods):
+                    break
+        
+        # Re-associate matched pods by updating their labels and re-indexing
+        reassociated_count = 0
+        for pod in matched_pods:
+            pod_id = pod.get("pod_id")
+            hostname = pod.get("hostname")
+            existing_labels = pod.get("labels", {})
+            
+            # Update labels with app_label if not already set
+            if not existing_labels.get("app") and app_label:
+                updated_labels = {
+                    **existing_labels,
+                    "app": app_label,
+                    "app_label": app_label,
+                }
+                
+                # Re-save pod with updated labels to trigger re-indexing
+                host_pod_store.save_pod(
+                    pod_id=pod_id,
+                    pod_name=pod.get("pod_name"),
+                    namespace=namespace,
+                    hostname=hostname,
+                    ip_address=pod.get("ip_address"),
+                    pause_container=pod.get("pause_container"),
+                    containers=pod.get("containers"),
+                    cni_network=pod.get("cni_network"),
+                    resources=pod.get("resources"),
+                    labels=updated_labels,
+                    status=pod.get("status", "running"),
+                    creation_time=pod.get("creation_time"),
+                    startup_time=pod.get("startup_time"),
+                )
+                reassociated_count += 1
+                logger.info(f"Re-associated pod {pod_id} with deployment {namespace}/{name} (app_label: {app_label})")
+        
+        return _envelope_success(
+            f"Re-associated {reassociated_count} pods with deployment {namespace}/{name}",
+            {
+                "pods_reassociated": reassociated_count,
+                "total_matched": len(matched_pods),
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to re-associate pods: {e}", exc_info=True)
+        return create_error_response(
+            error_code="REASSOCIATE_PODS_ERROR",
+            message=f"Failed to re-associate pods: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.get("/deployment/yaml/", tags=["Deployment"])
+async def get_deployment_yaml_api(
+    namespace: str,
+    app_label: str,
+    user: str = Depends(get_current_user),
+):
+    """Get deployment YAML for a specific application.
+    
+    Args:
+        namespace: Namespace name
+        app_label: Application label
+        user: Authenticated user
+        
+    Returns:
+        Deployment YAML content if found
+    """
+    try:
+        from utils.redis.deployment_store import DeploymentStore
+        
+        deployment_store = DeploymentStore(rd)
+        
+        # Get deployments by namespace and app_label
+        deployments = deployment_store.get_deployments_by_namespace(namespace)
+        
+        # Find deployment matching app_label
+        matching_deployment = None
+        for deployment in deployments:
+            if deployment.get("app_label") == app_label:
+                matching_deployment = deployment
+                break
+        
+        if not matching_deployment:
+            # Try by app_label only as fallback
+            deployments_by_app = deployment_store.get_deployments_by_app(app_label)
+            for deployment in deployments_by_app:
+                if deployment.get("namespace") == namespace:
+                    matching_deployment = deployment
+                    break
+        
+        if not matching_deployment:
+            return create_error_response(
+                error_code="DEPLOYMENT_NOT_FOUND",
+                message=f"Deployment not found for app_label={app_label} in namespace={namespace}",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        yaml_content = matching_deployment.get("yaml_content", "")
+        
+        return _envelope_success(
+            f"Deployment YAML retrieved for {app_label} in {namespace}",
+            {
+                "namespace": namespace,
+                "app_label": app_label,
+                "deployment_name": matching_deployment.get("name"),
+                "yaml_content": yaml_content,
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to get deployment YAML: {e}", exc_info=True)
+        return create_error_response(
+            error_code="GET_DEPLOYMENT_YAML_ERROR",
+            message=f"Failed to get deployment YAML: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 # @log_to_file(logger)

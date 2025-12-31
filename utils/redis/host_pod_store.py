@@ -403,6 +403,17 @@ class HostPodStore:
             if app_name and isinstance(app_name, str):
                 pipe.sadd(RedisKeyPatterns.POD_INDEX_APP.format(app_name=app_name), pod_id)
         
+        # Also check if pod was previously indexed under a different app_name and remove it
+        # This handles the case where labels are updated
+        existing_pod = self.get_pod(pod_id)
+        if existing_pod:
+            existing_labels = existing_pod.get("labels", {})
+            existing_app_name = existing_labels.get("app") or existing_labels.get("application")
+            if existing_app_name and existing_app_name != app_name:
+                # Remove from old app index
+                pipe.srem(RedisKeyPatterns.POD_INDEX_APP.format(app_name=existing_app_name), pod_id)
+                logger.info(f"Removed pod {pod_id} from old app index: {existing_app_name}")
+        
         pipe.execute()
         
         # Update application metadata (separate operation to avoid pipeline complexity)

@@ -74,10 +74,11 @@ class DeploymentStore:
             name=name
         )
         
+        # name parameter is metadata.name from the deployment YAML
         deployment_data = {
-            "name": name,
+            "name": name,  # metadata.name from YAML - this is the application name displayed in UI
             "namespace": namespace,
-            "app_label": app_label,
+            "app_label": app_label,  # labels.app from YAML - used for pod matching
             "yaml_content": yaml_content,
             "deployment_spec": deployment_spec,
             "replicas": replicas,
