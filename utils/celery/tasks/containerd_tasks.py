@@ -40,9 +40,24 @@ def _rehydrate_containers(containers_json):
         if "resources" in d and isinstance(d["resources"], dict):
             d["resources"] = ResourceSpec(**d["resources"])
 
+        # Normalize volume mounts: support both 'volumeMounts' (Kubernetes style) and 'mounts' (direct style)
+        # Prefer 'mounts' if both are present, otherwise use 'volumeMounts' if available
+        if "volumeMounts" in d and "mounts" not in d:
+            d["mounts"] = d.pop("volumeMounts")
+            logger.debug(f"Normalized 'volumeMounts' to 'mounts' for container {d.get('name', idx)}")
+        elif "volumeMounts" in d and "mounts" in d:
+            # If both are present, prefer 'mounts' and log a warning
+            logger.warning(f"Container {d.get('name', idx)} has both 'volumeMounts' and 'mounts', using 'mounts'")
+            d.pop("volumeMounts", None)
+        
         d.setdefault("env", None)
         d.setdefault("mounts", None)
         d.setdefault("args", None)
+        
+        # Log volume mount information for debugging
+        if d.get("mounts"):
+            mount_count = len(d["mounts"]) if isinstance(d["mounts"], list) else 1
+            logger.info(f"Container {d.get('name', idx)} has {mount_count} volume mount(s)")
 
         specs.append(ContainerSpec(**d))
     return specs

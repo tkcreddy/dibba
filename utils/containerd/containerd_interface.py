@@ -1335,7 +1335,8 @@ class OciSpecBuilder:
               namespaces: Optional[List[Dict]] = None,
               resources: Optional[Union[dict, "ResourceSpec"]] = None,
               cwd: str = "/",
-              root_readonly: bool = False) -> any_pb2.Any:
+              root_readonly: bool = False,
+              volume_mounts: Optional[List[Dict[str, Any]]] = None) -> any_pb2.Any:
 
         if hasattr(resources, "to_linux_resources_dict"):
             linux_res = resources.to_linux_resources_dict()  # ResourceSpec -> dict
@@ -1350,6 +1351,94 @@ class OciSpecBuilder:
         merged_env = dict(default_env)
         if env:
             merged_env.update(env)
+
+        # Default system mounts
+        default_mounts = [
+            {"destination": "/proc", "type": "proc", "source": "proc"},
+            {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+             "options": ["nosuid","strictatime","mode=755","size=65536k"]},
+            {"destination": "/dev/pts", "type": "devpts", "source": "devpts",
+             "options": ["nosuid","noexec","newinstance","ptmxmode=0666","mode=0620","gid=5"]},
+            {"destination": "/dev/shm", "type": "tmpfs", "source": "shm",
+             "options": ["nosuid","noexec","nodev","mode=1777","size=65536k"]},
+            {"destination": "/sys", "type": "sysfs", "source": "sysfs",
+             "options": ["nosuid","noexec","nodev","ro"]},
+            {"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup",
+             "options": ["nosuid","noexec","nodev","relatime","ro"]},
+        ]
+        
+        # Merge user-provided volume mounts with default mounts
+        # User mounts take precedence if they have the same destination
+        all_mounts = list(default_mounts)
+        if volume_mounts:
+            for user_mount in volume_mounts:
+                # Convert user mount format to OCI mount format
+                mount_dest = user_mount.get("mountPath") or user_mount.get("destination") or user_mount.get("containerPath")
+                if not mount_dest:
+                    logger.warning(f"Skipping mount without destination: {user_mount}")
+                    continue
+                
+                # Check if this destination already exists in default mounts
+                existing_idx = None
+                for idx, existing in enumerate(all_mounts):
+                    if existing.get("destination") == mount_dest:
+                        existing_idx = idx
+                        break
+                
+                # Get host path (source)
+                host_path = user_mount.get("hostPath") or user_mount.get("source")
+                if not host_path:
+                    # If no host path specified, use destination as source (for tmpfs or similar)
+                    host_path = mount_dest
+                    logger.warning(f"No hostPath specified for mount {mount_dest}, using destination as source")
+                
+                # Ensure host path exists (for directories)
+                mount_type = user_mount.get("type") or "bind"
+                if mount_type == "bind" and host_path and not host_path.startswith(("/proc", "/sys", "/dev")):
+                    try:
+                        # Create directory if it doesn't exist
+                        if not os.path.exists(host_path):
+                            os.makedirs(host_path, mode=0o755, exist_ok=True)
+                            logger.info(f"Created host path directory: {host_path}")
+                        elif not os.path.isdir(host_path):
+                            logger.warning(f"Host path {host_path} exists but is not a directory")
+                    except Exception as e:
+                        logger.warning(f"Failed to create/verify host path {host_path}: {e}")
+                
+                # Build OCI mount entry
+                oci_mount = {
+                    "destination": mount_dest,
+                    "type": mount_type,
+                    "source": host_path,
+                }
+                
+                # Add options
+                options = []
+                if user_mount.get("readOnly") or user_mount.get("readonly"):
+                    options.append("ro")
+                else:
+                    options.append("rw")
+                
+                # Add propagation mode if specified
+                propagation = user_mount.get("propagation") or user_mount.get("mountPropagation")
+                if propagation:
+                    if propagation.upper() in ["PRIVATE", "SHARED", "SLAVE", "RSLAVE", "RUNBINDABLE"]:
+                        options.append(propagation.lower())
+                
+                # Add bind mount option for bind type
+                if mount_type == "bind":
+                    options.append("bind")
+                
+                if options:
+                    oci_mount["options"] = options
+                
+                # Replace existing or append new mount
+                if existing_idx is not None:
+                    all_mounts[existing_idx] = oci_mount
+                    logger.info(f"Replaced default mount at {mount_dest} with user mount from {host_path}")
+                else:
+                    all_mounts.append(oci_mount)
+                    logger.info(f"Added volume mount: {mount_dest} -> {host_path} (type: {mount_type})")
 
         spec = {
             "ociVersion": "1.1.0",
@@ -1368,19 +1457,7 @@ class OciSpecBuilder:
             },
             "root": {"path": "rootfs", "readonly": root_readonly},
             "hostname": self.hostname,
-            "mounts": [
-                {"destination": "/proc", "type": "proc", "source": "proc"},
-                {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
-                 "options": ["nosuid","strictatime","mode=755","size=65536k"]},
-                {"destination": "/dev/pts", "type": "devpts", "source": "devpts",
-                 "options": ["nosuid","noexec","newinstance","ptmxmode=0666","mode=0620","gid=5"]},
-                {"destination": "/dev/shm", "type": "tmpfs", "source": "shm",
-                 "options": ["nosuid","noexec","nodev","mode=1777","size=65536k"]},
-                {"destination": "/sys", "type": "sysfs", "source": "sysfs",
-                 "options": ["nosuid","noexec","nodev","ro"]},
-                {"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup",
-                 "options": ["nosuid","noexec","nodev","relatime","ro"]},
-            ],
+            "mounts": all_mounts,
             "linux": {
                 "namespaces": [],
                 "resources": {}
@@ -2770,7 +2847,8 @@ class PodManager:
                       image: str,
                       args: Optional[List[str]] = None,
                       env: Optional[Dict[str, str]] = None,
-                      resources: Optional[ResourceSpec] = None) -> Dict:
+                      resources: Optional[ResourceSpec] = None,
+                      volume_mounts: Optional[List[Dict[str, Any]]] = None) -> Dict:
 
         pod_name = pod["name"]
         pod_ns = pod["ns"]
@@ -2800,12 +2878,13 @@ class PodManager:
             process_args=args,
             env=env or {},
             namespaces=namespaces,
-            resources=resources
+            resources=resources,
+            volume_mounts=volume_mounts
         )
         cid = f"{pod_name}-{name}"
         self.runtime.create_container(cid, image, spec_any, labels={"pod": pod_name, "app": name,"role": "app"})
         pid = self.runtime.start_task(cid, mounts)
-        logger.info(f"App started: cid={cid}, pid={pid}, image={image}")
+        logger.info(f"App started: cid={cid}, pid={pid}, image={image}, mounts={len(volume_mounts) if volume_mounts else 0}")
         return {"cid": cid, "pid": pid, "snapshot_key": snap_key}
 
     @log_to_file(logger)
@@ -2822,7 +2901,8 @@ class PodManager:
                 image=spec.image,
                 args=spec.args,
                 env=spec.env,
-                resources=spec.resources
+                resources=spec.resources,
+                volume_mounts=spec.mounts
             )
             results[spec.name] = res
         return results

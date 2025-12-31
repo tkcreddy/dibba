@@ -692,6 +692,11 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                                 'memory': f"{int(pod_memory)}Mi"
                             }
                         }
+                        # Extract volumeMounts if present
+                        volume_mounts = container.get('volumeMounts') or container.get('mounts')
+                        if volume_mounts:
+                            container_spec['mounts'] = volume_mounts
+                            logger.info(f"Step 3: Found {len(volume_mounts)} volume mounts for container {container.get('name')}")
                         container_specs.append(container_spec)
                     
                     # Submit pod creation task
@@ -776,6 +781,11 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                                 'memory': f"{int(resource_requirements.memory_mb)}Mi"
                             }
                         }
+                        # Extract volumeMounts if present
+                        volume_mounts = container.get('volumeMounts') or container.get('mounts')
+                        if volume_mounts:
+                            container_spec['mounts'] = volume_mounts
+                            logger.info(f"Step 3: Found {len(volume_mounts)} volume mounts for container {container.get('name')}")
                         container_specs.append(container_spec)
                     
                     # Prepare labels with app_label for pod identification
