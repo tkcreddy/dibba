@@ -1371,6 +1371,27 @@ class OciSpecBuilder:
         # User mounts take precedence if they have the same destination
         all_mounts = list(default_mounts)
         if volume_mounts:
+            # Try to resolve PVC references if storage system is available
+            try:
+                from utils.storage.containerd_integration import resolve_volume_mounts_for_containerd
+                # If volume_mounts contains PVC references, resolve them
+                # Note: volumes list is not available here, so we'll handle direct mounts
+                # PVC resolution should happen at the scheduler level before reaching containerd
+                resolved_mounts = []
+                for user_mount in volume_mounts:
+                    # If mount already has hostPath/source, use it directly
+                    if user_mount.get('hostPath') or user_mount.get('source'):
+                        resolved_mounts.append(user_mount)
+                    else:
+                        # This might be a PVC reference that wasn't resolved
+                        # Log a warning but continue
+                        logger.warning(f"Volume mount {user_mount.get('name')} may need PVC resolution")
+                        resolved_mounts.append(user_mount)
+                volume_mounts = resolved_mounts
+            except ImportError:
+                # Storage system not available, use mounts as-is
+                logger.debug("Storage integration not available, using volume mounts as-is")
+            
             for user_mount in volume_mounts:
                 # Convert user mount format to OCI mount format
                 mount_dest = user_mount.get("mountPath") or user_mount.get("destination") or user_mount.get("containerPath")

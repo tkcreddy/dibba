@@ -3,7 +3,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, ValidationError as PydanticValidationError
-from server.api_models import CreatePodsRequest, ScheduleDeploymentRequest
+from server.api_models import CreatePodsRequest, ScheduleDeploymentRequest, CreatePVCRequest, CreatePVRequest
 from server.sched.scheduler import schedule_deployment_from_yaml
 from utils.redis.host_pod_store import HostPodStore  # adjust path to where you saved that class
 from utils.celery.tasks.aws_tasks import create_worker_nodes, terminate_worker_node
@@ -345,13 +345,14 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 
 # ==================== Task Status ====================
 
-@log_to_file(logger)
 @app.get("/task/{task_id}", tags=["Task Management"])
 async def get_task_status(task_id: str, user: str = Depends(get_current_user)) -> Dict[str, Any]:
     """Get task status from Celery.
     
     This endpoint queries Celery for task status in a non-blocking way.
     For detailed task monitoring, use /flower/task/{task_id}.
+    
+    Note: This endpoint is frequently polled by the UI. Logging is minimal to reduce log verbosity.
     """
     try:
         task = celery_app.AsyncResult(task_id)
@@ -521,7 +522,7 @@ async def terminate_namespace(
         operation_name="terminate_namespace",
         error_code="TERMINATE_INSTANCES_TASK_ERROR",
         additional_data={"instances_count": len(instances_to_terminate)},
-    )
+        )
     return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
@@ -980,24 +981,108 @@ async def list_namespaces_and_pods_api(
                                 break
                 
                 # If still no match and we have containers, try to match by container name/image
-                if not deployment_name:
+                # Also try matching even if app_label exists but is empty/None (might be wrong)
+                if (not deployment_name and not app_label) or (app_label and app_label.strip() == ""):
                     deployments = deployment_store.get_deployments_by_namespace(ns)
+                    logger.info(f"Trying container matching for pod {pod_id} in list_namespaces_and_pods_api: found {len(deployments)} deployments in namespace {ns}")
+                    logger.info(f"Pod containers data: {containers}")
+                    
+                    if not deployments:
+                        # Try all namespaces as fallback (in case namespace mismatch)
+                        logger.debug(f"No deployments in namespace {ns}, trying all deployments")
+                        all_deployments = deployment_store.get_all_deployments()
+                        logger.info(f"Found {len(all_deployments)} total deployments across all namespaces")
+                        deployments = all_deployments
+                    
                     for deployment in deployments:
                         deployment_spec = deployment.get("deployment_spec", {})
                         containers_spec = deployment_spec.get("containers", [])
+                        dep_name = deployment.get("name")
+                        dep_app_label = deployment.get("app_label")
+                        dep_namespace = deployment.get("namespace")
+                        logger.info(f"Checking deployment {dep_name} (namespace: {dep_namespace}, app_label: {dep_app_label}) with {len(containers_spec)} container specs")
+                        
                         # Try to match by container name or image
                         for container in containers:
                             if isinstance(container, dict):
-                                container_name = container.get("name")
-                                container_image = container.get("image")
+                                # Try multiple possible keys for container name
+                                container_name = container.get("name") or container.get("id") or ""
+                                # Container ID might be like "pod-id-container-name", extract just the container name part
+                                if container_name and "-" in container_name:
+                                    # Try to extract container name from ID (format: pod-id-container-name)
+                                    parts = container_name.split("-")
+                                    if len(parts) > 2:
+                                        # Assume last part or last two parts are the container name
+                                        container_name_alt = "-".join(parts[-2:])  # Try last 2 parts
+                                        container_name_single = parts[-1]  # Try last part
+                                    else:
+                                        container_name_alt = container_name
+                                        container_name_single = container_name
+                                else:
+                                    container_name_alt = container_name
+                                    container_name_single = container_name
+                                
+                                container_image = container.get("image") or ""
+                                logger.info(f"Pod container: name={container_name} (alt: {container_name_alt}, single: {container_name_single}), image={container_image}")
+                                
                                 for container_spec in containers_spec:
                                     if isinstance(container_spec, dict):
-                                        spec_name = container_spec.get("name")
-                                        spec_image = container_spec.get("image")
-                                        if (container_name and spec_name and container_name == spec_name) or \
-                                           (container_image and spec_image and container_image == spec_image):
-                                            deployment_name = deployment.get("name")
-                                            logger.info(f"Matched pod {pod_id} to deployment {deployment_name} by container match (name={container_name}, image={container_image}) in list_namespaces_and_pods_api")
+                                        spec_name = container_spec.get("name") or ""
+                                        spec_image = container_spec.get("image") or ""
+                                        logger.info(f"Deployment container spec: name={spec_name}, image={spec_image}")
+                                        
+                                        # Try exact match first
+                                        name_match = (container_name and spec_name and container_name == spec_name) or \
+                                                    (container_name_alt and spec_name and container_name_alt == spec_name) or \
+                                                    (container_name_single and spec_name and container_name_single == spec_name)
+                                        image_match = container_image and spec_image and container_image == spec_image
+                                        
+                                        # If no exact match, try partial image match (in case of tags/digests)
+                                        if not name_match and not image_match and container_image and spec_image:
+                                            # Extract base image name (before tag/digest)
+                                            container_base = container_image.split("@")[0].split(":")[0]
+                                            spec_base = spec_image.split("@")[0].split(":")[0]
+                                            image_match = container_base == spec_base
+                                            logger.info(f"Trying base image match: {container_base} == {spec_base} -> {image_match}")
+                                        
+                                        if name_match or image_match:
+                                            deployment_name = dep_name
+                                            # Also set app_label from the deployment's app_label
+                                            if dep_app_label:
+                                                app_label = dep_app_label
+                                                logger.info(f"Matched pod {pod_id} to deployment {deployment_name} (app_label: {app_label}) by container match (name_match={name_match}, image_match={image_match}, container={container_name}/{container_image}) in list_namespaces_and_pods_api")
+                                                
+                                                # Persist the matched labels to Redis so future lookups work
+                                                try:
+                                                    existing_labels = p.get("labels", {})
+                                                    if not isinstance(existing_labels, dict):
+                                                        existing_labels = {}
+                                                    
+                                                    # Update labels with the matched app_label
+                                                    updated_labels = {
+                                                        **existing_labels,
+                                                        "app": dep_app_label,
+                                                        "app_label": dep_app_label,
+                                                    }
+                                                    
+                                                    # Save updated pod with labels to Redis
+                                                    store.save_pod(
+                                                        pod_id=pod_id,
+                                                        namespace=ns,
+                                                        hostname=p.get("hostname") or request.host_name,
+                                                        ip_address=ip_address,
+                                                        pause_container=p.get("pause_container"),
+                                                        containers=containers,
+                                                        labels=updated_labels,
+                                                        status=p.get("status", "unknown"),
+                                                        creation_time=p.get("creation_time") or p.get("created_at"),
+                                                        startup_time=p.get("startup_time")
+                                                    )
+                                                    logger.info(f"Updated pod {pod_id} in Redis with app_label {dep_app_label} in list_namespaces_and_pods_api")
+                                                except Exception as save_err:
+                                                    logger.warning(f"Failed to persist labels to Redis for pod {pod_id} in list_namespaces_and_pods_api: {save_err}", exc_info=True)
+                                            else:
+                                                logger.info(f"Matched pod {pod_id} to deployment {deployment_name} by container match (name_match={name_match}, image_match={image_match}, container={container_name}/{container_image}) in list_namespaces_and_pods_api")
                                             break
                                 if deployment_name:
                                     break
@@ -1250,25 +1335,213 @@ async def list_pods_by_filter_api(
                                     logger.debug(f"Matched pod {pod_id} to deployment {deployment_name} by app_label {pod_app_label} (fallback)")
                                     break
                     
-                    # If still no match and we have containers, try to match by container name/image
-                    if not deployment_name:
+                    # If still no match, try to match by container name/image
+                    # Also try matching even if pod_app_label exists but is empty/None (might be wrong)
+                    if (not deployment_name and not pod_app_label) or (pod_app_label and pod_app_label.strip() == ""):
                         deployments = deployment_store.get_deployments_by_namespace(pod_ns)
-                        for deployment in deployments:
-                            deployment_spec = deployment.get("deployment_spec", {})
-                            containers_spec = deployment_spec.get("containers", [])
+                        logger.info(f"Trying container matching for pod {pod_id} in namespace {pod_ns}: found {len(deployments)} deployments")
+                        logger.info(f"Pod containers data: {containers} (count: {len(containers) if containers else 0})")
+                        
+                        # If containers are empty, try to get them from the pod data directly
+                        if not containers or len(containers) == 0:
+                            # Try to get containers from the full pod data
+                            containers = p.get("containers") or []
+                            logger.warning(f"Pod {pod_id} has empty containers list in Redis. Attempting to match by other means.")
+                        
+                        if not deployments:
+                            # Try all namespaces as fallback (in case namespace mismatch)
+                            logger.debug(f"No deployments in namespace {pod_ns}, trying all deployments")
+                            all_deployments = deployment_store.get_all_deployments()
+                            logger.info(f"Found {len(all_deployments)} total deployments across all namespaces")
+                            deployments = all_deployments
+                        
+                    # If still no containers, try matching by pod creation time proximity to deployment creation time
+                    # or by checking if this is the only deployment in the namespace
+                    if (not containers or len(containers) == 0):
+                        if len(deployments) == 1:
+                            # Only one deployment in namespace - likely match
+                            deployment = deployments[0]
+                            dep_name = deployment.get("name")
+                            dep_app_label = deployment.get("app_label")
+                            logger.info(f"Pod {pod_id} has no containers but only one deployment in namespace {pod_ns}: {dep_name} (app_label: {dep_app_label}). Assuming match.")
+                            deployment_name = dep_name
+                            if dep_app_label:
+                                pod_app_label = dep_app_label
+                                # Persist the matched labels
+                                try:
+                                    existing_labels = p.get("labels", {})
+                                    if not isinstance(existing_labels, dict):
+                                        existing_labels = {}
+                                    updated_labels = {
+                                        **existing_labels,
+                                        "app": dep_app_label,
+                                        "app_label": dep_app_label,
+                                    }
+                                    store.save_pod(
+                                        pod_id=pod_id,
+                                        namespace=pod_ns,
+                                        hostname=hostname,
+                                        ip_address=p.get("ip_address"),
+                                        pause_container=p.get("pause_container"),
+                                        containers=containers,
+                                        labels=updated_labels,
+                                        status=p.get("status", "unknown"),
+                                        creation_time=p.get("creation_time") or p.get("created_at"),
+                                        startup_time=p.get("startup_time")
+                                    )
+                                    logger.info(f"Updated pod {pod_id} in Redis with app_label {dep_app_label} (single deployment match)")
+                                except Exception as save_err:
+                                    logger.warning(f"Failed to persist labels to Redis for pod {pod_id}: {save_err}", exc_info=True)
+                        elif len(deployments) > 1:
+                            # Multiple deployments - try to match by creation time proximity
+                            pod_creation_time = p.get("creation_time") or p.get("created_at")
+                            if pod_creation_time:
+                                try:
+                                    from datetime import datetime
+                                    pod_creation_dt = datetime.fromisoformat(pod_creation_time.replace('Z', '+00:00'))
+                                    best_match = None
+                                    best_time_diff = None
+                                    
+                                    for deployment in deployments:
+                                        dep_created_at = deployment.get("created_at")
+                                        if dep_created_at:
+                                            try:
+                                                dep_creation_dt = datetime.fromisoformat(dep_created_at.replace('Z', '+00:00'))
+                                                time_diff = abs((pod_creation_dt - dep_creation_dt).total_seconds())
+                                                if best_time_diff is None or time_diff < best_time_diff:
+                                                    best_time_diff = time_diff
+                                                    best_match = deployment
+                                            except Exception:
+                                                continue
+                                    
+                                    # If we found a match within 5 minutes, use it
+                                    if best_match and best_time_diff is not None and best_time_diff < 300:  # 5 minutes
+                                        dep_name = best_match.get("name")
+                                        dep_app_label = best_match.get("app_label")
+                                        logger.info(f"Pod {pod_id} matched to deployment {dep_name} (app_label: {dep_app_label}) by creation time proximity ({best_time_diff:.1f}s difference)")
+                                        deployment_name = dep_name
+                                        if dep_app_label:
+                                            pod_app_label = dep_app_label
+                                            # Persist the matched labels
+                                            try:
+                                                existing_labels = p.get("labels", {})
+                                                if not isinstance(existing_labels, dict):
+                                                    existing_labels = {}
+                                                updated_labels = {
+                                                    **existing_labels,
+                                                    "app": dep_app_label,
+                                                    "app_label": dep_app_label,
+                                                }
+                                                store.save_pod(
+                                                    pod_id=pod_id,
+                                                    namespace=pod_ns,
+                                                    hostname=hostname,
+                                                    ip_address=p.get("ip_address"),
+                                                    pause_container=p.get("pause_container"),
+                                                    containers=containers,
+                                                    labels=updated_labels,
+                                                    status=p.get("status", "unknown"),
+                                                    creation_time=p.get("creation_time") or p.get("created_at"),
+                                                    startup_time=p.get("startup_time")
+                                                )
+                                                logger.info(f"Updated pod {pod_id} in Redis with app_label {dep_app_label} (time-based match)")
+                                            except Exception as save_err:
+                                                logger.warning(f"Failed to persist labels to Redis for pod {pod_id}: {save_err}", exc_info=True)
+                                except Exception as time_err:
+                                    logger.debug(f"Failed to match pod {pod_id} by creation time: {time_err}", exc_info=True)
+                        
+                        # Try container matching if we have containers
+                        if containers and len(containers) > 0:
+                            for deployment in deployments:
+                                deployment_spec = deployment.get("deployment_spec", {})
+                                containers_spec = deployment_spec.get("containers", [])
+                                dep_name = deployment.get("name")
+                                dep_app_label = deployment.get("app_label")
+                                dep_namespace = deployment.get("namespace")
+                                logger.info(f"Checking deployment {dep_name} (namespace: {dep_namespace}, app_label: {dep_app_label}) with {len(containers_spec)} container specs")
+                            
                             # Try to match by container name or image
                             for container in containers:
                                 if isinstance(container, dict):
-                                    container_name = container.get("name")
-                                    container_image = container.get("image")
+                                    # Try multiple possible keys for container name
+                                    container_name = container.get("name") or container.get("id") or ""
+                                    # Container ID might be like "pod-id-container-name", extract just the container name part
+                                    if container_name and "-" in container_name:
+                                        # Try to extract container name from ID (format: pod-id-container-name)
+                                        parts = container_name.split("-")
+                                        if len(parts) > 2:
+                                            # Assume last part or last two parts are the container name
+                                            container_name_alt = "-".join(parts[-2:])  # Try last 2 parts
+                                            container_name_single = parts[-1]  # Try last part
+                                        else:
+                                            container_name_alt = container_name
+                                            container_name_single = container_name
+                                    else:
+                                        container_name_alt = container_name
+                                        container_name_single = container_name
+                                    
+                                    container_image = container.get("image") or ""
+                                    logger.info(f"Pod container: name={container_name} (alt: {container_name_alt}, single: {container_name_single}), image={container_image}")
+                                    
                                     for container_spec in containers_spec:
                                         if isinstance(container_spec, dict):
-                                            spec_name = container_spec.get("name")
-                                            spec_image = container_spec.get("image")
-                                            if (container_name and spec_name and container_name == spec_name) or \
-                                               (container_image and spec_image and container_image == spec_image):
-                                                deployment_name = deployment.get("name")
-                                                logger.info(f"Matched pod {pod_id} to deployment {deployment_name} by container match (name={container_name}, image={container_image})")
+                                            spec_name = container_spec.get("name") or ""
+                                            spec_image = container_spec.get("image") or ""
+                                            logger.info(f"Deployment container spec: name={spec_name}, image={spec_image}")
+                                            
+                                            # Try exact match first
+                                            name_match = (container_name and spec_name and container_name == spec_name) or \
+                                                        (container_name_alt and spec_name and container_name_alt == spec_name) or \
+                                                        (container_name_single and spec_name and container_name_single == spec_name)
+                                            image_match = container_image and spec_image and container_image == spec_image
+                                            
+                                            # If no exact match, try partial image match (in case of tags/digests)
+                                            if not name_match and not image_match and container_image and spec_image:
+                                                # Extract base image name (before tag/digest)
+                                                container_base = container_image.split("@")[0].split(":")[0]
+                                                spec_base = spec_image.split("@")[0].split(":")[0]
+                                                image_match = container_base == spec_base
+                                                logger.info(f"Trying base image match: {container_base} == {spec_base} -> {image_match}")
+                                            
+                                            if name_match or image_match:
+                                                deployment_name = dep_name
+                                                # Also set pod_app_label from the deployment's app_label
+                                                if dep_app_label:
+                                                    pod_app_label = dep_app_label
+                                                    logger.info(f"Matched pod {pod_id} to deployment {deployment_name} (app_label: {pod_app_label}) by container match (name_match={name_match}, image_match={image_match}, container={container_name}/{container_image})")
+                                                    
+                                                    # Persist the matched labels to Redis so future lookups work
+                                                    try:
+                                                        existing_pod = p  # Use the pod data from Redis
+                                                        existing_labels = existing_pod.get("labels", {})
+                                                        if not isinstance(existing_labels, dict):
+                                                            existing_labels = {}
+                                                        
+                                                        # Update labels with the matched app_label
+                                                        updated_labels = {
+                                                            **existing_labels,
+                                                            "app": dep_app_label,
+                                                            "app_label": dep_app_label,
+                                                        }
+                                                        
+                                                        # Save updated pod with labels to Redis
+                                                        store.save_pod(
+                                                            pod_id=pod_id,
+                                                            namespace=pod_ns,
+                                                            hostname=hostname,
+                                                            ip_address=p.get("ip_address"),
+                                                            pause_container=p.get("pause_container"),
+                                                            containers=containers,
+                                                            labels=updated_labels,
+                                                            status=p.get("status", "unknown"),
+                                                            creation_time=p.get("creation_time") or p.get("created_at"),
+                                                            startup_time=p.get("startup_time")
+                                                        )
+                                                        logger.info(f"Updated pod {pod_id} in Redis with app_label {dep_app_label}")
+                                                    except Exception as save_err:
+                                                        logger.warning(f"Failed to persist labels to Redis for pod {pod_id}: {save_err}", exc_info=True)
+                                                else:
+                                                    logger.info(f"Matched pod {pod_id} to deployment {deployment_name} by container match (name_match={name_match}, image_match={image_match}, container={container_name}/{container_image})")
                                                 break
                                     if deployment_name:
                                         break
@@ -1555,68 +1828,149 @@ async def terminate_deployment_pods_api(
             )
         
         app_label = deployment.get("app_label")
+        deployment_name = deployment.get("name", name)  # Use name from deployment or parameter
         deployment_spec = deployment.get("deployment_spec", {})
         containers_spec = deployment_spec.get("containers", [])
         
-        # Get all pods in the namespace
+        logger.info(f"Terminating pods for deployment: name={deployment_name}, app_label={app_label}, namespace={namespace}")
+        
+        # Use EXACT same approach as list_pods_by_filter - get all pods from all hosts first
         host_pod_store = HostPodStore(rd)
-        namespace_pods = host_pod_store.get_pods_by_namespace(namespace)
+        all_hosts = host_pod_store.get_all_hosts()
+        all_pods = []
+        seen_pod_ids = set()  # Track seen pod IDs to avoid duplicates
         
-        # Filter pods that match this deployment
+        # Collect pods from all hosts, deduplicating by pod_id (same as list_pods_by_filter)
+        logger.info(f"Collecting pods from {len(all_hosts)} hosts")
+        for host in all_hosts:
+            hostname = host.get("hostname")
+            if hostname:
+                host_pods = host_pod_store.get_pods_by_host(hostname)
+                for p in host_pods:
+                    pod_id = p.get("pod_id")
+                    if pod_id and pod_id not in seen_pod_ids:
+                        seen_pod_ids.add(pod_id)
+                        all_pods.append(p)
+        
+        logger.info(f"Collected {len(all_pods)} total pods from all hosts")
+        
+        # Filter pods that match this deployment (same logic as list_pods_by_filter)
         matching_pods = []
+        seen_pod_ids.clear()  # Reset for matching
         
-        # Strategy 1: Match by app_label if available
-        if app_label:
-            pods_by_app = host_pod_store.get_pods_by_application(app_label)
-            matching_pods = [p for p in pods_by_app if p.get("namespace") == namespace]
-            logger.info(f"Found {len(matching_pods)} pods by app_label {app_label} in namespace {namespace}")
-        
-        # Strategy 2: If no pods found by app_label, try matching by container name/image
-        if not matching_pods and containers_spec:
-            logger.info(f"No pods found by app_label, trying container matching for {len(containers_spec)} containers")
-            for pod in namespace_pods:
-                pod_containers = pod.get("containers", [])
-                if not pod_containers:
-                    continue
+        for p in all_pods:
+            pod_ns = p.get("namespace") or "default"
+            
+            # Apply namespace filter
+            if pod_ns != namespace:
+                continue
+            
+            # Extract app_label from pod (same logic as list_pods_by_filter)
+            pod_labels = p.get("labels", {})
+            pod_app_label = None
+            
+            if isinstance(pod_labels, dict):
+                pod_app_label = pod_labels.get("app")
+            
+            # If not in labels, try reverse lookup from pod index (same as list_pods_by_filter)
+            if not pod_app_label:
+                pod_id = p.get("pod_id")
+                if pod_id:
+                    try:
+                        app_index_pattern = "pod:index:app:*"
+                        for app_index_key in rd.redis_client.scan_iter(match=app_index_pattern):
+                            if rd.redis_client.sismember(app_index_key, pod_id):
+                                pod_app_label = app_index_key.split(":")[-1]
+                                logger.debug(f"Found app_label {pod_app_label} for pod {pod_id} via index lookup")
+                                break
+                    except Exception as e:
+                        logger.debug(f"Error during index lookup for pod {pod_id}: {e}")
+            
+            # Also try pod data directly
+            if not pod_app_label:
+                pod_app_label = p.get("app_label")
+            
+            # Match by app_label (primary match)
+            matched = False
+            if app_label and pod_app_label == app_label:
+                matched = True
+                logger.info(f"Matched pod {p.get('pod_id')} by app_label: {pod_app_label} == {app_label}")
+            else:
+                # Try to match by deployment_name (same logic as list_pods_by_filter)
+                pod_deployment_name = None
+                if pod_ns:
+                    try:
+                        # Get deployment name from deployment store
+                        deployments = deployment_store.get_deployments_by_namespace(pod_ns)
+                        for dep in deployments:
+                            dep_app_label = dep.get("app_label")
+                            if dep_app_label == pod_app_label:
+                                pod_deployment_name = dep.get("name")
+                                break
+                        # If not found, try by app_label only
+                        if not pod_deployment_name and pod_app_label:
+                            deployments_by_app = deployment_store.get_deployments_by_app(pod_app_label)
+                            for dep in deployments_by_app:
+                                if dep.get("namespace") == pod_ns:
+                                    pod_deployment_name = dep.get("name")
+                                    break
+                    except Exception as e:
+                        logger.debug(f"Error looking up deployment for pod {p.get('pod_id')}: {e}")
                 
-                # Check if any pod container matches any deployment container
+                # Match by deployment_name
+                if deployment_name and pod_deployment_name == deployment_name:
+                    matched = True
+                    logger.info(f"Matched pod {p.get('pod_id')} by deployment_name: {pod_deployment_name} == {deployment_name}")
+            
+            # If still not matched, try container matching
+            if not matched and containers_spec:
+                pod_containers = p.get("containers", [])
                 for pod_container in pod_containers:
                     if not isinstance(pod_container, dict):
                         continue
-                    
                     pod_container_name = pod_container.get("name")
                     pod_container_image = pod_container.get("image")
                     
                     for container_spec in containers_spec:
                         if not isinstance(container_spec, dict):
                             continue
-                        
                         spec_name = container_spec.get("name")
                         spec_image = container_spec.get("image")
                         
-                        # Match by name or image
                         if (pod_container_name and spec_name and pod_container_name == spec_name) or \
                            (pod_container_image and spec_image and pod_container_image == spec_image):
-                            # Check if pod is already in matching_pods
-                            pod_id = pod.get("pod_id")
-                            if pod_id and not any(p.get("pod_id") == pod_id for p in matching_pods):
-                                matching_pods.append(pod)
-                                logger.info(f"Matched pod {pod_id} by container (name={pod_container_name}, image={pod_container_image})")
+                            matched = True
+                            logger.info(f"Matched pod {p.get('pod_id')} by container (name={pod_container_name}, image={pod_container_image})")
                             break
-                    if any(p.get("pod_id") == pod.get("pod_id") for p in matching_pods):
+                    if matched:
                         break
-        
-        # Strategy 3: If still no matches and only one deployment in namespace, assume all pods belong to it
-        if not matching_pods:
-            from utils.redis.deployment_store import DeploymentStore
-            deployment_store = DeploymentStore(rd)
-            all_deployments = deployment_store.get_deployments_by_namespace(namespace)
-            if len(all_deployments) == 1:
-                # Only one deployment in namespace, assume all pods belong to it
-                matching_pods = namespace_pods
-                logger.info(f"Only one deployment in namespace {namespace}, assuming all {len(matching_pods)} pods belong to it")
+            
+            if matched:
+                pod_id = p.get("pod_id")
+                if pod_id not in seen_pod_ids:
+                    matching_pods.append(p)
+                    seen_pod_ids.add(pod_id)
         
         namespace_pods = matching_pods
+        logger.info(f"Final matching pods count: {len(namespace_pods)}")
+        
+        # Log pod IDs for debugging
+        if namespace_pods:
+            pod_ids = [p.get("pod_id") for p in namespace_pods]
+            logger.info(f"Pods to terminate: {pod_ids}")
+        else:
+            logger.warning(f"No pods matched for deployment {namespace}/{name} (app_label={app_label}, deployment_name={deployment_name})")
+            logger.warning(f"Total pods in namespace: {len(namespace_pods)}")
+            # Log all pods in namespace for debugging
+            if namespace_pods:
+                logger.warning("Pods in namespace (for debugging):")
+                for pod in namespace_pods:
+                    pod_id = pod.get("pod_id")
+                    pod_app_label = pod.get("app_label")
+                    pod_labels = pod.get("labels", {})
+                    if isinstance(pod_labels, dict):
+                        pod_app_label = pod_app_label or pod_labels.get("app") or pod_labels.get("app_label")
+                    logger.warning(f"  - Pod {pod_id}: app_label={pod_app_label}, labels={pod_labels}")
         
         if not namespace_pods:
             return _envelope_success("No pods found for deployment", {"pods_terminated": 0})
@@ -1633,14 +1987,13 @@ async def terminate_deployment_pods_api(
                 continue
             
             try:
-                # Encode hostname for queue
-                encoded_hostname = utilities.encode_hostname_with_key(hostname)
-                host_queue_info = create_host_queue_info(encoded_hostname)
+                # Create host queue info (same pattern as other endpoints)
+                host_queue_info = create_host_queue_info(hostname, ue)
                 
                 result = submit_celery_task(
                     task=terminate_pod_task,
-                    args=(pod_id, namespace),
-                    kwargs={"host_name": hostname},
+                    args=(namespace, pod_id),
+                    kwargs={},
                     queue_info=host_queue_info,
                     operation_name="terminate_pod",
                     error_code="TERMINATE_POD_TASK_ERROR",
@@ -1805,13 +2158,15 @@ async def reassociate_deployment_pods_api(
 async def get_deployment_yaml_api(
     namespace: str,
     app_label: str,
+    deployment_name: Optional[str] = None,
     user: str = Depends(get_current_user),
 ):
     """Get deployment YAML for a specific application.
     
     Args:
         namespace: Namespace name
-        app_label: Application label
+        app_label: Application label (primary lookup method)
+        deployment_name: Optional deployment name (metadata.name) for fallback lookup
         user: Authenticated user
         
     Returns:
@@ -1822,15 +2177,23 @@ async def get_deployment_yaml_api(
         
         deployment_store = DeploymentStore(rd)
         
-        # Get deployments by namespace and app_label
+        # Get deployments by namespace
         deployments = deployment_store.get_deployments_by_namespace(namespace)
         
-        # Find deployment matching app_label
+        # Find deployment matching app_label first
         matching_deployment = None
         for deployment in deployments:
             if deployment.get("app_label") == app_label:
                 matching_deployment = deployment
                 break
+        
+        # If not found by app_label and deployment_name is provided, try by deployment name
+        if not matching_deployment and deployment_name:
+            for deployment in deployments:
+                if deployment.get("name") == deployment_name:
+                    matching_deployment = deployment
+                    logger.debug(f"Found deployment {deployment_name} by name (app_label: {deployment.get('app_label')})")
+                    break
         
         if not matching_deployment:
             # Try by app_label only as fallback
@@ -2027,7 +2390,7 @@ async def destroy_container_api(request: DestroyContainerRequest, user: str = De
         operation_name="destroy_container",
         error_code="DESTROY_CONTAINER_ERROR",
         additional_data={"host_name": request.host_name, "namespace": request.namespace, "container_id": request.cid},
-    )
+        )
     return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
@@ -2041,7 +2404,7 @@ async def purge_stopped_api(request: PurgeStoppedRequest, user: str = Depends(ge
         operation_name="purge_stopped",
         error_code="PURGE_STOPPED_ERROR",
         additional_data={"host_name": request.host_name, "namespace": request.namespace},
-    )
+        )
     return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
@@ -2090,6 +2453,389 @@ async def cleanup_tasks_by_pod_prefix_api(request: CleanupTasksByPodPrefixReques
         additional_data={"host_name": request.host_name, "namespace": request.namespace, "pod_id": request.pod_id},
     )
     return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+# ==================== Volume Management ====================
+
+@log_to_file(logger)
+@app.post("/storage/pvc/", tags=["Storage"])
+async def create_pvc_api(
+    request: CreatePVCRequest,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Create a PersistentVolumeClaim.
+    
+    This will automatically provision a PersistentVolume if needed.
+    """
+    try:
+        from utils.storage.volume_manager import VolumeManager
+        from utils.storage.volume import PersistentVolumeClaim, VolumeAccessMode
+        
+        volume_manager = VolumeManager()
+        
+        # Convert access modes
+        access_modes = [VolumeAccessMode(am) for am in request.access_modes]
+        
+        # Create PVC
+        pvc = PersistentVolumeClaim(
+            name=request.name,
+            namespace=request.namespace,
+            storage_class=request.storage_class,
+            access_modes=access_modes,
+            resources=request.resources
+        )
+        
+        # Create and bind to PV
+        pvc = volume_manager.create_pvc(pvc)
+        
+        return _envelope_success(
+            f"PVC {request.namespace}/{request.name} created and bound",
+            pvc.to_dict()
+        )
+    except Exception as e:
+        logger.error(f"Failed to create PVC: {e}", exc_info=True)
+        return create_error_response(
+            error_code="PVC_CREATION_ERROR",
+            message=f"Failed to create PVC: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.get("/storage/pvc/{namespace}/{name}", tags=["Storage"])
+async def get_pvc_api(
+    namespace: str,
+    name: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Get a PersistentVolumeClaim by namespace and name."""
+    try:
+        from utils.storage.volume_store import VolumeStore
+        
+        volume_store = VolumeStore()
+        pvc = volume_store.get_pvc(namespace, name)
+        
+        if not pvc:
+            return create_error_response(
+                error_code="PVC_NOT_FOUND",
+                message=f"PVC {namespace}/{name} not found",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        return _envelope_success("PVC retrieved", pvc.to_dict())
+    except Exception as e:
+        logger.error(f"Failed to get PVC: {e}", exc_info=True)
+        return create_error_response(
+            error_code="GET_PVC_ERROR",
+            message=f"Failed to get PVC: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.get("/storage/pvc/", tags=["Storage"])
+async def list_pvcs_api(
+    namespace: Optional[str] = None,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """List all PersistentVolumeClaims, optionally filtered by namespace."""
+    try:
+        from utils.storage.volume_store import VolumeStore
+        
+        volume_store = VolumeStore()
+        pvcs = volume_store.list_pvcs(namespace=namespace)
+        
+        return _envelope_success(
+            f"Retrieved {len(pvcs)} PVC(s)",
+            [pvc.to_dict() for pvc in pvcs]
+        )
+    except Exception as e:
+        logger.error(f"Failed to list PVCs: {e}", exc_info=True)
+        return create_error_response(
+            error_code="LIST_PVCS_ERROR",
+            message=f"Failed to list PVCs: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.delete("/storage/pvc/{namespace}/{name}", tags=["Storage"])
+async def delete_pvc_api(
+    namespace: str,
+    name: str,
+    delete_volume: bool = False,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Delete a PersistentVolumeClaim.
+    
+    Args:
+        namespace: PVC namespace
+        name: PVC name
+        delete_volume: If True, also delete the bound PersistentVolume
+    """
+    try:
+        from utils.storage.volume_manager import VolumeManager
+        
+        volume_manager = VolumeManager()
+        success = volume_manager.delete_pvc(namespace, name, delete_volume=delete_volume)
+        
+        if not success:
+            return create_error_response(
+                error_code="PVC_DELETION_ERROR",
+                message=f"Failed to delete PVC {namespace}/{name}",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        return _envelope_success(f"PVC {namespace}/{name} deleted")
+    except Exception as e:
+        logger.error(f"Failed to delete PVC: {e}", exc_info=True)
+        return create_error_response(
+            error_code="PVC_DELETION_ERROR",
+            message=f"Failed to delete PVC: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.get("/storage/pv/", tags=["Storage"])
+async def list_pvs_api(
+    storage_class: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """List all PersistentVolumes, optionally filtered by storage class or status."""
+    try:
+        from utils.storage.volume_store import VolumeStore
+        from utils.storage.volume import VolumeStatus
+        
+        volume_store = VolumeStore()
+        status = VolumeStatus(status_filter) if status_filter else None
+        pvs = volume_store.list_pvs(storage_class=storage_class, status=status)
+        
+        return _envelope_success(
+            f"Retrieved {len(pvs)} PV(s)",
+            [pv.to_dict() for pv in pvs]
+        )
+    except Exception as e:
+        logger.error(f"Failed to list PVs: {e}", exc_info=True)
+        return create_error_response(
+            error_code="LIST_PVS_ERROR",
+            message=f"Failed to list PVs: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.get("/storage/pv/{name}", tags=["Storage"])
+async def get_pv_api(
+    name: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Get a PersistentVolume by name."""
+    try:
+        from utils.storage.volume_store import VolumeStore
+        
+        volume_store = VolumeStore()
+        pv = volume_store.get_pv(name)
+        
+        if not pv:
+            return create_error_response(
+                error_code="PV_NOT_FOUND",
+                message=f"PV {name} not found",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        return _envelope_success("PV retrieved", pv.to_dict())
+    except Exception as e:
+        logger.error(f"Failed to get PV: {e}", exc_info=True)
+        return create_error_response(
+            error_code="GET_PV_ERROR",
+            message=f"Failed to get PV: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.delete("/storage/pv/{name}", tags=["Storage"])
+async def delete_pv_api(
+    name: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Delete a PersistentVolume."""
+    try:
+        from utils.storage.volume_manager import VolumeManager
+        
+        volume_manager = VolumeManager()
+        success = volume_manager.delete_pv(name)
+        
+        if not success:
+            return create_error_response(
+                error_code="PV_DELETION_ERROR",
+                message=f"Failed to delete PV {name}",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        return _envelope_success(f"PV {name} deleted")
+    except Exception as e:
+        logger.error(f"Failed to delete PV: {e}", exc_info=True)
+        return create_error_response(
+            error_code="PV_DELETION_ERROR",
+            message=f"Failed to delete PV: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.get("/storage/storageclasses/", tags=["Storage"])
+async def list_storage_classes_api(
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """List all available storage classes."""
+    try:
+        from utils.storage.storage_classes import DEFAULT_STORAGE_CLASSES
+        
+        storage_classes = [
+            sc.to_dict() for sc in DEFAULT_STORAGE_CLASSES.values()
+        ]
+        
+        return _envelope_success(
+            f"Retrieved {len(storage_classes)} storage class(es)",
+            storage_classes
+        )
+    except Exception as e:
+        logger.error(f"Failed to list storage classes: {e}", exc_info=True)
+        return create_error_response(
+            error_code="LIST_STORAGE_CLASSES_ERROR",
+            message=f"Failed to list storage classes: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.post("/storage/snapshot/", tags=["Storage"])
+async def create_snapshot_api(
+    namespace: str,
+    pvc_name: str,
+    snapshot_name: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Create a snapshot of a PersistentVolumeClaim."""
+    try:
+        from utils.storage.volume_manager import VolumeManager
+        
+        volume_manager = VolumeManager()
+        snapshot = volume_manager.create_snapshot(namespace, pvc_name, snapshot_name)
+        
+        if not snapshot:
+            return create_error_response(
+                error_code="SNAPSHOT_CREATION_ERROR",
+                message=f"Failed to create snapshot {snapshot_name}",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        return _envelope_success(
+            f"Snapshot {snapshot_name} created",
+            snapshot.to_dict()
+        )
+    except Exception as e:
+        logger.error(f"Failed to create snapshot: {e}", exc_info=True)
+        return create_error_response(
+            error_code="SNAPSHOT_CREATION_ERROR",
+            message=f"Failed to create snapshot: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.get("/storage/snapshot/", tags=["Storage"])
+async def list_snapshots_api(
+    namespace: Optional[str] = None,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """List all snapshots, optionally filtered by namespace."""
+    try:
+        from utils.storage.volume_store import VolumeStore
+        
+        volume_store = VolumeStore()
+        snapshots = volume_store.list_snapshots(namespace=namespace)
+        
+        return _envelope_success(
+            f"Retrieved {len(snapshots)} snapshot(s)",
+            [snapshot.to_dict() for snapshot in snapshots]
+        )
+    except Exception as e:
+        logger.error(f"Failed to list snapshots: {e}", exc_info=True)
+        return create_error_response(
+            error_code="LIST_SNAPSHOTS_ERROR",
+            message=f"Failed to list snapshots: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.delete("/storage/snapshot/{namespace}/{name}", tags=["Storage"])
+async def delete_snapshot_api(
+    namespace: str,
+    name: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Delete a volume snapshot."""
+    try:
+        from utils.storage.volume_manager import VolumeManager
+        
+        volume_manager = VolumeManager()
+        success = volume_manager.delete_snapshot(namespace, name)
+        
+        if not success:
+            return create_error_response(
+                error_code="SNAPSHOT_DELETION_ERROR",
+                message=f"Failed to delete snapshot {namespace}/{name}",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        return _envelope_success(f"Snapshot {namespace}/{name} deleted")
+    except Exception as e:
+        logger.error(f"Failed to delete snapshot: {e}", exc_info=True)
+        return create_error_response(
+            error_code="SNAPSHOT_DELETION_ERROR",
+            message=f"Failed to delete snapshot: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@log_to_file(logger)
+@app.post("/storage/snapshot/restore/", tags=["Storage"])
+async def restore_from_snapshot_api(
+    snapshot_name: str,
+    namespace: str,
+    new_pvc_name: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Restore a PVC from a snapshot."""
+    try:
+        from utils.storage.volume_manager import VolumeManager
+        
+        volume_manager = VolumeManager()
+        pvc = volume_manager.restore_from_snapshot(snapshot_name, namespace, new_pvc_name)
+        
+        if not pvc:
+            return create_error_response(
+                error_code="SNAPSHOT_RESTORE_ERROR",
+                message=f"Failed to restore PVC from snapshot {snapshot_name}",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        return _envelope_success(
+            f"PVC {namespace}/{new_pvc_name} restored from snapshot",
+            pvc.to_dict()
+        )
+    except Exception as e:
+        logger.error(f"Failed to restore from snapshot: {e}", exc_info=True)
+        return create_error_response(
+            error_code="SNAPSHOT_RESTORE_ERROR",
+            message=f"Failed to restore from snapshot: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 def run_server():

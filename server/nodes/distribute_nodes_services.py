@@ -383,13 +383,24 @@ class ClusterWorkerDistribution:
                                   key=lambda item: total_cpu_per_cluster[item[0]] + total_memory_per_cluster[item[0]],
                                   reverse=True)
 
+        # Track which nodes have instances of each service for load balancing
+        service_node_counts = {}  # {service_name: {node_index: count}}
+        
         for service_name, instance_num in sorted_instances:
             requirements = self.cluster_infos[service_name]
             best_node = -1
             min_resource_usage = float('inf')
             
+            # Initialize service node counts if needed
+            if service_name not in service_node_counts:
+                service_node_counts[service_name] = {}
+                for i in range(num_nodes):
+                    service_node_counts[service_name][i] = 0
+            
             logger.info(f"Placing {service_name} instance {instance_num} (CPU: {requirements['cpu']}, Memory: {requirements['memory']})")
 
+            # First pass: Find all nodes that can fit this instance
+            candidate_nodes = []
             for i in range(num_nodes):
                 node = self.worker_nodes[i]
                 current_cpu_usage = sum(
@@ -402,23 +413,38 @@ class ClusterWorkerDistribution:
 
                 if (node['cpu'] >= current_cpu_usage + requirements['cpu'] and
                         node['memory'] >= current_memory_usage + requirements['memory']):
-                    resource_usage = current_cpu_usage + requirements['cpu'] + current_memory_usage + requirements[
-                        'memory']
-                    logger.info(f"  Node {i}: Can fit! Resource usage would be: {resource_usage} (current min: {min_resource_usage})")
-                    if resource_usage < min_resource_usage:
-                        min_resource_usage = resource_usage
-                        best_node = i
-                        logger.info(f"  Node {i}: New best node (usage: {resource_usage})")
+                    resource_usage = current_cpu_usage + requirements['cpu'] + current_memory_usage + requirements['memory']
+                    instance_count_on_node = service_node_counts[service_name][i]
+                    candidate_nodes.append({
+                        'node_index': i,
+                        'resource_usage': resource_usage,
+                        'instance_count': instance_count_on_node,
+                        'node': node
+                    })
+                    logger.info(f"  Node {i}: Can fit! Resource usage would be: {resource_usage}, current instances of {service_name}: {instance_count_on_node}")
                 else:
                     logger.info(f"  Node {i}: Cannot fit (CPU: {current_cpu_usage + requirements['cpu']} > {node['cpu']} or Memory: {current_memory_usage + requirements['memory']} > {node['memory']})")
 
-            if best_node != -1:
-                distribution[best_node].append((service_name, instance_num))
-                logger.info(f"Placed {service_name} instance {instance_num} on node {best_node}. Current distribution: {distribution}")
-            else:
+            if not candidate_nodes:
                 logger.warning(
                     f"Could not place instance {instance_num} of microservice {service_name}. Insufficient resources on all nodes. As requested CPUs are {total_cpus_need} available cpus are {total_worker_cpu} and Memory need is {total_memory_need} and available is {total_worker_memory}")
                 return None
+
+            # Load balancing: Prefer nodes with fewer instances of this service
+            # Sort candidates by: 1) instance count (ascending), 2) resource usage (ascending)
+            candidate_nodes.sort(key=lambda x: (x['instance_count'], x['resource_usage']))
+            
+            # Select the node with the fewest instances of this service
+            # If multiple nodes have the same count, choose the one with lowest resource usage
+            best_node = candidate_nodes[0]['node_index']
+            min_resource_usage = candidate_nodes[0]['resource_usage']
+            
+            logger.info(f"  Selected node {best_node} (instances of {service_name}: {candidate_nodes[0]['instance_count']}, resource usage: {min_resource_usage})")
+
+            # Place the instance
+            distribution[best_node].append((service_name, instance_num))
+            service_node_counts[service_name][best_node] += 1
+            logger.info(f"Placed {service_name} instance {instance_num} on node {best_node}. Current distribution: {distribution}")
 
         logger.info(f"Final distribution result: {distribution}")
         return distribution

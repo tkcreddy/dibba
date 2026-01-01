@@ -45,6 +45,7 @@ class DeploymentSpec:
     resource_requirements: ResourceRequirements
     min_replicas: Optional[int] = None  # Minimum replicas (for auto-scaling)
     max_replicas: Optional[int] = None  # Maximum replicas (for auto-scaling)
+    volumes: Optional[List[Dict[str, Any]]] = None  # Pod-level volumes
 
 
 class ResourceConverter:
@@ -269,6 +270,11 @@ class DeploymentParser:
             
             logger.info(f"Final replicas configuration: replicas={replicas}, min_replicas={min_replicas}, max_replicas={max_replicas}")
             
+            # Extract volumes from pod spec (if present)
+            volumes = template_spec.get('volumes', [])
+            if volumes:
+                logger.info(f"Found {len(volumes)} volumes in pod spec")
+            
             # Extract metadata.name - this is the deployment name that will be stored in Redis
             deployment_name = metadata.get('name', 'unknown')
             logger.info(f"Parsed deployment name (metadata.name): {deployment_name}, app_label: {app_label}")
@@ -281,7 +287,8 @@ class DeploymentParser:
                 min_replicas=min_replicas,
                 max_replicas=max_replicas,
                 containers=containers,
-                resource_requirements=resource_reqs
+                resource_requirements=resource_reqs,
+                volumes=volumes if volumes else None
             )
         
         except Exception as e:

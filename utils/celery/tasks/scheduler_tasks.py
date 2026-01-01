@@ -29,8 +29,208 @@ from utils.celery.queue_utils import create_host_queue_info, create_queue_info, 
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.ReadConfig import ReadConfig as rc
 from utils.exceptions import AWSError
+from utils.storage.volume_manager import VolumeManager
+from utils.storage.volume import PersistentVolumeClaim, VolumeAccessMode
 
 logger = LogKCld()
+
+
+@log_to_file(logger)
+def _resolve_pvc_volume_mounts(
+    containers: List[Dict[str, Any]],
+    volumes: Optional[List[Dict[str, Any]]],
+    namespace: str,
+    hostname: str
+) -> List[Dict[str, Any]]:
+    """Resolve PVC references in volumeMounts to actual mount paths.
+    
+    Args:
+        containers: List of container definitions
+        volumes: List of pod-level volume definitions
+        namespace: Pod namespace
+        hostname: Host where pod will be created
+        
+    Returns:
+        List of container specs with resolved volume mounts
+    """
+    volume_manager = VolumeManager()
+    resolved_containers = []
+    
+    # Build volume name to mount path mapping
+    volume_mount_map = {}
+    if volumes:
+        for volume in volumes:
+            volume_name = volume.get('name')
+            if not volume_name:
+                continue
+            
+            # Handle different volume types
+            if 'persistentVolumeClaim' in volume:
+                pvc_name = volume['persistentVolumeClaim'].get('claimName')
+                if pvc_name:
+                    # Get PVC and resolve to mount path
+                    mount_path = volume_manager.get_pvc_mount_path(namespace, pvc_name)
+                    if mount_path:
+                        volume_mount_map[volume_name] = mount_path
+                        logger.info(f"Resolved PVC {namespace}/{pvc_name} to mount path: {mount_path}")
+                    else:
+                        logger.warning(f"PVC {namespace}/{pvc_name} not found or not bound")
+            elif 'hostPath' in volume:
+                # Direct hostPath volume
+                host_path = volume['hostPath'].get('path')
+                if host_path:
+                    volume_mount_map[volume_name] = host_path
+                    logger.info(f"Resolved hostPath volume {volume_name} to: {host_path}")
+            elif 'emptyDir' in volume:
+                # EmptyDir volume - create temporary directory
+                import tempfile
+                temp_dir = tempfile.mkdtemp(prefix=f"dibba-emptydir-{volume_name}-")
+                volume_mount_map[volume_name] = temp_dir
+                logger.info(f"Created emptyDir volume {volume_name} at: {temp_dir}")
+    
+    # Update container volumeMounts with resolved paths
+    for container in containers:
+        container_spec = dict(container)
+        volume_mounts = container.get('volumeMounts') or container.get('mounts') or []
+        
+        if volume_mounts:
+            resolved_mounts = []
+            for mount in volume_mounts:
+                mount_name = mount.get('name') or mount.get('volumeName')
+                mount_path = mount.get('mountPath') or mount.get('containerPath')
+                
+                if mount_name and mount_name in volume_mount_map:
+                    # Resolve PVC or volume reference
+                    resolved_mount = {
+                        'mountPath': mount_path,
+                        'hostPath': volume_mount_map[mount_name],
+                        'readOnly': mount.get('readOnly', False),
+                        'type': 'bind'
+                    }
+                    resolved_mounts.append(resolved_mount)
+                    logger.info(f"Resolved volume mount: {mount_name} -> {mount_path} (from {volume_mount_map[mount_name]})")
+                elif mount.get('hostPath') or mount.get('source'):
+                    # Direct mount (already has hostPath)
+                    resolved_mounts.append(mount)
+                else:
+                    logger.warning(f"Volume mount {mount_name} not found in volumes, skipping")
+            
+            if resolved_mounts:
+                container_spec['mounts'] = resolved_mounts
+        
+        resolved_containers.append(container_spec)
+    
+    return resolved_containers
+
+
+@log_to_file(logger)
+def _create_pvcs_from_volumes(
+    volumes: List[Dict[str, Any]],
+    namespace: str,
+    deployment_name: str
+) -> None:
+    """Create PVCs from volume definitions in deployment YAML.
+    
+    Args:
+        volumes: List of volume definitions from pod spec
+        namespace: Deployment namespace
+        deployment_name: Deployment name (for PVC naming)
+    """
+    volume_manager = VolumeManager()
+    
+    for volume in volumes:
+        if 'persistentVolumeClaim' not in volume:
+            continue
+        
+        pvc_spec = volume['persistentVolumeClaim']
+        pvc_name = pvc_spec.get('claimName')
+        
+        if not pvc_name:
+            logger.warning(f"PVC volume {volume.get('name')} has no claimName, skipping")
+            continue
+        
+        # Check if PVC already exists
+        from utils.storage.volume_store import VolumeStore
+        volume_store = VolumeStore()
+        existing_pvc = volume_store.get_pvc(namespace, pvc_name)
+        
+        if existing_pvc:
+            logger.info(f"PVC {namespace}/{pvc_name} already exists, skipping creation")
+            continue
+        
+        # Create PVC from spec
+        try:
+            from utils.storage.volume import PersistentVolumeClaim, VolumeAccessMode
+            
+            # Extract PVC configuration
+            storage_class = pvc_spec.get('storageClassName')
+            access_modes = pvc_spec.get('accessModes', ['ReadWriteOnce'])
+            resources = pvc_spec.get('resources', {'requests': {'storage': '1Gi'}})
+            
+            # Convert access modes
+            access_modes_list = [VolumeAccessMode(am) for am in access_modes]
+            
+            # Create PVC
+            pvc = PersistentVolumeClaim(
+                name=pvc_name,
+                namespace=namespace,
+                storage_class=storage_class,
+                access_modes=access_modes_list,
+                resources=resources
+            )
+            
+            # Create and bind to PV
+            pvc = volume_manager.create_pvc(pvc)
+            logger.info(f"Created PVC {namespace}/{pvc_name} from deployment {deployment_name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to create PVC {namespace}/{pvc_name}: {e}", exc_info=True)
+            # Continue with other PVCs even if one fails
+
+
+@log_to_file(logger)
+def _attach_volumes_to_node(
+    volumes: List[Dict[str, Any]],
+    namespace: str,
+    hostname: str
+) -> None:
+    """Attach volumes to a node before pod creation.
+    
+    Args:
+        volumes: List of volume definitions
+        namespace: Pod namespace
+        hostname: Node hostname
+    """
+    volume_manager = VolumeManager()
+    
+    for volume in volumes:
+        if 'persistentVolumeClaim' not in volume:
+            continue
+        
+        pvc_spec = volume['persistentVolumeClaim']
+        pvc_name = pvc_spec.get('claimName')
+        
+        if not pvc_name:
+            continue
+        
+        # Get PVC
+        from utils.storage.volume_store import VolumeStore
+        volume_store = VolumeStore()
+        pvc = volume_store.get_pvc(namespace, pvc_name)
+        
+        if not pvc or not pvc.volume_name:
+            logger.warning(f"PVC {namespace}/{pvc_name} not found or not bound, skipping attachment")
+            continue
+        
+        # Attach volume to node
+        try:
+            success = volume_manager.attach_volume_to_node(pvc.volume_name, hostname)
+            if success:
+                logger.info(f"Attached volume {pvc.volume_name} to node {hostname}")
+            else:
+                logger.warning(f"Failed to attach volume {pvc.volume_name} to node {hostname}")
+        except Exception as e:
+            logger.error(f"Error attaching volume {pvc.volume_name} to node {hostname}: {e}", exc_info=True)
 
 
 @celery_app.task(name="sched.evaluate_deployment_requirements")
@@ -90,6 +290,10 @@ def evaluate_deployment_requirements_task(yaml_content: str) -> Dict[str, Any]:
             f"Memory: {deployment.resource_requirements.memory_mb} MB"
         )
         
+        # Create PVCs if defined in YAML
+        if deployment.volumes:
+            _create_pvcs_from_volumes(deployment.volumes, deployment.namespace, deployment.name)
+        
         # Get available resources using distribute_nodes_services
         logger.info("Step 1: Querying available resources from Redis using distribute_nodes_services...")
         redis_interface = RedisInterface()
@@ -107,6 +311,7 @@ def evaluate_deployment_requirements_task(yaml_content: str) -> Dict[str, Any]:
                     'app_label': deployment.app_label,
                     'replicas': deployment.replicas,
                     'containers': deployment.containers,
+                    'volumes': deployment.volumes,
                     'resource_requirements': {
                         'cpu_millicores': deployment.resource_requirements.cpu_millicores,
                         'memory_mb': deployment.resource_requirements.memory_mb,
@@ -247,6 +452,7 @@ def evaluate_deployment_requirements_task(yaml_content: str) -> Dict[str, Any]:
                 'min_replicas': getattr(deployment, 'min_replicas', deployment.replicas),
                 'max_replicas': getattr(deployment, 'max_replicas', deployment.replicas),
                 'containers': deployment.containers,
+                'volumes': getattr(deployment, 'volumes', None),
                 'resource_requirements': {
                     'cpu_millicores': deployment.resource_requirements.cpu_millicores,
                     'memory_mb': deployment.resource_requirements.memory_mb,
@@ -514,6 +720,7 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
         app_label = deployment_data.get('app_label', 'unknown')
         replicas = deployment_data.get('replicas', 1)
         containers = deployment_data.get('containers', [])
+        volumes = deployment_data.get('volumes')  # Pod-level volumes
         resource_reqs = deployment_data.get('resource_requirements', {})
         
         # Reconstruct deployment spec for easier handling
@@ -678,9 +885,21 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                     pod_cpu = pod_resource_reqs.get('cpu_millicores', resource_requirements.cpu_millicores)
                     pod_memory = pod_resource_reqs.get('memory_mb', resource_requirements.memory_mb)
                     
-                    # Prepare container specs for containerd
+                    # Resolve PVCs and prepare container specs for containerd
+                    resolved_containers = _resolve_pvc_volume_mounts(
+                        containers=containers,
+                        volumes=volumes,
+                        namespace=namespace,
+                        hostname=hostname
+                    )
+                    
+                    # Attach volumes to node if needed
+                    if volumes:
+                        _attach_volumes_to_node(volumes, namespace, hostname)
+                    
+                    # Build container specs with resources
                     container_specs = []
-                    for container in containers:
+                    for container in resolved_containers:
                         container_spec = {
                             'image': container.get('image'),
                             'name': container.get('name'),
@@ -692,11 +911,10 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                                 'memory': f"{int(pod_memory)}Mi"
                             }
                         }
-                        # Extract volumeMounts if present
-                        volume_mounts = container.get('volumeMounts') or container.get('mounts')
-                        if volume_mounts:
-                            container_spec['mounts'] = volume_mounts
-                            logger.info(f"Step 3: Found {len(volume_mounts)} volume mounts for container {container.get('name')}")
+                        # Add resolved volume mounts
+                        if container.get('mounts'):
+                            container_spec['mounts'] = container.get('mounts')
+                            logger.info(f"Step 3: Added {len(container.get('mounts'))} resolved volume mounts for container {container.get('name')}")
                         container_specs.append(container_spec)
                     
                     # Submit pod creation task
@@ -767,9 +985,21 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                     
                     logger.info(f"Step 3: Creating pod for {app_name} instance {instance_num} on {hostname}")
                     
-                    # Prepare container specs for containerd
+                    # Resolve PVCs and prepare container specs for containerd
+                    resolved_containers = _resolve_pvc_volume_mounts(
+                        containers=containers,
+                        volumes=volumes,
+                        namespace=namespace,
+                        hostname=hostname
+                    )
+                    
+                    # Attach volumes to node if needed
+                    if volumes:
+                        _attach_volumes_to_node(volumes, namespace, hostname)
+                    
+                    # Build container specs with resources
                     container_specs = []
-                    for container in containers:
+                    for container in resolved_containers:
                         container_spec = {
                             'image': container.get('image'),
                             'name': container.get('name'),
@@ -781,11 +1011,10 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                                 'memory': f"{int(resource_requirements.memory_mb)}Mi"
                             }
                         }
-                        # Extract volumeMounts if present
-                        volume_mounts = container.get('volumeMounts') or container.get('mounts')
-                        if volume_mounts:
-                            container_spec['mounts'] = volume_mounts
-                            logger.info(f"Step 3: Found {len(volume_mounts)} volume mounts for container {container.get('name')}")
+                        # Add resolved volume mounts
+                        if container.get('mounts'):
+                            container_spec['mounts'] = container.get('mounts')
+                            logger.info(f"Step 3: Added {len(container.get('mounts'))} resolved volume mounts for container {container.get('name')}")
                         container_specs.append(container_spec)
                     
                     # Prepare labels with app_label for pod identification

@@ -1,5 +1,5 @@
 # utils/containerd/schemas.py
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from pydantic import BaseModel, Field, ConfigDict
 
 def _parse_mem_bytes(s: str) -> int:
@@ -81,3 +81,26 @@ class ScheduleDeploymentRequest(BaseModel):
     """Request model for scheduling a deployment from YAML."""
     model_config = ConfigDict(extra="forbid")
     yaml_content: str = Field(..., description="Kubernetes-like deployment YAML content")
+
+
+# ==================== Volume Management Models ====================
+
+class CreatePVCRequest(BaseModel):
+    """Request model for creating a PersistentVolumeClaim."""
+    model_config = ConfigDict(extra="allow")
+    name: str
+    namespace: str
+    storage_class: Optional[str] = None
+    access_modes: List[str] = Field(default_factory=lambda: ["ReadWriteOnce"])
+    resources: Dict[str, Any] = Field(default_factory=lambda: {"requests": {"storage": "1Gi"}})
+
+
+class CreatePVRequest(BaseModel):
+    """Request model for creating a PersistentVolume."""
+    model_config = ConfigDict(extra="allow")
+    name: str
+    storage_class: str
+    capacity: str
+    access_modes: List[str] = Field(default_factory=lambda: ["ReadWriteOnce"])
+    host_path: Optional[str] = None
+    aws_volume_id: Optional[str] = None

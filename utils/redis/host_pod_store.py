@@ -531,10 +531,44 @@ class HostPodStore:
         """
         pod_ids = self.redis.smembers(f"pod:index:app:{app_name}")
         pods = []
+        seen_pod_ids = set()
+        
+        # Get pods from index
         for pod_id in pod_ids:
-            pod_data = self.get_pod(pod_id)
+            pod_id_str = pod_id.decode() if isinstance(pod_id, bytes) else pod_id
+            if pod_id_str in seen_pod_ids:
+                continue
+            pod_data = self.get_pod(pod_id_str)
             if pod_data:
                 pods.append(pod_data)
+                seen_pod_ids.add(pod_id_str)
+        
+        # Fallback: If index is empty or incomplete, query all hosts
+        if not pods:
+            logger.debug(f"No pods found in app index for {app_name}, querying all hosts")
+            all_hosts = self.get_all_hosts()
+            for host in all_hosts:
+                hostname = host.get("hostname")
+                if not hostname:
+                    continue
+                host_pods = self.get_pods_by_host(hostname)
+                for pod in host_pods:
+                    pod_id = pod.get("pod_id")
+                    if not pod_id or pod_id in seen_pod_ids:
+                        continue
+                    
+                    # Check if pod belongs to this app
+                    pod_labels = pod.get("labels", {})
+                    pod_app_label = pod.get("app_label")
+                    if isinstance(pod_labels, dict):
+                        pod_app_label = pod_app_label or pod_labels.get("app") or pod_labels.get("app_label")
+                    
+                    if pod_app_label == app_name:
+                        pods.append(pod)
+                        seen_pod_ids.add(pod_id)
+                        logger.debug(f"Found pod {pod_id} for app {app_name} via host query")
+        
+        logger.info(f"Found {len(pods)} pods for application {app_name}")
         return pods
     
     @log_to_file(logger)

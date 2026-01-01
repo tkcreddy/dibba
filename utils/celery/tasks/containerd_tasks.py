@@ -10,6 +10,7 @@ import os
 import shlex
 
 from utils.containerd.schemas import ContainerSpec, ResourceSpec
+import re
 
 logger = LogKCld()
 
@@ -26,6 +27,32 @@ key_read = read_config.encryption_config
 
 # ----------------- helpers you already started using -----------------
 
+def _parse_cpu_to_millicores(cpu_str: str) -> int:
+    """Parse CPU string (e.g., '250m', '1', '0.5') to millicores.
+    
+    Args:
+        cpu_str: CPU string (e.g., '250m', '1', '0.5')
+        
+    Returns:
+        CPU in millicores (int)
+    """
+    if not cpu_str:
+        return 0
+    
+    cpu_str = str(cpu_str).strip().lower()
+    
+    # Handle millicores (e.g., '250m', '500m')
+    if cpu_str.endswith('m'):
+        return int(float(cpu_str[:-1]))
+    
+    # Handle cores (e.g., '1', '0.5', '2.5')
+    try:
+        cores = float(cpu_str)
+        return int(cores * 1000)
+    except ValueError:
+        logger.error(f"Invalid CPU format: {cpu_str}")
+        return 0
+
 @log_to_file(logger)
 def _rehydrate_containers(containers_json):
     specs = []
@@ -38,7 +65,40 @@ def _rehydrate_containers(containers_json):
 
         d = dict(item)
         if "resources" in d and isinstance(d["resources"], dict):
-            d["resources"] = ResourceSpec(**d["resources"])
+            resources = d["resources"]
+            
+            # Check if this is Kubernetes-style (has 'requests' or 'limits')
+            if "limits" in resources or "requests" in resources:
+                # Kubernetes-style: convert to ResourceSpec format
+                # Prefer limits over requests
+                cpu_str = None
+                memory_str = None
+                
+                if "limits" in resources:
+                    cpu_str = resources["limits"].get("cpu")
+                    memory_str = resources["limits"].get("memory")
+                
+                if not cpu_str and "requests" in resources:
+                    cpu_str = resources["requests"].get("cpu")
+                if not memory_str and "requests" in resources:
+                    memory_str = resources["requests"].get("memory")
+                
+                # Convert CPU to millicores
+                cpu_millicores = _parse_cpu_to_millicores(cpu_str or "0")
+                
+                # Memory is already in the right format (e.g., "256Mi"), use as-is
+                memory = memory_str or "0"
+                
+                # Create ResourceSpec
+                d["resources"] = ResourceSpec(
+                    cpu_millicores=cpu_millicores,
+                    memory=memory,
+                    cpuset_cpus=None  # Can be extracted from resources if needed
+                )
+                logger.debug(f"Converted Kubernetes-style resources for container {d.get('name', idx)}: cpu={cpu_str} -> {cpu_millicores} millicores, memory={memory_str}")
+            else:
+                # Direct format: already in ResourceSpec format (cpu_millicores, memory)
+                d["resources"] = ResourceSpec(**resources)
 
         # Normalize volume mounts: support both 'volumeMounts' (Kubernetes style) and 'mounts' (direct style)
         # Prefer 'mounts' if both are present, otherwise use 'volumeMounts' if available
@@ -177,10 +237,50 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, labels: Opt
     # Extract labels from kwargs if not provided directly
     pod_labels = labels or extra_kwargs.get('labels') or {}
     
+    # Extract volumes and hostname from kwargs for storage integration
+    volumes = extra_kwargs.get('volumes')
+    hostname = extra_kwargs.get('hostname') or os.environ.get('HOSTNAME', 'unknown')
+    
     # Capture creation time when pod creation starts
     creation_time = datetime.now(timezone.utc).isoformat()
 
     try:
+        # -------------------------------------------------
+        # 0) Prepare volumes using storage system (if available)
+        # -------------------------------------------------
+        if volumes:
+            try:
+                from utils.storage.containerd_integration import (
+                    prepare_volumes_for_pod,
+                    validate_volume_mounts
+                )
+                
+                # Validate volume mounts before proceeding
+                container_mounts = []
+                for container in containers:
+                    if isinstance(container, dict):
+                        mounts = container.get('mounts') or container.get('volumeMounts') or []
+                        if mounts:
+                            container_mounts.extend(mounts)
+                
+                is_valid, error_msg = validate_volume_mounts(container_mounts, volumes)
+                if not is_valid:
+                    logger.warning(f"Volume mount validation failed: {error_msg}")
+                    # Continue anyway - mounts may have been pre-resolved
+                
+                # Prepare volumes (create PVCs, attach volumes)
+                volume_prep = prepare_volumes_for_pod(volumes, ns, hostname)
+                if not volume_prep.get('success'):
+                    logger.warning(f"Volume preparation had issues: {volume_prep.get('errors')}")
+                    # Continue anyway - volumes may already be prepared
+                else:
+                    logger.info(f"Successfully prepared {volume_prep.get('volumes_prepared')} volume(s)")
+            except ImportError:
+                logger.debug("Storage integration not available, skipping volume preparation")
+            except Exception as e:
+                logger.warning(f"Volume preparation failed: {e}", exc_info=True)
+                # Continue anyway - mounts may have been pre-resolved by scheduler
+        
         client = ContainerdClient(socket=sock, namespace=ns)
         pods = PodManager(client)
 
