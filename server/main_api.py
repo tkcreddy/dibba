@@ -655,6 +655,50 @@ async def create_pods(request: CreatePodsRequest, user: str = Depends(get_curren
 #
 
 @log_to_file(logger)
+def _filter_pause_containers(containers: list, pause_container: dict = None) -> list:
+    """Filter out pause containers from the containers list.
+    
+    Args:
+        containers: List of container dictionaries
+        pause_container: Optional pause container info dict
+        
+    Returns:
+        Filtered list of containers (excluding pause containers)
+    """
+    if not containers:
+        return []
+    
+    pause_cid = None
+    if pause_container and isinstance(pause_container, dict):
+        pause_cid = pause_container.get("cid") or pause_container.get("container_id")
+    
+    filtered = []
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        
+        # Check if this is a pause container
+        container_name = str(container.get("name", "")).lower()
+        container_image = str(container.get("image", "")).lower()
+        container_cid = container.get("cid") or container.get("container_id")
+        container_labels = container.get("labels", {})
+        if not isinstance(container_labels, dict):
+            container_labels = {}
+        
+        # Skip if it's a pause container
+        is_pause = (
+            "pause" in container_name or
+            "pause" in container_image or
+            container_labels.get("role") == "pause" or
+            (pause_cid and container_cid == pause_cid)
+        )
+        
+        if not is_pause:
+            filtered.append(container)
+    
+    return filtered
+
+
 @app.post("/containerd/list_namespaces_and_pods/", tags=["Containerd - Pods"])
 async def list_namespaces_and_pods_api(
     request: ContainerdHostRequest,
@@ -796,6 +840,9 @@ async def list_namespaces_and_pods_api(
 
         # Extract ports from containers
         containers = p.get("containers") or []
+        pause_container = p.get("pause_container")
+        # Filter out pause containers
+        containers = _filter_pause_containers(containers, pause_container)
         ports = []
         for container in containers:
             if isinstance(container, dict):
@@ -1240,6 +1287,9 @@ async def list_pods_by_filter_api(
             
             # Extract ports (same logic as list_namespaces_and_pods_api)
             containers = p.get("containers") or []
+            pause_container = p.get("pause_container")
+            # Filter out pause containers
+            containers = _filter_pause_containers(containers, pause_container)
             ports = []
             for container in containers:
                 if isinstance(container, dict):
