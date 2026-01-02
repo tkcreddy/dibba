@@ -64,6 +64,23 @@ def _rehydrate_containers(containers_json):
             raise TypeError(f"containers[{idx}] must be dict, got {type(item)}")
 
         d = dict(item)
+        
+        # Ensure required fields are present
+        if "name" not in d or not d.get("name"):
+            # Try to extract name from image if not provided
+            image = d.get("image", "")
+            if image:
+                # Extract name from image (e.g., "nginx:latest" -> "nginx")
+                image_name = image.split("/")[-1].split(":")[0]
+                d["name"] = image_name
+            else:
+                # Fallback to a default name
+                d["name"] = f"container-{idx}"
+            logger.warning(f"Container at index {idx} missing 'name' field, using '{d['name']}'")
+        
+        if "image" not in d or not d.get("image"):
+            raise ValueError(f"Container {d.get('name', idx)} is missing required 'image' field")
+        
         if "resources" in d and isinstance(d["resources"], dict):
             resources = d["resources"]
             
@@ -327,6 +344,16 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, labels: Opt
             cni_network=cni_net,
             cni_ifname=cni_dev,
         )
+
+        # Check if pod creation failed
+        if not pod.get("ok", True):
+            error_msg = pod.get("error", "Pod creation failed")
+            logger.error(f"Pod creation failed: {error_msg}")
+            return {
+                "error": error_msg,
+                "namespace": ns,
+                "socket": sock,
+            }
 
         # -------------------------------------------------
         # 4) Extract pod IPv4 (from CNI result or via netns)

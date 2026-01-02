@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError as PydanticValidatio
 from server.api_models import CreatePodsRequest, ScheduleDeploymentRequest, CreatePVCRequest, CreatePVRequest
 from server.sched.scheduler import schedule_deployment_from_yaml
 from utils.redis.host_pod_store import HostPodStore  # adjust path to where you saved that class
-from utils.celery.tasks.aws_tasks import create_worker_nodes, terminate_worker_node
+from utils.celery.tasks.aws_tasks import create_worker_nodes, terminate_worker_node, get_ec2_instances
 
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.redis.redis_interface import RedisInterface
@@ -523,6 +523,57 @@ async def terminate_namespace(
         error_code="TERMINATE_INSTANCES_TASK_ERROR",
         additional_data={"instances_count": len(instances_to_terminate)},
         )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+@log_to_file(logger)
+@handle_async_errors("list_ec2_instances", "TASK_SUBMISSION_ERROR")
+@app.get("/aws/instances/", tags=["AWS Management"])
+async def list_ec2_instances(user: str = Depends(get_current_user)):
+    """List all EC2 instances."""
+    result = submit_celery_task(
+        task=get_ec2_instances,
+        args=(
+            None,  # aws_access_key - deprecated, read from config
+            None,  # aws_secret_key - deprecated, read from config
+            aws_config.get("region"),  # Optional region override
+        ),
+        kwargs={},
+        queue_info=aws_queue_info,
+        operation_name="list_ec2_instances",
+        error_code="LIST_EC2_INSTANCES_ERROR",
+    )
+    return _envelope_success("Task submitted successfully", result.get("data", result))
+
+
+@log_to_file(logger)
+@handle_async_errors("terminate_instance_ids", "TASK_SUBMISSION_ERROR")
+@app.post("/aws/terminate-instances/", tags=["AWS Management"])
+async def terminate_instance_ids(
+    request: Dict[str, Any],
+    user: str = Depends(get_current_user)
+):
+    """Terminate specific EC2 instance IDs."""
+    instance_ids = request.get("instance_ids", [])
+    if not instance_ids or not isinstance(instance_ids, list):
+        raise NotFoundError(
+            message="instance_ids must be a non-empty list",
+            error_code="INVALID_INSTANCE_IDS",
+        )
+
+    result = submit_celery_task(
+        task=terminate_worker_node,
+        args=(
+            None,  # aws_access_key - deprecated, read from config
+            None,  # aws_secret_key - deprecated, read from config
+            aws_config.get("region"),  # Optional region override
+            instance_ids,
+        ),
+        queue_info=aws_queue_info,
+        operation_name="terminate_instance_ids",
+        error_code="TERMINATE_INSTANCES_TASK_ERROR",
+        additional_data={"instances_count": len(instance_ids)},
+    )
     return _envelope_success("Task submitted successfully", result.get("data", result))
 
 

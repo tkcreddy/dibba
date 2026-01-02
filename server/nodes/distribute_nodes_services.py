@@ -185,28 +185,66 @@ def get_worker_nodes_from_redis(
                 if isinstance(virtual_memory, dict):
                     memory_usage_percent = virtual_memory.get("percent", 0.0)
             
-            # Calculate available resources
-            available_cpu_cores = total_cpu_cores * (1 - avg_cpu_usage / 100.0) if total_cpu_cores > 0 else 0.0
-            available_memory_mb = total_memory_mb * (1 - memory_usage_percent / 100.0) if total_memory_mb > 0 else 0.0
-            
             # Get pods on this host to calculate reserved resources (using LIMITS as maximum)
-            pods = store.get_pods_by_host(host.get("hostname", ""))
+            # This gets ALL pods across ALL namespaces on this host
+            hostname = host.get("hostname", "")
+            pods = store.get_pods_by_host(hostname)
             reserved_cpu_cores = 0.0
             reserved_memory_mb = 0.0
             
+            logger.debug(f"Calculating reserved resources for host {hostname}: found {len(pods)} pods across all namespaces")
+            
+            # Track namespaces and pod counts for logging
+            namespace_counts = {}
+            total_containers_processed = 0
+            
             for pod in pods:
+                if not isinstance(pod, dict):
+                    continue
+                
+                pod_namespace = pod.get("namespace", "unknown")
+                namespace_counts[pod_namespace] = namespace_counts.get(pod_namespace, 0) + 1
+                pod_id = pod.get("pod_id", "unknown")
+                
+                # Skip pause containers - they use minimal resources and shouldn't count toward reservations
+                # Pause containers are identified by having "pause" in their name or being the pause container
+                pause_container = pod.get("pause_container", {})
+                if isinstance(pause_container, dict) and pause_container.get("cid"):
+                    # Pause container exists but uses minimal resources (100m CPU, 64Mi memory typically)
+                    # We'll account for it separately if needed, but for now focus on app containers
+                    pass
+                
                 # Check pod-level resources first
                 pod_resources = pod.get("resources", {})
                 
-                # Also check containers for their resource limits
+                # Get containers - these are the application containers (excluding pause)
                 containers = pod.get("containers", [])
                 if not isinstance(containers, list):
                     containers = []
                 
-                # Process each container's resources
+                # Filter out pause containers from the containers list
+                # Pause containers are typically named "pause" or have "pause" in the image name
+                app_containers = []
                 for container in containers:
                     if not isinstance(container, dict):
                         continue
+                    container_name = str(container.get("name", "")).lower()
+                    container_image = str(container.get("image", "")).lower()
+                    # Skip pause containers
+                    if "pause" in container_name or "pause" in container_image:
+                        logger.debug(f"Skipping pause container {container.get('name')} in pod {pod_id}")
+                        continue
+                    app_containers.append(container)
+                
+                containers = app_containers
+                total_containers_processed += len(containers)
+                
+                # Process each application container's resources
+                for container in containers:
+                    if not isinstance(container, dict):
+                        continue
+                    
+                    container_name = container.get("name", "unknown")
                     
                     # Get container resources (may be in different formats)
                     container_resources = container.get("resources", {})
@@ -214,7 +252,40 @@ def get_worker_nodes_from_redis(
                         # Try to get from pod-level resources if container doesn't have it
                         container_resources = pod_resources
                     
+                    # If still no resources, try to look up from deployment store
                     if not container_resources:
+                        try:
+                            # Try to get resources from deployment store by matching app_label and namespace
+                            pod_namespace = pod.get("namespace")
+                            pod_labels = pod.get("labels", {})
+                            pod_app_label = pod_labels.get("app_label") or pod_labels.get("app")
+                            
+                            if pod_namespace and pod_app_label:
+                                from utils.redis.deployment_store import DeploymentStore
+                                from utils.redis.redis_interface import RedisInterface
+                                dep_store = DeploymentStore(RedisInterface())
+                                deployments = dep_store.get_deployments_by_namespace(pod_namespace)
+                                
+                                # Find matching deployment
+                                for dep in deployments:
+                                    if dep.get("app_label") == pod_app_label:
+                                        dep_spec = dep.get("deployment_spec", {})
+                                        dep_containers = dep_spec.get("containers", [])
+                                        # Match container by name or image
+                                        for dep_container in dep_containers:
+                                            if (dep_container.get("name") == container_name or 
+                                                dep_container.get("image") == container.get("image")):
+                                                container_resources = dep_container.get("resources", {})
+                                                if container_resources:
+                                                    logger.debug(f"Found resources for pod {pod_id} container {container_name} from deployment store")
+                                                    break
+                                        if container_resources:
+                                            break
+                        except Exception as e:
+                            logger.debug(f"Failed to look up resources from deployment store for pod {pod_id}: {e}")
+                    
+                    if not container_resources:
+                        logger.debug(f"Container {container_name} in pod {pod_id} has no resources (checked pod data and deployment store)")
                         continue
                     
                     # Extract LIMITS only (limits are the maximum resource allocation)
@@ -222,58 +293,130 @@ def get_worker_nodes_from_redis(
                     memory_str = None
                     
                     if isinstance(container_resources, dict):
+                        # Try Kubernetes-style limits first
                         if "limits" in container_resources:
                             limits = container_resources.get("limits", {})
                             if isinstance(limits, dict):
                                 cpu_str = limits.get("cpu")
                                 memory_str = limits.get("memory")
+                        
+                        # Fallback to direct format (cpu_millicores, memory)
+                        if not cpu_str and "cpu_millicores" in container_resources:
+                            cpu_millicores = container_resources.get("cpu_millicores", 0)
+                            if cpu_millicores:
+                                cpu_str = f"{cpu_millicores}m"  # Convert to string format for parsing
+                        
+                        if not memory_str and "memory" in container_resources:
+                            memory_val = container_resources.get("memory", "")
+                            if memory_val and isinstance(memory_val, str):
+                                memory_str = memory_val
+                            elif memory_val:
+                                # If it's a number, assume MB
+                                memory_str = f"{memory_val}Mi"
                     
                     # Parse CPU (convert to cores)
                     if cpu_str:
                         cpu_cores = _parse_cpu_to_cores(cpu_str)
                         reserved_cpu_cores += cpu_cores
+                        logger.debug(f"Pod {pod_id} container {container_name}: reserved {cpu_cores} CPU cores (from {cpu_str})")
                     
                     # Parse Memory (convert to MB)
                     if memory_str:
                         memory_mb = _parse_memory_to_mb(memory_str)
                         reserved_memory_mb += memory_mb
+                        logger.debug(f"Pod {pod_id} container {container_name}: reserved {memory_mb} MB memory (from {memory_str})")
                 
                 # If no containers found, try pod-level resources (LIMITS only)
-                if not containers and pod_resources:
-                    if isinstance(pod_resources, dict):
-                        cpu_str = None
-                        memory_str = None
-                        
-                        # Only use limits (maximum resource allocation)
-                        if "limits" in pod_resources:
-                            limits = pod_resources.get("limits", {})
-                            if isinstance(limits, dict):
-                                cpu_str = limits.get("cpu")
-                                memory_str = limits.get("memory")
-                        
-                        if cpu_str:
-                            cpu_cores = _parse_cpu_to_cores(cpu_str)
-                            reserved_cpu_cores += cpu_cores
-                        
-                        if memory_str:
-                            memory_mb = _parse_memory_to_mb(memory_str)
-                            reserved_memory_mb += memory_mb
-                    else:
-                        # Legacy format: assume direct values are limits
-                        pod_cpu = pod_resources.get("cpu_millicores", 0)
-                        if pod_cpu:
-                            reserved_cpu_cores += pod_cpu / 1000.0  # Convert millicores to cores
-                        
-                        pod_memory = pod_resources.get("memory", "")
-                        if pod_memory:
-                            memory_mb = _parse_memory_to_mb(pod_memory)
-                            reserved_memory_mb += memory_mb
+                if not containers:
+                    # If pod_resources is empty, try to get from deployment store
+                    if not pod_resources:
+                        try:
+                            pod_namespace = pod.get("namespace")
+                            pod_labels = pod.get("labels", {})
+                            pod_app_label = pod_labels.get("app_label") or pod_labels.get("app")
+                            
+                            if pod_namespace and pod_app_label:
+                                from utils.redis.deployment_store import DeploymentStore
+                                from utils.redis.redis_interface import RedisInterface
+                                dep_store = DeploymentStore(RedisInterface())
+                                deployments = dep_store.get_deployments_by_namespace(pod_namespace)
+                                
+                                # Find matching deployment and get resource_requirements
+                                for dep in deployments:
+                                    if dep.get("app_label") == pod_app_label:
+                                        dep_spec = dep.get("deployment_spec", {})
+                                        resource_reqs = dep_spec.get("resource_requirements", {})
+                                        if resource_reqs:
+                                            # Create a pod_resources dict from resource_requirements
+                                            pod_resources = {
+                                                "cpu_millicores": resource_reqs.get("cpu_millicores", 0),
+                                                "memory": f"{resource_reqs.get('memory_mb', 0)}Mi"
+                                            }
+                                            logger.debug(f"Found pod-level resources for pod {pod_id} from deployment store")
+                                            break
+                        except Exception as e:
+                            logger.debug(f"Failed to look up pod-level resources from deployment store for pod {pod_id}: {e}")
+                    
+                    if pod_resources:
+                        if isinstance(pod_resources, dict):
+                            cpu_str = None
+                            memory_str = None
+                            
+                            # Only use limits (maximum resource allocation)
+                            if "limits" in pod_resources:
+                                limits = pod_resources.get("limits", {})
+                                if isinstance(limits, dict):
+                                    cpu_str = limits.get("cpu")
+                                    memory_str = limits.get("memory")
+                            
+                            # Fallback to direct format
+                            if not cpu_str and "cpu_millicores" in pod_resources:
+                                cpu_millicores = pod_resources.get("cpu_millicores", 0)
+                                if cpu_millicores:
+                                    cpu_str = f"{cpu_millicores}m"
+                            
+                            if not memory_str and "memory" in pod_resources:
+                                memory_val = pod_resources.get("memory", "")
+                                if memory_val and isinstance(memory_val, str):
+                                    memory_str = memory_val
+                                elif memory_val:
+                                    memory_str = f"{memory_val}Mi"
+                            
+                            if cpu_str:
+                                cpu_cores = _parse_cpu_to_cores(cpu_str)
+                                reserved_cpu_cores += cpu_cores
+                                logger.debug(f"Pod {pod_id} (pod-level): reserved {cpu_cores} CPU cores (from {cpu_str})")
+                            
+                            if memory_str:
+                                memory_mb = _parse_memory_to_mb(memory_str)
+                                reserved_memory_mb += memory_mb
+                                logger.debug(f"Pod {pod_id} (pod-level): reserved {memory_mb} MB memory (from {memory_str})")
+                        else:
+                            # Legacy format: assume direct values are limits
+                            pod_cpu = pod_resources.get("cpu_millicores", 0)
+                            if pod_cpu:
+                                reserved_cpu_cores += pod_cpu / 1000.0  # Convert millicores to cores
+                                logger.debug(f"Pod {pod_id} (legacy format): reserved {pod_cpu / 1000.0} CPU cores")
+                            
+                            pod_memory = pod_resources.get("memory", "")
+                            if pod_memory:
+                                memory_mb = _parse_memory_to_mb(pod_memory)
+                                reserved_memory_mb += memory_mb
+                                logger.debug(f"Pod {pod_id} (legacy format): reserved {memory_mb} MB memory")
             
-            # Final available = total available - reserved (using LIMITS as maximum)
-            # Limits represent the maximum resources a pod can use, so we subtract
-            # all pod limits to get truly available resources for new deployments
-            final_available_cpu = max(0, available_cpu_cores - reserved_cpu_cores)
-            final_available_memory = max(0, available_memory_mb - reserved_memory_mb)
+            logger.info(f"Host {hostname}: Reserved resources calculated from {len(pods)} pods across {len(namespace_counts)} namespaces ({namespace_counts}), {total_containers_processed} app containers. Reserved: {reserved_cpu_cores:.2f} CPU cores, {reserved_memory_mb:.2f} MB memory")
+            
+            # Calculate available resources
+            # Available = Total - Reserved (using LIMITS as maximum)
+            # We use total CPU/memory directly, not adjusted by usage percentage,
+            # because reserved resources already account for what's allocated
+            # The usage percentage reflects current utilization, but for scheduling
+            # we care about what's actually reserved/allocated, not current usage
+            final_available_cpu = max(0, total_cpu_cores - reserved_cpu_cores)
+            final_available_memory = max(0, total_memory_mb - reserved_memory_mb)
+            
+            logger.debug(f"Host {hostname}: Total CPU={total_cpu_cores}, Reserved CPU={reserved_cpu_cores}, Available CPU={final_available_cpu}")
+            logger.debug(f"Host {hostname}: Total Memory={total_memory_mb} MB, Reserved Memory={reserved_memory_mb} MB, Available Memory={final_available_memory} MB")
             
             worker_nodes.append({
                 "cpu": final_available_cpu,
@@ -415,13 +558,18 @@ class ClusterWorkerDistribution:
                         node['memory'] >= current_memory_usage + requirements['memory']):
                     resource_usage = current_cpu_usage + requirements['cpu'] + current_memory_usage + requirements['memory']
                     instance_count_on_node = service_node_counts[service_name][i]
+                    # Calculate available resources (for redundancy prioritization)
+                    available_cpu = node['cpu'] - current_cpu_usage
+                    available_memory = node['memory'] - current_memory_usage
                     candidate_nodes.append({
                         'node_index': i,
                         'resource_usage': resource_usage,
                         'instance_count': instance_count_on_node,
+                        'available_cpu': available_cpu,
+                        'available_memory': available_memory,
                         'node': node
                     })
-                    logger.info(f"  Node {i}: Can fit! Resource usage would be: {resource_usage}, current instances of {service_name}: {instance_count_on_node}")
+                    logger.info(f"  Node {i}: Can fit! Resource usage would be: {resource_usage}, current instances of {service_name}: {instance_count_on_node}, available CPU: {available_cpu}, available Memory: {available_memory}")
                 else:
                     logger.info(f"  Node {i}: Cannot fit (CPU: {current_cpu_usage + requirements['cpu']} > {node['cpu']} or Memory: {current_memory_usage + requirements['memory']} > {node['memory']})")
 
@@ -430,16 +578,34 @@ class ClusterWorkerDistribution:
                     f"Could not place instance {instance_num} of microservice {service_name}. Insufficient resources on all nodes. As requested CPUs are {total_cpus_need} available cpus are {total_worker_cpu} and Memory need is {total_memory_need} and available is {total_worker_memory}")
                 return None
 
-            # Load balancing: Prefer nodes with fewer instances of this service
-            # Sort candidates by: 1) instance count (ascending), 2) resource usage (ascending)
-            candidate_nodes.sort(key=lambda x: (x['instance_count'], x['resource_usage']))
+            # Enhanced load balancing for redundancy:
+            # 1. PRIORITY: Prefer nodes with 0 instances of this service (for redundancy)
+            # 2. Among nodes with 0 instances, prefer nodes with more available resources (to balance load)
+            # 3. If all nodes have instances, prefer the one with fewer instances
+            # 4. If tied on instance count, prefer lower resource usage
             
-            # Select the node with the fewest instances of this service
-            # If multiple nodes have the same count, choose the one with lowest resource usage
-            best_node = candidate_nodes[0]['node_index']
-            min_resource_usage = candidate_nodes[0]['resource_usage']
+            # Separate candidates into two groups: nodes with 0 instances vs nodes with instances
+            nodes_with_zero_instances = [c for c in candidate_nodes if c['instance_count'] == 0]
+            nodes_with_instances = [c for c in candidate_nodes if c['instance_count'] > 0]
             
-            logger.info(f"  Selected node {best_node} (instances of {service_name}: {candidate_nodes[0]['instance_count']}, resource usage: {min_resource_usage})")
+            if nodes_with_zero_instances:
+                # Prioritize nodes with 0 instances for redundancy
+                # Among these, prefer nodes with more available resources (to balance load)
+                # Sort by total available capacity in descending order (more available = better)
+                nodes_with_zero_instances.sort(
+                    key=lambda x: x['available_cpu'] + x['available_memory'],
+                    reverse=True  # Descending order: more available resources first
+                )
+                best_candidate = nodes_with_zero_instances[0]
+                logger.info(f"  Selected node {best_candidate['node_index']} (0 instances of {service_name}, available CPU: {best_candidate['available_cpu']}, available Memory: {best_candidate['available_memory']}) for redundancy")
+            else:
+                # All nodes already have instances, use original logic: prefer fewer instances, then lower resource usage
+                candidate_nodes.sort(key=lambda x: (x['instance_count'], x['resource_usage']))
+                best_candidate = candidate_nodes[0]
+                logger.info(f"  Selected node {best_candidate['node_index']} (instances of {service_name}: {best_candidate['instance_count']}, resource usage: {best_candidate['resource_usage']})")
+            
+            best_node = best_candidate['node_index']
+            min_resource_usage = best_candidate['resource_usage']
 
             # Place the instance
             distribution[best_node].append((service_name, instance_num))

@@ -14,9 +14,12 @@ from utils.redis.host_pod_store import HostPodStore, HostStatus
 from utils.redis.deployment_store import DeploymentStore
 from server.nodes.distribute_nodes_services import ClusterWorkerDistribution, get_worker_nodes_from_redis
 from utils.celery.tasks.containerd_tasks import create_pod_task, terminate_pod_task
-from utils.celery.queue_utils import create_host_queue_info, submit_celery_task
+from utils.celery.queue_utils import create_host_queue_info, create_queue_info, submit_celery_task
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.ReadConfig import ReadConfig as rc
+from celery.result import AsyncResult
+from time import sleep
+from utils.exceptions import AWSError
 
 logger = LogKCld()
 
@@ -400,8 +403,48 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
             logger.info(f"Scaling down: {running_pods_count} running pods, max_replicas={max_replicas}, need to terminate {excess_replicas} pods")
             logger.info(f"Current running pod IDs: {[p.get('pod_id') for p in running_pods]}")
             
-            # Terminate excess pods (terminate oldest first)
-            pods_to_terminate = sorted(running_pods, key=lambda p: p.get("creation_time", ""))[:excess_replicas]
+            # Terminate excess pods while preserving redundancy across nodes
+            # Strategy: Group pods by hostname, then terminate to maintain distribution
+            pods_by_host = {}
+            for pod in running_pods:
+                hostname = pod.get("hostname")
+                if hostname:
+                    if hostname not in pods_by_host:
+                        pods_by_host[hostname] = []
+                    pods_by_host[hostname].append(pod)
+            
+            # Sort pods within each host by creation_time (oldest first)
+            for hostname in pods_by_host:
+                pods_by_host[hostname].sort(key=lambda p: p.get("creation_time", ""))
+            
+            # Select pods to terminate: prioritize removing from nodes with more pods
+            # This helps maintain distribution across nodes
+            pods_to_terminate = []
+            remaining_to_terminate = excess_replicas
+            
+            # First pass: Try to balance by removing from nodes with most pods
+            while remaining_to_terminate > 0 and pods_by_host:
+                # Find node with most pods
+                max_host = max(pods_by_host.keys(), key=lambda h: len(pods_by_host[h]))
+                if pods_by_host[max_host]:
+                    pod = pods_by_host[max_host].pop(0)  # Remove oldest from this node
+                    pods_to_terminate.append(pod)
+                    remaining_to_terminate -= 1
+                    # Remove host from dict if no more pods
+                    if not pods_by_host[max_host]:
+                        del pods_by_host[max_host]
+                else:
+                    break
+            
+            # If still need to terminate more, continue with remaining pods
+            if remaining_to_terminate > 0:
+                remaining_pods = []
+                for host_pods in pods_by_host.values():
+                    remaining_pods.extend(host_pods)
+                remaining_pods.sort(key=lambda p: p.get("creation_time", ""))
+                pods_to_terminate.extend(remaining_pods[:remaining_to_terminate])
+            
+            logger.info(f"Selected {len(pods_to_terminate)} pods to terminate for redundancy: {[(p.get('pod_id'), p.get('hostname')) for p in pods_to_terminate]}")
             
             utilities = UtilitiesExtension()
             for pod in pods_to_terminate:
@@ -506,34 +549,175 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
             distribution = ClusterWorkerDistribution(worker_nodes, cluster_info)
             placement_by_index = distribution.distribute_cluster_nodes()
             
+            # If placement fails, try to create AWS nodes
             if not placement_by_index:
-                logger.error(f"Could not find placement for {missing_replicas} missing replicas")
-                return {
-                    "status": "error",
-                    "error": "Could not find placement for missing replicas",
-                    "pods_created": 0,
-                    "pods_terminated": 0,
-                }
+                logger.warning(f"Could not find placement for {missing_replicas} missing replicas on existing nodes. Attempting to create AWS nodes...")
+                
+                # Calculate required AWS nodes
+                required_nodes = max(1, (missing_replicas + 1) // 2)
+                logger.info(f"Creating {required_nodes} AWS node(s) to accommodate {missing_replicas} missing replicas")
+                
+                # Get AWS config
+                from utils.celery.tasks.aws_tasks import create_worker_nodes
+                
+                read_config = rc()
+                aws_config = read_config.aws_config
+                
+                if not aws_config:
+                    logger.error("AWS configuration not found. Cannot create nodes.")
+                    return {
+                        "status": "error",
+                        "error": "AWS configuration not found. Cannot create nodes for scaling.",
+                        "pods_created": 0,
+                        "pods_terminated": 0,
+                    }
+                
+                # Create AWS queue info with proper encoding
+                key = read_config.encryption_config['key']
+                encode_util = UtilitiesExtension(key)
+                aws_queue_info = create_queue_info("aws_interface", utilities_extension=encode_util)
+                logger.info(f"Routing AWS node creation to queue: {aws_queue_info.get('queue')}")
+                
+                # Submit AWS node creation task (matching scheduler_tasks.py pattern)
+                aws_result = submit_celery_task(
+                    task=create_worker_nodes,
+                    args=(
+                        None,  # aws_access_key - deprecated, read from config
+                        None,  # aws_secret_key - deprecated, read from config
+                        aws_config.get("region"),  # Optional region override
+                    ),
+                    kwargs={
+                        'instance_type': aws_config.get('instance_type', 't3.medium'),
+                        'ami_id': aws_config.get('ami_id'),
+                        'key_name': aws_config.get('key_name'),
+                        'security_group_ids': aws_config.get('security_group_ids', []),
+                        'subnet_id': aws_config.get('subnet_id'),
+                        'namespace': namespace,
+                        'MaxCount': required_nodes,
+                    },
+                    queue_info=aws_queue_info,
+                    operation_name="create_aws_nodes_for_scaling",
+                    error_code="AWS_NODE_CREATION_ERROR",
+                )
+                
+                aws_task_id = aws_result.get("data", {}).get("task_id")
+                if not aws_task_id:
+                    logger.error("AWS node creation task failed to submit")
+                    return {
+                        "status": "error",
+                        "error": "Failed to submit AWS node creation task",
+                        "pods_created": 0,
+                        "pods_terminated": 0,
+                    }
+                
+                logger.info(f"Waiting for AWS node creation task {aws_task_id} to complete...")
+                aws_task = AsyncResult(aws_task_id, app=celery_app)
+                
+                # Wait for AWS task to complete (max 300 seconds)
+                max_wait_time = 300
+                wait_interval = 5
+                elapsed_time = 0
+                aws_status = "pending"
+                
+                while elapsed_time < max_wait_time:
+                    if aws_task.ready():
+                        if aws_task.successful():
+                            aws_status = "success"
+                            logger.info(f"AWS node creation task {aws_task_id} completed successfully")
+                            break
+                        else:
+                            aws_status = "error"
+                            error_msg = str(aws_task.result) if aws_task.result else "Unknown error"
+                            logger.error(f"AWS node creation task {aws_task_id} failed: {error_msg}")
+                            raise AWSError(
+                                message=f"AWS node creation failed: {error_msg}",
+                                error_code="AWS_NODE_CREATION_FAILED",
+                                details={"task_id": aws_task_id, "required_nodes": required_nodes}
+                            )
+                    sleep(wait_interval)
+                    elapsed_time += wait_interval
+                    logger.debug(f"Waiting for AWS nodes... ({elapsed_time}/{max_wait_time}s)")
+                
+                if aws_status != "success":
+                    aws_status = "timeout"
+                    logger.error(f"AWS node creation task {aws_task_id} timed out after {max_wait_time} seconds")
+                    raise AWSError(
+                        message=f"AWS node creation timed out after {max_wait_time} seconds",
+                        error_code="AWS_NODE_CREATION_TIMEOUT",
+                        details={"task_id": aws_task_id, "required_nodes": required_nodes}
+                    )
+                
+                # Wait for nodes to register in Redis (10 seconds)
+                logger.info("Waiting 240 seconds for new AWS nodes to register in Redis...")
+                sleep(240)
+                
+                # Retry getting worker nodes (should now include new nodes)
+                logger.info("Retrying placement with updated worker nodes (including new AWS nodes)...")
+                worker_nodes_raw = get_worker_nodes_from_redis(redis_interface)
+                if not worker_nodes_raw:
+                    logger.error("Still no worker nodes available after AWS node creation")
+                    return {
+                        "status": "error",
+                        "error": "No worker nodes available after AWS node creation",
+                        "pods_created": 0,
+                        "pods_terminated": 0,
+                    }
+                
+                # Convert to millicores format again
+                worker_nodes = [
+                    {
+                        'cpu': int(node.get('cpu', 0) * 1000),  # Convert cores to millicores
+                        'memory': node.get('memory', 0),  # Already in MB
+                        'hostname': node.get('hostname'),
+                        'ip_address': node.get('ip_address'),
+                    }
+                    for node in worker_nodes_raw
+                ]
+                
+                # Retry distribution with updated nodes
+                logger.info(f"Retrying distribution with {len(worker_nodes)} worker nodes (including new AWS nodes)")
+                distribution = ClusterWorkerDistribution(worker_nodes, cluster_info)
+                placement_by_index = distribution.distribute_cluster_nodes()
+                
+                if not placement_by_index:
+                    logger.error(f"Still could not find placement for {missing_replicas} missing replicas even after creating AWS nodes")
+                    return {
+                        "status": "error",
+                        "error": "Could not find placement for missing replicas even after creating AWS nodes",
+                        "pods_created": 0,
+                        "pods_terminated": 0,
+                    }
+                
+                logger.info(f"Successfully found placement after creating AWS nodes: {placement_by_index}")
             
             # Convert placement from indices to hostnames and offset instance numbers
             # The distribution algorithm creates instances 0..(missing_replicas-1)
             # We need to offset by running_pods_count to avoid conflicts
             placement = {}
             total_placement_count = 0
+            
+            # Log the order of worker nodes for debugging
+            logger.info(f"Worker nodes order: {[node.get('hostname') for node in worker_nodes_raw]}")
+            logger.info(f"Distribution result (by index): {placement_by_index}")
+            
             for node_idx, pod_info_list in placement_by_index.items():
                 if node_idx >= len(worker_nodes_raw):
+                    logger.warning(f"Node index {node_idx} is out of range (max: {len(worker_nodes_raw) - 1})")
                     continue
                 node = worker_nodes_raw[node_idx]
                 hostname = node.get("hostname")
-                if hostname:
-                    # Offset instance numbers by running_pods_count
-                    offset_pod_list = []
-                    for app_name, instance_num in pod_info_list:
-                        offset_instance_num = running_pods_count + instance_num
-                        offset_pod_list.append((app_name, offset_instance_num))
-                        total_placement_count += 1
-                    placement[hostname] = offset_pod_list
-                    logger.info(f"Placement for {hostname}: {len(offset_pod_list)} pods with instance numbers {[inst for _, inst in offset_pod_list]}")
+                if not hostname:
+                    logger.warning(f"Node at index {node_idx} has no hostname, skipping")
+                    continue
+                
+                # Offset instance numbers by running_pods_count
+                offset_pod_list = []
+                for app_name, instance_num in pod_info_list:
+                    offset_instance_num = running_pods_count + instance_num
+                    offset_pod_list.append((app_name, offset_instance_num))
+                    total_placement_count += 1
+                placement[hostname] = offset_pod_list
+                logger.info(f"Placement for {hostname} (node index {node_idx}): {len(offset_pod_list)} pods with instance numbers {[inst for _, inst in offset_pod_list]}")
             
             logger.info(f"Total placement count: {total_placement_count} pods (expected: {missing_replicas})")
             if total_placement_count != missing_replicas:
@@ -541,7 +725,9 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
             
             # Create pods
             utilities = UtilitiesExtension()
+            pods_created_tasks = []  # Track all task IDs for verification
             for hostname, pod_info_list in placement.items():
+                logger.info(f"Creating {len(pod_info_list)} pods on {hostname}")
                 for app_name, instance_num in pod_info_list:
                     try:
                         host_queue_info = create_host_queue_info(hostname, utilities)
@@ -553,6 +739,7 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                             "instance": str(instance_num),
                         }
                         
+                        logger.info(f"Submitting create_pod_task for {app_label} instance {instance_num} on {hostname}")
                         result = submit_celery_task(
                             task=create_pod_task,
                             args=(containers, namespace),
@@ -568,13 +755,17 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                             }
                         )
                         
-                        if result.get("data", {}).get("task_id"):
+                        task_id = result.get("data", {}).get("task_id")
+                        if task_id:
                             pods_created += 1
-                            logger.info(f"Created pod for {app_label} instance {instance_num} on {hostname} (task_id: {result.get('data', {}).get('task_id')})")
+                            pods_created_tasks.append({"hostname": hostname, "instance": instance_num, "task_id": task_id})
+                            logger.info(f"Successfully submitted pod creation for {app_label} instance {instance_num} on {hostname} (task_id: {task_id})")
                         else:
-                            logger.warning(f"Failed to create pod for {app_label} instance {instance_num}: no task_id returned")
+                            logger.error(f"Failed to create pod for {app_label} instance {instance_num} on {hostname}: no task_id returned. Result: {result}")
                     except Exception as e:
-                        logger.error(f"Failed to create pod for {app_label} instance {instance_num}: {e}")
+                        logger.error(f"Exception creating pod for {app_label} instance {instance_num} on {hostname}: {e}", exc_info=True)
+            
+            logger.info(f"Submitted {pods_created} pod creation tasks. Task details: {pods_created_tasks}")
             
             logger.info(f"Scaling up complete: created {pods_created} pods (expected {missing_replicas})")
             if pods_created != missing_replicas:
