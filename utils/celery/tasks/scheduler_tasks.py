@@ -453,6 +453,7 @@ def evaluate_deployment_requirements_task(yaml_content: str) -> Dict[str, Any]:
                 'max_replicas': getattr(deployment, 'max_replicas', deployment.replicas),
                 'containers': deployment.containers,
                 'volumes': getattr(deployment, 'volumes', None),
+                'health_checks': getattr(deployment, 'health_checks', None),  # Include health checks
                 'resource_requirements': {
                     'cpu_millicores': deployment.resource_requirements.cpu_millicores,
                     'memory_mb': deployment.resource_requirements.memory_mb,

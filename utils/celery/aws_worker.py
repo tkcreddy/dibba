@@ -16,9 +16,11 @@ celery_app.conf.task_queues = [
     Queue(aws_interface_queue_name, exchange=secure_exchange, routing_key=aws_interface_queue_name),
     Queue(scheduler_queue_name, exchange=secure_exchange, routing_key=scheduler_queue_name),
 ]
-
 celery_app.autodiscover_tasks(['utils.celery.tasks.aws_tasks'])
+
 celery_app.conf.include = [
     "utils.celery.tasks.scheduler_tasks",
-    "utils.celery.tasks.deployment_recovery_tasks"
+    "utils.celery.tasks.deployment_recovery_tasks",
+    "utils.celery.tasks.health_check_tasks",  # Include health check tasks
 ]
+

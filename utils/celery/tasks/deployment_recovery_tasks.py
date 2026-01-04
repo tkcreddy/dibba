@@ -307,8 +307,60 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
         running_pods = [p for p in namespace_pods if p.get("status", "").upper() == "RUNNING"]
         running_pods_count = len(running_pods)
         
-        logger.info(f"Deployment {namespace}/{deployment_name}: {running_pods_count} running pods, min={min_replicas}, max={max_replicas}")
-        logger.info(f"Found {len(pods)} total pods for app_label {app_label}, {len(namespace_pods)} in namespace {namespace}, {running_pods_count} running")
+        # Additional validation: Check if pods actually exist and were updated recently
+        # This helps filter out stale Redis entries
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        cutoff_time = now - timedelta(seconds=60)  # Pods must be updated in last 60 seconds
+        
+        validated_pods = []
+        for pod in running_pods:
+            # Check 1: Pod must have containers or valid pause container
+            containers = pod.get("containers", [])
+            pause_container = pod.get("pause_container", {})
+            has_containers = containers or (pause_container and pause_container.get("pid"))
+            
+            if not has_containers:
+                logger.warning(f"Pod {pod.get('pod_id')} marked as RUNNING but has no containers - likely stale entry")
+                continue
+            
+            # Check 2: Pod must have been updated in the last 60 seconds
+            last_updated_str = pod.get("last_updated")
+            if last_updated_str:
+                try:
+                    # Parse ISO format timestamp
+                    if isinstance(last_updated_str, str):
+                        # Handle both with and without timezone info
+                        if last_updated_str.endswith('Z'):
+                            last_updated_str = last_updated_str[:-1] + '+00:00'
+                        last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
+                        # Ensure timezone-aware
+                        if last_updated.tzinfo is None:
+                            last_updated = last_updated.replace(tzinfo=timezone.utc)
+                    else:
+                        # If it's already a datetime object
+                        last_updated = last_updated_str
+                        if last_updated.tzinfo is None:
+                            last_updated = last_updated.replace(tzinfo=timezone.utc)
+                    
+                    if last_updated < cutoff_time:
+                        logger.warning(
+                            f"Pod {pod.get('pod_id')} last updated {last_updated} is older than 60 seconds "
+                            f"(cutoff: {cutoff_time}) - likely stale entry"
+                        )
+                        continue
+                except Exception as e:
+                    logger.warning(f"Failed to parse last_updated timestamp for pod {pod.get('pod_id')}: {e}")
+                    # If we can't parse the timestamp, we'll still include it but log a warning
+                    logger.warning(f"Including pod {pod.get('pod_id')} despite timestamp parse error")
+            
+            validated_pods.append(pod)
+        
+        running_pods = validated_pods
+        running_pods_count = len(running_pods)
+        
+        logger.info(f"Deployment {namespace}/{deployment_name}: {running_pods_count} validated running pods (updated in last 60s), min={min_replicas}, max={max_replicas}")
+        logger.info(f"Found {len(pods)} total pods for app_label {app_label}, {len(namespace_pods)} in namespace {namespace}, {running_pods_count} validated running")
         
         # If we found pods but none are running, log all statuses for debugging
         if len(namespace_pods) > 0 and running_pods_count == 0:
@@ -343,12 +395,43 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                         namespace_pods.append(pod)
                 
                 # More robust status check: handle case, whitespace, and type variations
+                # Also validate pods have containers and were updated recently
                 running_pods = []
                 for p in namespace_pods:
                     status = p.get("status")
                     if status:
                         status_str = str(status).strip().upper()
                         if status_str == "RUNNING":
+                            # Validate pod has containers
+                            containers = p.get("containers", [])
+                            pause_container = p.get("pause_container", {})
+                            has_containers = containers or (pause_container and pause_container.get("pid"))
+                            
+                            if not has_containers:
+                                logger.warning(f"Fallback: Pod {p.get('pod_id')} marked as RUNNING but has no containers - skipping")
+                                continue
+                            
+                            # Validate pod was updated in last 60 seconds
+                            last_updated_str = p.get("last_updated")
+                            if last_updated_str:
+                                try:
+                                    if isinstance(last_updated_str, str):
+                                        if last_updated_str.endswith('Z'):
+                                            last_updated_str = last_updated_str[:-1] + '+00:00'
+                                        last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
+                                        if last_updated.tzinfo is None:
+                                            last_updated = last_updated.replace(tzinfo=timezone.utc)
+                                    else:
+                                        last_updated = last_updated_str
+                                        if last_updated.tzinfo is None:
+                                            last_updated = last_updated.replace(tzinfo=timezone.utc)
+                                    
+                                    if last_updated < cutoff_time:
+                                        logger.warning(f"Fallback: Pod {p.get('pod_id')} last updated {last_updated} is older than 60s - skipping")
+                                        continue
+                                except Exception as e:
+                                    logger.warning(f"Fallback: Failed to parse last_updated for pod {p.get('pod_id')}: {e}")
+                            
                             running_pods.append(p)
                 running_pods_count = len(running_pods)
                 logger.info(f"Fallback search: Found {len(namespace_pods)} pods in namespace {namespace} with app_label {app_label}, {running_pods_count} running")

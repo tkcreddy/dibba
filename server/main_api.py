@@ -37,6 +37,7 @@ from utils.exceptions import (
     DibbaBaseException,
     AuthenticationError,
     NotFoundError,
+    ValidationError,
     exception_to_http_exception
 )
 from utils.error_handlers import (
@@ -79,6 +80,167 @@ if os.path.exists(ui_dist_dir):
         """Redirect to UI."""
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/dibba/")
+
+# ==================== User Management ====================
+
+@log_to_file(logger)
+@handle_async_errors("list_users", "REDIS_ERROR")
+@app.get("/users/", tags=["Users"])
+async def list_users(user: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """List all users.
+    
+    Args:
+        user: Current authenticated user
+        
+    Returns:
+        Dictionary with list of users
+    """
+    try:
+        # Get all users from Redis authentication hash
+        all_users = rd.redis_client.hgetall("authentication")
+        users_list = [{"username": username} for username in all_users.keys()]
+        
+        return _envelope_success(
+            message=f"Found {len(users_list)} user(s)",
+            data={"users": users_list}
+        )
+    except Exception as e:
+        logger.error(f"Failed to list users: {e}", exc_info=True)
+        raise
+
+
+@log_to_file(logger)
+@handle_async_errors("create_user", "REDIS_ERROR")
+@app.post("/users/", tags=["Users"])
+async def create_user(
+    username: str,
+    password: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Create a new user.
+    
+    Args:
+        username: Username for the new user
+        password: Plain text password (will be hashed)
+        user: Current authenticated user
+        
+    Returns:
+        Success message
+    """
+    try:
+        # Check if user already exists
+        if rd.get_user_pass(username):
+            raise ValidationError(
+                message=f"User '{username}' already exists",
+                error_code="USER_EXISTS",
+                details={"username": username}
+            )
+        
+        # Hash password and save
+        hashed_password = ue.encode_phrase_with_key(password)
+        rd.save_user_pass(username, hashed_password)
+        
+        logger.info(f"User '{username}' created by '{user}'")
+        return _envelope_success(
+            message=f"User '{username}' created successfully",
+            data={"username": username}
+        )
+    except ValidationError:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create user: {e}", exc_info=True)
+        raise
+
+
+@log_to_file(logger)
+@handle_async_errors("update_user_password", "REDIS_ERROR")
+@app.put("/users/{username}/password", tags=["Users"])
+async def update_user_password(
+    username: str,
+    new_password: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Update user password.
+    
+    Args:
+        username: Username to update
+        new_password: New plain text password (will be hashed)
+        user: Current authenticated user
+        
+    Returns:
+        Success message
+    """
+    try:
+        # Check if user exists
+        if not rd.get_user_pass(username):
+            raise NotFoundError(
+                message=f"User '{username}' not found",
+                error_code="USER_NOT_FOUND",
+                details={"username": username}
+            )
+        
+        # Hash new password and save
+        hashed_password = ue.encode_phrase_with_key(new_password)
+        rd.save_user_pass(username, hashed_password)
+        
+        logger.info(f"Password updated for user '{username}' by '{user}'")
+        return _envelope_success(
+            message=f"Password updated for user '{username}'",
+            data={"username": username}
+        )
+    except NotFoundError:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update user password: {e}", exc_info=True)
+        raise
+
+
+@log_to_file(logger)
+@handle_async_errors("delete_user", "REDIS_ERROR")
+@app.delete("/users/{username}", tags=["Users"])
+async def delete_user(
+    username: str,
+    user: str = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Delete a user.
+    
+    Args:
+        username: Username to delete
+        user: Current authenticated user
+        
+    Returns:
+        Success message
+    """
+    try:
+        # Prevent deleting yourself
+        if username == user:
+            raise ValidationError(
+                message="Cannot delete your own user account",
+                error_code="CANNOT_DELETE_SELF",
+                details={"username": username}
+            )
+        
+        # Check if user exists
+        if not rd.get_user_pass(username):
+            raise NotFoundError(
+                message=f"User '{username}' not found",
+                error_code="USER_NOT_FOUND",
+                details={"username": username}
+            )
+        
+        # Delete user from Redis
+        rd.redis_client.hdel("authentication", username)
+        
+        logger.info(f"User '{username}' deleted by '{user}'")
+        return _envelope_success(
+            message=f"User '{username}' deleted successfully",
+            data={"username": username}
+        )
+    except (ValidationError, NotFoundError):
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete user: {e}", exc_info=True)
+        raise
 
 # ==================== Error Handlers ====================
 

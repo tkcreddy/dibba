@@ -30,6 +30,7 @@ read_config = rc()
 key = read_config.encryption_config['key']
 encode_util = UtilitiesExtension(key)
 health_check_queue_name = encode_util.encode_hostname_with_key('health_check')
+scheduler_queue_name = encode_util.encode_hostname_with_key('scheduler')
 secure_exchange = Exchange('secure_exchange', type='direct')
 celery_app.conf.update(
     beat_schedule={
@@ -72,6 +73,17 @@ celery_app.conf.update(
             'routing_key': scheduler_queue_name,
             'delivery_mode': 2,
             'expires': 120,  # Expire if not processed within 120 seconds
+        }
+    },
+    'check-all-pods-health-every-30-seconds': {
+        'task': 'health.check_all_pods_health',
+        'schedule': 30.0,  # Run every 30 seconds
+        'options': {
+            'queue': 'scheduler',  # Use scheduler queue for health checks
+            'exchange': secure_exchange,
+            'routing_key': 'scheduler',
+            'delivery_mode': 2,
+            'expires': 60,  # Expire if not processed within 60 seconds
         }
     },
     },

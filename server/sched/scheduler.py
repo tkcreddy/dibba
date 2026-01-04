@@ -46,6 +46,7 @@ class DeploymentSpec:
     min_replicas: Optional[int] = None  # Minimum replicas (for auto-scaling)
     max_replicas: Optional[int] = None  # Maximum replicas (for auto-scaling)
     volumes: Optional[List[Dict[str, Any]]] = None  # Pod-level volumes
+    health_checks: Optional[Dict[str, Any]] = None  # Health check configuration
 
 
 class ResourceConverter:
@@ -275,6 +276,49 @@ class DeploymentParser:
             if volumes:
                 logger.info(f"Found {len(volumes)} volumes in pod spec")
             
+            # Extract health check configuration from containers
+            # Health checks are defined per container (like Kubernetes)
+            health_checks = {}
+            for container in containers:
+                container_name = container.get('name', 'unknown')
+                container_health = {}
+                
+                # Parse livenessProbe
+                liveness_probe = container.get('livenessProbe')
+                if liveness_probe:
+                    container_health['livenessProbe'] = {
+                        'httpGet': liveness_probe.get('httpGet'),
+                        'tcpSocket': liveness_probe.get('tcpSocket'),
+                        'exec': liveness_probe.get('exec'),
+                        'initialDelaySeconds': liveness_probe.get('initialDelaySeconds', 0),
+                        'periodSeconds': liveness_probe.get('periodSeconds', 10),
+                        'timeoutSeconds': liveness_probe.get('timeoutSeconds', 1),
+                        'successThreshold': liveness_probe.get('successThreshold', 1),
+                        'failureThreshold': liveness_probe.get('failureThreshold', 3),
+                    }
+                    logger.info(f"Found livenessProbe for container {container_name}")
+                
+                # Parse readinessProbe
+                readiness_probe = container.get('readinessProbe')
+                if readiness_probe:
+                    container_health['readinessProbe'] = {
+                        'httpGet': readiness_probe.get('httpGet'),
+                        'tcpSocket': readiness_probe.get('tcpSocket'),
+                        'exec': readiness_probe.get('exec'),
+                        'initialDelaySeconds': readiness_probe.get('initialDelaySeconds', 0),
+                        'periodSeconds': readiness_probe.get('periodSeconds', 10),
+                        'timeoutSeconds': readiness_probe.get('timeoutSeconds', 1),
+                        'successThreshold': readiness_probe.get('successThreshold', 1),
+                        'failureThreshold': readiness_probe.get('failureThreshold', 3),
+                    }
+                    logger.info(f"Found readinessProbe for container {container_name}")
+                
+                if container_health:
+                    health_checks[container_name] = container_health
+            
+            if health_checks:
+                logger.info(f"Parsed health checks for {len(health_checks)} container(s)")
+            
             # Extract metadata.name - this is the deployment name that will be stored in Redis
             deployment_name = metadata.get('name', 'unknown')
             logger.info(f"Parsed deployment name (metadata.name): {deployment_name}, app_label: {app_label}")
@@ -288,7 +332,8 @@ class DeploymentParser:
                 max_replicas=max_replicas,
                 containers=containers,
                 resource_requirements=resource_reqs,
-                volumes=volumes if volumes else None
+                volumes=volumes if volumes else None,
+                health_checks=health_checks if health_checks else None
             )
         
         except Exception as e:

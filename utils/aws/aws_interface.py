@@ -86,11 +86,20 @@ class AwsInterface:
                             (tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'),
                             None
                         )
+                        # Get state name (running, stopped, terminated, etc.)
+                        state_name = instance.get('State', {}).get('Name', 'unknown') if instance.get('State') else 'unknown'
+                        # Get launch time
+                        launch_time = instance.get('LaunchTime')
+                        launch_time_str = launch_time.strftime('%Y-%m-%d %H:%M:%S') if launch_time else None
+                        
                         instance_details = {
                             "Name": name_tag,
                             "InstanceID": instance.get('InstanceId'),
+                            "InstanceType": instance.get('InstanceType'),
+                            "State": state_name,
                             "PrivateIpAddress": instance.get('PrivateIpAddress'),
-                            "LaunchTime": instance.get('LaunchTime').strftime('%Y-%m-%d %H:%M:%S')
+                            "PublicIpAddress": instance.get('PublicIpAddress'),
+                            "LaunchTime": launch_time_str
                         }
                         instances.append(instance_details)
         except Exception as err:
