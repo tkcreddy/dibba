@@ -609,7 +609,7 @@ class DeploymentScheduler:
                 if app_name != deployment.app_label:
                     continue
                 
-                # Prepare container specs for containerd
+                # Prepare container specs for containerd with resources properly formatted
                 containers = []
                 for container in deployment.containers:
                     container_spec = {
@@ -623,43 +623,40 @@ class DeploymentScheduler:
                             'memory': f"{int(deployment.resource_requirements.memory_mb)}Mi"
                         }
                     }
+                    # Add ports if present
+                    if 'ports' in container:
+                        container_spec['ports'] = container['ports']
                     containers.append(container_spec)
                 
-                # Submit pod creation task
-                host_queue_info = create_host_queue_info(hostname, self.encode_util)
-                
+                # Use centralized function to create pod
                 try:
-                    result = submit_celery_task(
-                        task=create_pod_task,
-                        kwargs={
-                            'containers': containers,
-                            'app_namespace': deployment.namespace,
-                        },
-                        queue_info=host_queue_info,
-                        operation_name="create_pod",
-                        error_code="POD_CREATION_ERROR",
-                        additional_data={
-                            'deployment': deployment.name,
-                            'replica': instance_num,
+                    result = self.create_pod_on_host(
+                        containers=containers,
+                        namespace=deployment.namespace,
+                        hostname=hostname,
+                        labels=deployment.app_label and {'app': deployment.app_label} or None,
+                        deployment_name=deployment.name,
+                        replica_num=instance_num
+                    )
+                    
+                    if result.get('status') == 'submitted':
+                        results.append({
                             'hostname': hostname,
-                        }
-                    )
-                    
-                    results.append({
-                        'hostname': hostname,
-                        'replica': instance_num,
-                        'task_id': result.get('task_id'),
-                        'status': 'submitted'
-                    })
-                    
-                    logger.info(
-                        f"Submitted pod creation for {deployment.name} "
-                        f"replica {instance_num} on {hostname}"
-                    )
+                            'replica': instance_num,
+                            'task_id': result.get('task_id'),
+                            'status': 'submitted'
+                        })
+                    else:
+                        results.append({
+                            'hostname': hostname,
+                            'replica': instance_num,
+                            'status': 'error',
+                            'error': result.get('error', 'Unknown error')
+                        })
                 
                 except Exception as e:
                     logger.error(
-                        f"Failed to submit pod creation for {deployment.name} "
+                        f"Failed to create pod for {deployment.name} "
                         f"replica {instance_num} on {hostname}: {e}",
                         exc_info=True
                     )
@@ -671,6 +668,201 @@ class DeploymentScheduler:
                     })
         
         return results
+    
+    @log_to_file(logger)
+    def create_pod_on_host(
+        self,
+        containers: List[Dict[str, Any]],
+        namespace: str,
+        hostname: str,
+        labels: Optional[Dict[str, str]] = None,
+        deployment_name: Optional[str] = None,
+        replica_num: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Centralized function to create a pod on a specific host.
+        
+        This is the correct way to create pods - used by scheduler and should be used
+        by deployment recovery and other components.
+        
+        Args:
+            containers: List of container specs (must have resources properly formatted)
+            namespace: Pod namespace
+            hostname: Host where pod should be created
+            labels: Optional pod labels
+            deployment_name: Optional deployment name for logging
+            replica_num: Optional replica number for logging
+            
+        Returns:
+            Dictionary with task_id and status
+        """
+        # Prepare container specs in the correct format
+        container_specs = []
+        for container in containers:
+            # Extract resources - handle both direct format and nested format
+            resources = container.get('resources', {})
+            if isinstance(resources, dict):
+                # If resources already has cpu_millicores and memory, use it
+                if 'cpu_millicores' in resources and 'memory' in resources:
+                    container_spec = {
+                        'image': container.get('image'),
+                        'name': container.get('name'),
+                        'command': container.get('command'),
+                        'args': container.get('args', []),
+                        'env': container.get('env', {}),
+                        'resources': {
+                            'cpu_millicores': resources['cpu_millicores'],
+                            'memory': resources['memory'] if isinstance(resources['memory'], str) else f"{resources['memory']}Mi"
+                        }
+                    }
+                else:
+                    # Try to extract from nested format (limits/requests)
+                    cpu_millicores = 0
+                    memory_str = "0Mi"
+                    
+                    if 'limits' in resources:
+                        cpu_str = resources['limits'].get('cpu', '0')
+                        memory_str = resources['limits'].get('memory', '0Mi')
+                        cpu_millicores = ResourceConverter.parse_cpu(cpu_str)
+                    elif 'requests' in resources:
+                        cpu_str = resources['requests'].get('cpu', '0')
+                        memory_str = resources['requests'].get('memory', '0Mi')
+                        cpu_millicores = ResourceConverter.parse_cpu(cpu_str)
+                    
+                    container_spec = {
+                        'image': container.get('image'),
+                        'name': container.get('name'),
+                        'command': container.get('command'),
+                        'args': container.get('args', []),
+                        'env': container.get('env', {}),
+                        'resources': {
+                            'cpu_millicores': cpu_millicores,
+                            'memory': memory_str
+                        }
+                    }
+            else:
+                # No resources specified, use defaults
+                container_spec = {
+                    'image': container.get('image'),
+                    'name': container.get('name'),
+                    'command': container.get('command'),
+                    'args': container.get('args', []),
+                    'env': container.get('env', {}),
+                    'resources': {
+                        'cpu_millicores': 0,
+                        'memory': '0Mi'
+                    }
+                }
+            
+            # Add ports if present
+            if 'ports' in container:
+                container_spec['ports'] = container['ports']
+            
+            container_specs.append(container_spec)
+        
+        # Submit pod creation task
+        host_queue_info = create_host_queue_info(hostname, self.encode_util)
+        
+        try:
+            result = submit_celery_task(
+                task=create_pod_task,
+                kwargs={
+                    'containers': container_specs,
+                    'app_namespace': namespace,
+                    'labels': labels or {},
+                },
+                queue_info=host_queue_info,
+                operation_name="create_pod",
+                error_code="POD_CREATION_ERROR",
+                additional_data={
+                    'deployment': deployment_name,
+                    'replica': replica_num,
+                    'hostname': hostname,
+                }
+            )
+            
+            logger.info(
+                f"Submitted pod creation on {hostname} "
+                f"{f'for {deployment_name} ' if deployment_name else ''}"
+                f"{f'replica {replica_num} ' if replica_num else ''}"
+                f"(task_id: {result.get('task_id')})"
+            )
+            
+            return {
+                'status': 'submitted',
+                'task_id': result.get('task_id'),
+                'hostname': hostname
+            }
+        
+        except Exception as e:
+            logger.error(
+                f"Failed to submit pod creation on {hostname}: {e}",
+                exc_info=True
+            )
+            return {
+                'status': 'error',
+                'error': str(e),
+                'hostname': hostname
+            }
+    
+    @log_to_file(logger)
+    def terminate_pod_on_host(
+        self,
+        pod_id: str,
+        namespace: str,
+        hostname: str
+    ) -> Dict[str, Any]:
+        """Centralized function to terminate a pod on a specific host.
+        
+        This is the correct way to terminate pods - used by scheduler and should be
+        used by health checks and other components.
+        
+        Args:
+            pod_id: Pod ID to terminate
+            namespace: Pod namespace
+            hostname: Host where pod is running
+            
+        Returns:
+            Dictionary with task_id and status
+        """
+        from utils.celery.tasks.containerd_tasks import terminate_pod_task
+        
+        host_queue_info = create_host_queue_info(hostname, self.encode_util)
+        
+        try:
+            result = submit_celery_task(
+                task=terminate_pod_task,
+                args=(namespace, pod_id),
+                kwargs={},
+                queue_info=host_queue_info,
+                operation_name="terminate_pod",
+                error_code="POD_TERMINATION_ERROR",
+                additional_data={
+                    'pod_id': pod_id,
+                    'hostname': hostname,
+                }
+            )
+            
+            logger.info(
+                f"Submitted pod termination for {pod_id} on {hostname} "
+                f"(task_id: {result.get('task_id')})"
+            )
+            
+            return {
+                'status': 'submitted',
+                'task_id': result.get('task_id'),
+                'hostname': hostname
+            }
+        
+        except Exception as e:
+            logger.error(
+                f"Failed to submit pod termination for {pod_id} on {hostname}: {e}",
+                exc_info=True
+            )
+            return {
+                'status': 'error',
+                'error': str(e),
+                'hostname': hostname
+            }
 
 @log_to_file(logger)
 def schedule_deployment_from_yaml(yaml_content: str, use_chain: bool = True) -> Dict[str, Any]:

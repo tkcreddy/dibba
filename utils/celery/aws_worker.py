@@ -21,6 +21,6 @@ celery_app.autodiscover_tasks(['utils.celery.tasks.aws_tasks'])
 celery_app.conf.include = [
     "utils.celery.tasks.scheduler_tasks",
     "utils.celery.tasks.deployment_recovery_tasks",
-    "utils.celery.tasks.health_check_tasks",  # Include health check tasks
+    # Health check tasks are excluded - they run on separate health_check_worker node
 ]
 

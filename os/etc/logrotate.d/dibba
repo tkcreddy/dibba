@@ -1,0 +1,10 @@
+/var/log/dibba/dibba*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+

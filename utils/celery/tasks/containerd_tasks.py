@@ -563,6 +563,71 @@ def purge_stopped_tasks_and_containers_task(
 
 @celery_app.task
 @log_to_file(logger)
+def exec_container_command_task(pod_id: str, container_name: str, command: List[str], 
+                                namespace: Optional[str] = None, timeout_seconds: int = 1) -> Dict[str, Any]:
+    """Execute a command in a container (runs on the worker node where the pod is located).
+    
+    This task is used for health check exec probes and must run on the worker node
+    where the pod is running, not on the health check worker node.
+    
+    Args:
+        pod_id: Pod ID
+        container_name: Container name
+        command: Command to execute (list of strings)
+        namespace: Containerd namespace (default: k8s.io)
+        timeout_seconds: Command timeout in seconds
+        
+    Returns:
+        Dictionary with 'success' (bool) and 'exit_code' (int)
+    """
+    ns = namespace or DEFAULT_NAMESPACE
+    
+    try:
+        container_id = f"{pod_id}-{container_name}"
+        exec_id = f"healthcheck-{uuid.uuid4().hex[:8]}"
+        
+        # Build ctr command
+        ctr_cmd = [
+            'ctr',
+            '-n', ns,
+            'task', 'exec',
+            '--exec-id', exec_id,
+            container_id
+        ] + command
+        
+        # Execute command on the worker node
+        result = subprocess.run(
+            ctr_cmd,
+            capture_output=True,
+            timeout=timeout_seconds,
+            text=True
+        )
+        
+        return {
+            'success': result.returncode == 0,
+            'exit_code': result.returncode,
+            'stdout': result.stdout,
+            'stderr': result.stderr
+        }
+        
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Exec command timed out for pod {pod_id} container {container_name}")
+        return {
+            'success': False,
+            'exit_code': -1,
+            'error': 'timeout'
+        }
+    except Exception as e:
+        logger.error(f"Exec command failed for pod {pod_id} container {container_name}: {e}", exc_info=True)
+        return {
+            'success': False,
+            'exit_code': -1,
+            'error': str(e)
+        }
+
+
+@celery_app.task
+@log_to_file(logger)
 def prune_namespace_task(
     namespace: str,
     aggressive: bool = True,

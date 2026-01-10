@@ -1,0 +1,28 @@
+[Unit]
+Description=Calico Node (containerd / ctr)
+After=containerd.service network-online.target
+Wants=containerd.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Environment can be overridden here if needed
+Environment="ETCD_ENDPOINTS=http://ip-172-31-17-19:2379"
+Environment="NODENAME=%H"
+
+# If you use containerd namespaces, uncomment
+# Environment="CTR_NS=k8s.io"
+
+ExecStart=/opt/calico/start-calico-node.sh
+ExecStop=/opt/calico/start-calico-node.sh stop
+
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

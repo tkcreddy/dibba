@@ -13,7 +13,7 @@ from utils.redis.redis_interface import RedisInterface
 from utils.redis.host_pod_store import HostPodStore, HostStatus
 from utils.redis.deployment_store import DeploymentStore
 from server.nodes.distribute_nodes_services import ClusterWorkerDistribution, get_worker_nodes_from_redis
-from utils.celery.tasks.containerd_tasks import create_pod_task, terminate_pod_task
+from server.sched.scheduler import DeploymentScheduler
 from utils.celery.queue_utils import create_host_queue_info, create_queue_info, submit_celery_task
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.ReadConfig import ReadConfig as rc
@@ -76,7 +76,7 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                 # Try to get pods by app label first, then filter by namespace
                 try:
                     app_pods = host_pod_store.get_pods_by_application(app_label)
-                    running_pods = [
+                    candidate_pods = [
                         pod for pod in app_pods
                         if pod.get('status') == 'RUNNING' and
                         pod.get('namespace') == namespace
@@ -85,17 +85,55 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     logger.warning(f"Failed to get pods by app, trying by namespace: {e}")
                     # Fallback: get by namespace and filter by app label
                     all_pods = host_pod_store.get_pods_by_namespace(namespace)
-                    running_pods = [
+                    candidate_pods = [
                         pod for pod in all_pods
                         if pod.get('status') == 'RUNNING'
                     ]
                     # Try to match by labels if available
-                    if running_pods and running_pods[0].get('labels'):
-                        running_pods = [
-                            pod for pod in running_pods
+                    if candidate_pods and candidate_pods[0].get('labels'):
+                        candidate_pods = [
+                            pod for pod in candidate_pods
                             if pod.get('labels', {}).get('app') == app_label
                         ]
                 
+                # Validate pods: filter out stale pods (same logic as scale_deployment_task)
+                from datetime import datetime, timezone, timedelta
+                validated_pods = []
+                now = datetime.now(timezone.utc)
+                
+                for pod in candidate_pods:
+                    # Check if pod has valid container information
+                    containers = pod.get('containers', [])
+                    pause_container = pod.get('pause_container', {})
+                    has_containers = containers or (pause_container and pause_container.get("pid"))
+                    
+                    if not has_containers:
+                        logger.debug(f"Pod {pod.get('pod_id')} excluded: no valid containers")
+                        continue
+                    
+                    # Check if pod was updated in the last 60 seconds
+                    last_updated_str = pod.get('last_updated')
+                    if last_updated_str:
+                        try:
+                            last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
+                            time_since_update = (now - last_updated).total_seconds()
+                            if time_since_update > 60:
+                                logger.debug(
+                                    f"Pod {pod.get('pod_id')} excluded: last updated {time_since_update:.1f}s ago (>60s)"
+                                )
+                                continue
+                        except Exception as e:
+                            logger.warning(f"Failed to parse last_updated for pod {pod.get('pod_id')}: {e}")
+                            # If we can't parse, exclude it to be safe
+                            continue
+                    else:
+                        # No last_updated timestamp, exclude to be safe
+                        logger.debug(f"Pod {pod.get('pod_id')} excluded: no last_updated timestamp")
+                        continue
+                    
+                    validated_pods.append(pod)
+                
+                running_pods = validated_pods
                 current_replicas = len(running_pods)
                 logger.info(f"Deployment {namespace}/{name}: {current_replicas} running pods (min required: {min_replicas})")
                 
@@ -156,11 +194,9 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                             hostname = worker_nodes[node_index]['hostname']
                             placement[hostname] = placements
                     
-                    # Create missing pods
+                    # Create missing pods using centralized scheduler function
                     pods_recreated = 0
-                    read_config = rc()
-                    key = read_config.encryption_config['key']
-                    encode_util = UtilitiesExtension(key)
+                    scheduler = DeploymentScheduler()
                     
                     for hostname, placements in placement.items():
                         host_info = next((n for n in worker_nodes if n.get('hostname') == hostname), None)
@@ -174,48 +210,38 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                                 # Use a high instance number to avoid conflicts
                                 recovery_instance_num = max([int(i) for i in existing_instances if i and str(i).isdigit()], default=-1) + 1 + instance_num
                                 
-                                # Prepare container specs
+                                # Prepare container specs with resources properly formatted
+                                # The scheduler's create_pod_on_host will handle resource conversion
                                 container_specs = []
                                 for container in containers:
-                                    container_specs.append({
+                                    # Include resources in the container spec - scheduler will handle conversion
+                                    container_spec = {
                                         'name': container.get('name'),
                                         'image': container.get('image'),
                                         'args': container.get('args', []),
                                         'env': container.get('env', {}),
-                                        'resources': container.get('resources', {}),
                                         'ports': container.get('ports', []),
-                                    })
-                                
-                                # Create pod
-                                host_queue_info = create_host_queue_info(hostname, encode_util)
-                                result = submit_celery_task(
-                                    task=create_pod_task,
-                                    args=(
-                                        namespace,
-                                        f"{name}-recovery-{recovery_instance_num}",
-                                        container_specs,
-                                    ),
-                                    kwargs={
-                                        'cni_network': {'name': 'calico', 'ifname': 'eth0'},
-                                        'labels': {'app': app_label, 'instance': str(recovery_instance_num)},
-                                        'resources': {
-                                            'cpu_millicores': cpu_millicores,
-                                            'memory': f"{int(memory_mb)}Mi"
-                                        },
-                                    },
-                                    queue_info=host_queue_info,
-                                    operation_name="recover_pod",
-                                    error_code="POD_RECOVERY_ERROR",
-                                    additional_data={
-                                        'deployment': name,
-                                        'replica': recovery_instance_num,
-                                        'hostname': hostname,
-                                        'recovery': True,
                                     }
+                                    # Include resources if present (scheduler will convert if needed)
+                                    if 'resources' in container:
+                                        container_spec['resources'] = container['resources']
+                                    container_specs.append(container_spec)
+                                
+                                # Use centralized scheduler function to create pod
+                                result = scheduler.create_pod_on_host(
+                                    containers=container_specs,
+                                    namespace=namespace,
+                                    hostname=hostname,
+                                    labels={'app': app_label, 'instance': str(recovery_instance_num)},
+                                    deployment_name=name,
+                                    replica_num=recovery_instance_num
                                 )
                                 
-                                pods_recreated += 1
-                                logger.info(f"Recovered pod for {namespace}/{name} instance {recovery_instance_num} on {hostname}")
+                                if result.get('status') == 'submitted':
+                                    pods_recreated += 1
+                                    logger.info(f"Recovered pod for {namespace}/{name} instance {recovery_instance_num} on {hostname} (task_id: {result.get('task_id')})")
+                                else:
+                                    raise Exception(result.get('error', 'Unknown error'))
                                 
                             except Exception as e:
                                 logger.error(f"Failed to recover pod for {namespace}/{name} on {hostname}: {e}", exc_info=True)
@@ -538,28 +564,19 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                     continue
                 
                 try:
-                    host_queue_info = create_host_queue_info(hostname, utilities)
-                    
-                    result = submit_celery_task(
-                        task=terminate_pod_task,
-                        args=(namespace, pod_id),  # Correct order: namespace, pod_name
-                        kwargs={},  # host_name is not a parameter of terminate_pod_task
-                        queue_info=host_queue_info,
-                        operation_name="terminate_pod",
-                        error_code="TERMINATE_POD_TASK_ERROR",
-                        additional_data={
-                            "namespace": namespace,
-                            "pod_name": pod_id,
-                            "host_name": hostname,
-                            "deployment_name": deployment_name,
-                        }
+                    # Use centralized scheduler function for pod termination
+                    scheduler = DeploymentScheduler()
+                    result = scheduler.terminate_pod_on_host(
+                        pod_id=pod_id,
+                        namespace=namespace,
+                        hostname=hostname
                     )
                     
-                    if result.get("data", {}).get("task_id"):
+                    if result.get('status') == 'submitted':
                         pods_terminated += 1
-                        logger.info(f"Terminated pod {pod_id} for scaling down (task_id: {result.get('data', {}).get('task_id')})")
+                        logger.info(f"Terminated pod {pod_id} for scaling down (task_id: {result.get('task_id')})")
                     else:
-                        logger.warning(f"Failed to terminate pod {pod_id}: no task_id returned")
+                        logger.warning(f"Failed to terminate pod {pod_id}: {result.get('error', 'Unknown error')}")
                 except Exception as e:
                     logger.error(f"Failed to terminate pod {pod_id}: {e}")
             
