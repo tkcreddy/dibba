@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dibba - Lightweight Container Orchestration Platform</title>
+    <meta name="description" content="Dibba is a production-ready, Python-based container orchestration platform built on containerd, Celery, and Redis. Deploy and manage containers at scale.">
+    <meta name="keywords" content="container orchestration, containerd, kubernetes alternative, python, devops, cloud native">
+    
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://www.dibba.cloud/">
+    <meta property="og:title" content="Dibba - Lightweight Container Orchestration Platform">
+    <meta property="og:description" content="Production-ready container orchestration platform built on containerd, Celery, and Redis">
+    
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image">
+    <meta property="twitter:url" content="https://www.dibba.cloud/">
+    <meta property="twitter:title" content="Dibba - Lightweight Container Orchestration Platform">
+    <meta property="twitter:description" content="Production-ready container orchestration platform built on containerd, Celery, and Redis">
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #fff;
+        }
+        
+        /* Hero Section */
+        .hero {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 100px 20px;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: url('data:image/svg+xml,<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg"><defs><pattern id="grid" width="100" height="100" patternUnits="userSpaceOnUse"><path d="M 100 0 L 0 0 0 100" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="1"/></pattern></defs><rect width="100%" height="100%" fill="url(%23grid)"/></svg>');
+            opacity: 0.3;
+        }
+        
+        .hero-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 700;
+            margin-bottom: 20px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        
+        .hero .tagline {
+            font-size: 1.5rem;
+            margin-bottom: 30px;
+            opacity: 0.95;
+        }
+        
+        .hero .description {
+            font-size: 1.2rem;
+            max-width: 800px;
+            margin: 0 auto 40px;
+            opacity: 0.9;
+        }
+        
+        .cta-buttons {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            display: inline-block;
+            padding: 15px 35px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            text-decoration: none;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            border: 2px solid transparent;
+        }
+        
+        .btn-primary {
+            background: white;
+            color: #667eea;
+        }
+        
+        .btn-primary:hover {
+            background: #f8f9fa;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+        
+        .btn-secondary {
+            background: transparent;
+            color: white;
+            border-color: white;
+        }
+        
+        .btn-secondary:hover {
+            background: white;
+            color: #667eea;
+            transform: translateY(-2px);
+        }
+        
+        /* Features Section */
+        .features {
+            padding: 80px 20px;
+            background: #f8f9fa;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .section-title {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 20px;
+            color: #2d3748;
+        }
+        
+        .section-subtitle {
+            text-align: center;
+            font-size: 1.2rem;
+            color: #718096;
+            margin-bottom: 60px;
+            max-width: 700px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 40px;
+            margin-top: 60px;
+        }
+        
+        .feature-card {
+            background: white;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+        }
+        
+        .feature-icon {
+            font-size: 3rem;
+            margin-bottom: 20px;
+        }
+        
+        .feature-card h3 {
+            font-size: 1.5rem;
+            margin-bottom: 15px;
+            color: #2d3748;
+        }
+        
+        .feature-card p {
+            color: #718096;
+            line-height: 1.8;
+        }
+        
+        /* Architecture Section */
+        .architecture {
+            padding: 80px 20px;
+            background: white;
+        }
+        
+        .architecture-diagram {
+            background: #f8f9fa;
+            padding: 40px;
+            border-radius: 12px;
+            margin-top: 40px;
+            text-align: center;
+            font-family: 'Courier New', monospace;
+            overflow-x: auto;
+        }
+        
+        /* Code Example */
+        .code-example {
+            background: #2d3748;
+            color: #e2e8f0;
+            padding: 30px;
+            border-radius: 8px;
+            margin-top: 40px;
+            overflow-x: auto;
+        }
+        
+        .code-example pre {
+            margin: 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            line-height: 1.6;
+        }
+        
+        /* Stats Section */
+        .stats {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 60px 20px;
+            text-align: center;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 40px;
+            max-width: 1000px;
+            margin: 40px auto 0;
+        }
+        
+        .stat-item h3 {
+            font-size: 3rem;
+            margin-bottom: 10px;
+        }
+        
+        .stat-item p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+        
+        /* Getting Started */
+        .getting-started {
+            padding: 80px 20px;
+            background: #f8f9fa;
+        }
+        
+        .steps {
+            max-width: 800px;
+            margin: 40px auto 0;
+        }
+        
+        .step {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .step-number {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            background: #667eea;
+            color: white;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 40px;
+            font-weight: bold;
+            margin-right: 15px;
+        }
+        
+        .step h3 {
+            display: inline-block;
+            margin: 0;
+            color: #2d3748;
+        }
+        
+        .step p {
+            margin-top: 15px;
+            color: #718096;
+        }
+        
+        /* Footer */
+        .footer {
+            background: #2d3748;
+            color: white;
+            padding: 60px 20px 30px;
+            text-align: center;
+        }
+        
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            flex-wrap: wrap;
+            margin-bottom: 40px;
+        }
+        
+        .footer-links a {
+            color: #cbd5e0;
+            text-decoration: none;
+            transition: color 0.3s ease;
+        }
+        
+        .footer-links a:hover {
+            color: white;
+        }
+        
+        .footer-bottom {
+            margin-top: 40px;
+            padding-top: 30px;
+            border-top: 1px solid #4a5568;
+            color: #cbd5e0;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+            
+            .hero .tagline {
+                font-size: 1.2rem;
+            }
+            
+            .section-title {
+                font-size: 2rem;
+            }
+            
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="hero-content">
+            <h1>🚀 Dibba</h1>
+            <p class="tagline">Lightweight Container Orchestration Platform</p>
+            <p class="description">
+                Production-ready, Python-based container orchestration built on containerd, Celery, and Redis. 
+                Deploy and manage containers at scale with Kubernetes-like capabilities without the complexity.
+            </p>
+            <div class="cta-buttons">
+                <a href="https://github.com/tkcreddy/dibba" class="btn btn-primary">Get Started</a>
+                <a href="#features" class="btn btn-secondary">Learn More</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Stats Section -->
+    <section class="stats">
+        <div class="container">
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <h3>100%</h3>
+                    <p>Open Source</p>
+                </div>
+                <div class="stat-item">
+                    <h3>⚡</h3>
+                    <p>Lightweight & Fast</p>
+                </div>
+                <div class="stat-item">
+                    <h3>🔧</h3>
+                    <p>Production Ready</p>
+                </div>
+                <div class="stat-item">
+                    <h3>🐍</h3>
+                    <p>Python Native</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section class="features" id="features">
+        <div class="container">
+            <h2 class="section-title">Powerful Features</h2>
+            <p class="section-subtitle">
+                Everything you need to orchestrate containers in production
+            </p>
+            
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">📦</div>
+                    <h3>Pod Management</h3>
+                    <p>
+                        Kubernetes-style pod architecture with pause containers, multi-container support, 
+                        and shared namespaces. Full lifecycle management from creation to termination.
+                    </p>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🔄</div>
+                    <h3>Auto-Scaling</h3>
+                    <p>
+                        Automatic replica management with min/max limits. Self-healing deployments that 
+                        automatically recover from failures and scale based on demand.
+                    </p>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🏥</div>
+                    <h3>Health Checks</h3>
+                    <p>
+                        Kubernetes-style liveness and readiness probes. Automatic container restart on 
+                        health check failures with configurable intervals and timeouts.
+                    </p>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">☁️</div>
+                    <h3>AWS Integration</h3>
+                    <p>
+                        Seamless AWS EC2 integration for dynamic worker node provisioning. Automatic 
+                        instance lifecycle management and multi-region support.
+                    </p>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🌐</div>
+                    <h3>CNI Networking</h3>
+                    <p>
+                        Native Calico CNI integration for pod networking. Automatic IP assignment, 
+                        network policies, and etcd-based network state management.
+                    </p>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">📊</div>
+                    <h3>Monitoring</h3>
+                    <p>
+                        Real-time metrics and health monitoring. Centralized logging with rotation, 
+                        worker node health tracking, and automatic state synchronization.
+                    </p>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">💾</div>
+                    <h3>Storage</h3>
+                    <p>
+                        Persistent volumes and volume claims. Support for multiple storage backends 
+                        with dynamic provisioning and snapshot capabilities.
+                    </p>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🔌</div>
+                    <h3>REST API</h3>
+                    <p>
+                        FastAPI-based RESTful API with OpenAPI documentation. Full CRUD operations 
+                        for deployments, pods, and infrastructure management.
+                    </p>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🎨</div>
+                    <h3>Web UI</h3>
+                    <p>
+                        Modern web dashboard for managing deployments, pods, and worker nodes. 
+                        Real-time status updates and intuitive interface.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Architecture Section -->
+    <section class="architecture">
+        <div class="container">
+            <h2 class="section-title">Built for Scale</h2>
+            <p class="section-subtitle">
+                Modern architecture designed for reliability and performance
+            </p>
+            
+            <div class="architecture-diagram">
+                <pre>
+┌─────────────────────────────────────────┐
+│         Dibba Control Plane             │
+├─────────────────────────────────────────┤
+│  FastAPI API  │  Celery Beat  │ Workers │
+│      ↓        │       ↓        │   ↓    │
+│           Redis State Store             │
+└─────────────────────────────────────────┘
+           ↓         ↓         ↓
+    ┌─────────┐ ┌─────────┐ ┌─────────┐
+    │ Worker  │ │ Worker  │ │ Worker  │
+    │  Node 1 │ │  Node 2 │ │  Node N │
+    │containerd│ │containerd│ │containerd│
+    └─────────┘ └─────────┘ └─────────┘
+                </pre>
+            </div>
+        </div>
+    </section>
+
+    <!-- Getting Started Section -->
+    <section class="getting-started">
+        <div class="container">
+            <h2 class="section-title">Get Started in Minutes</h2>
+            <p class="section-subtitle">
+                Simple installation and quick deployment
+            </p>
+            
+            <div class="steps">
+                <div class="step">
+                    <span class="step-number">1</span>
+                    <h3>Install Dependencies</h3>
+                    <p>Python 3.8+, containerd 2.0+, Redis, and Calico CNI</p>
+                </div>
+                
+                <div class="step">
+                    <span class="step-number">2</span>
+                    <h3>Clone Repository</h3>
+                    <p><code>git clone https://github.com/tkcreddy/dibba.git</code></p>
+                </div>
+                
+                <div class="step">
+                    <span class="step-number">3</span>
+                    <h3>Install & Configure</h3>
+                    <p><code>pip install -r requirements.txt</code> and configure your settings</p>
+                </div>
+                
+                <div class="step">
+                    <span class="step-number">4</span>
+                    <h3>Start Services</h3>
+                    <p>Start API server, Celery Beat, and workers - you're ready to deploy!</p>
+                </div>
+            </div>
+            
+            <div class="code-example" style="margin-top: 40px;">
+                <pre>
+# Quick start example
+curl -X POST "http://localhost:8080/scheduler/deploy/" \
+  -H "Authorization: Bearer &lt;token&gt;" \
+  -H "Content-Type: application/json" \
+  -d @deployment.yaml
+                </pre>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="footer-content">
+            <div class="footer-links">
+                <a href="https://github.com/tkcreddy/dibba">GitHub</a>
+                <a href="https://github.com/tkcreddy/dibba#readme">Documentation</a>
+                <a href="https://github.com/tkcreddy/dibba/issues">Issues</a>
+                <a href="https://github.com/tkcreddy/dibba/discussions">Discussions</a>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; 2024 Dibba. Built with ❤️ by the Dibba Team.</p>
+                <p>Apache License 2.0</p>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>
+

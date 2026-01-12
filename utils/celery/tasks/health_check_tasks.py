@@ -913,12 +913,16 @@ async def check_all_pods_health_task(max_concurrency: int = 100) -> Dict[str, An
                     health_result = await _check_pod_health_async(pod_id, hostname, namespace, session=shared_session)
                     return {
                         'pod_id': pod_id,
+                        'hostname': hostname,
+                        'namespace': namespace,
                         'result': health_result
                     }
                 except Exception as e:
                     logger.error(f"Failed to check health for pod {pod_id}: {e}", exc_info=True)
                     return {
                         'pod_id': pod_id,
+                        'hostname': hostname,
+                        'namespace': namespace,
                         'error': str(e)
                     }
         
@@ -951,17 +955,44 @@ async def check_all_pods_health_task(max_concurrency: int = 100) -> Dict[str, An
                         pod_id = check_result.get('pod_id')
                         
                         if 'error' in check_result:
+                            # Pod check failed (e.g., not found in Redis, no IP, etc.) - mark as unhealthy
+                            error_msg = check_result.get('error', 'Unknown error')
+                            logger.warning(f"Pod {pod_id} health check failed: {error_msg}")
+                            results['unhealthy'] += 1
                             results['errors'].append({
                                 'pod_id': pod_id,
-                                'error': check_result.get('error')
+                                'error': error_msg
+                            })
+                            # Track failed pods for recreation
+                            if 'failed_pods' not in results:
+                                results['failed_pods'] = []
+                            results['failed_pods'].append({
+                                'pod_id': pod_id,
+                                'hostname': check_result.get('hostname'),
+                                'namespace': check_result.get('namespace'),
+                                'error': error_msg
                             })
                         else:
                             health_result = check_result.get('result', {})
                             
                             if health_result.get('status') == 'error':
+                                # Pod not found or other error - mark as unhealthy
+                                error_msg = health_result.get('error', 'Unknown error')
+                                logger.warning(f"Pod {pod_id} health check error: {error_msg}")
+                                results['unhealthy'] += 1
                                 results['errors'].append({
                                     'pod_id': pod_id,
-                                    'error': health_result.get('error')
+                                    'error': error_msg
+                                })
+                                # Track failed pods for recreation
+                                if 'failed_pods' not in results:
+                                    results['failed_pods'] = []
+                                results['failed_pods'].append({
+                                    'pod_id': pod_id,
+                                    'hostname': health_result.get('hostname'),
+                                    'namespace': health_result.get('namespace'),
+                                    'health_result': health_result,
+                                    'error': error_msg
                                 })
                             else:
                                 liveness = health_result.get('liveness', {}).get('status', 'unknown')
@@ -1072,6 +1103,7 @@ async def check_all_pods_health_task(max_concurrency: int = 100) -> Dict[str, An
             try:
                 # Get all deployments to check min_replicas
                 all_deployments = deployment_store.get_all_deployments()
+                logger.info(f"Checking min_replicas for {len(all_deployments)} deployments")
                 for deployment in all_deployments:
                     namespace = deployment.get('namespace')
                     app_label = deployment.get('app_label')
@@ -1084,18 +1116,24 @@ async def check_all_pods_health_task(max_concurrency: int = 100) -> Dict[str, An
                     # Get all pods for this app (including ones we didn't check due to worker distribution)
                     try:
                         app_pods = host_pod_store.get_pods_by_application(app_label)
-                        healthy_pods = [
+                        # Filter pods by namespace and status
+                        deployment_pods = [
                             pod for pod in app_pods
                             if pod.get('namespace') == namespace and
-                            pod.get('status', '').upper() == 'RUNNING' and
-                            pod.get('health_status') == 'ready'
+                            pod.get('status', '').upper() == 'RUNNING'
                         ]
                         
-                        # Validate pods (filter stale ones)
-                        # datetime is already imported at module level (line 17), don't re-import to avoid shadowing
+                        logger.debug(f"Deployment {namespace}/{deployment.get('name')}: found {len(deployment_pods)} RUNNING pods for app_label={app_label}")
+                        
+                        # Count healthy pods
+                        # For pods with health checks: must have health_status == 'ready'
+                        # For pods without health checks: count as healthy if they're RUNNING
                         now = datetime.now(timezone.utc)
                         validated_healthy_pods = []
-                        for pod in healthy_pods:
+                        validated_running_pods = []
+                        
+                        for pod in deployment_pods:
+                            # Validate pod has containers
                             containers = pod.get('containers', [])
                             pause_container = pod.get('pause_container', {})
                             has_containers = containers or (pause_container and pause_container.get("pid"))
@@ -1103,22 +1141,45 @@ async def check_all_pods_health_task(max_concurrency: int = 100) -> Dict[str, An
                             if not has_containers:
                                 continue
                             
+                            # Check if pod is recent (updated within last 60 seconds)
                             last_updated_str = pod.get('last_updated')
+                            is_recent = False
                             if last_updated_str:
                                 try:
                                     last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
                                     time_since_update = (now - last_updated).total_seconds()
                                     if time_since_update <= 60:
-                                        validated_healthy_pods.append(pod)
+                                        is_recent = True
                                 except Exception:
-                                    continue
+                                    pass
+                            
+                            if not is_recent:
+                                continue
+                            
+                            validated_running_pods.append(pod)
+                            
+                            # Check if pod has health checks configured
+                            pod_has_health_checks_flag = pod_has_health_checks(pod, deployment_store)
+                            
+                            if pod_has_health_checks_flag:
+                                # Pod has health checks - must have health_status == 'ready' to be considered healthy
+                                health_status = pod.get('health_status')
+                                if health_status == 'ready':
+                                    validated_healthy_pods.append(pod)
+                            else:
+                                # Pod has no health checks - consider it healthy if it's RUNNING
+                                validated_healthy_pods.append(pod)
                         
                         current_healthy_count = len(validated_healthy_pods)
+                        total_running_count = len(validated_running_pods)
+                        
+                        logger.info(f"Deployment {namespace}/{deployment.get('name')}: total_running={total_running_count}, healthy={current_healthy_count}, min_replicas={min_replicas}")
                         
                         if current_healthy_count < min_replicas:
                             should_trigger_recovery = True
-                            recovery_reason = f"Deployment {namespace}/{deployment.get('name')} below min_replicas (healthy: {current_healthy_count}, required: {min_replicas})"
+                            recovery_reason = f"Deployment {namespace}/{deployment.get('name')} below min_replicas (healthy: {current_healthy_count}, total_running: {total_running_count}, required: {min_replicas})"
                             logger.warning(f"{recovery_reason}, triggering recovery")
+                            logger.info(f"Set should_trigger_recovery=True for deployment {namespace}/{deployment.get('name')}")
                             break
                     except Exception as e:
                         logger.debug(f"Failed to check pods for deployment {namespace}/{deployment.get('name')}: {e}")
@@ -1132,6 +1193,7 @@ async def check_all_pods_health_task(max_concurrency: int = 100) -> Dict[str, An
         
         min_replicas_check_time = time.time() - min_replicas_check_start
         logger.info(f"[TIMING] min_replicas_check: {min_replicas_check_time:.3f}s")
+        logger.info(f"should_trigger_recovery after min_replicas check: {should_trigger_recovery}")
         
         # Trigger deployment recovery if needed
         recovery_trigger_start = time.time()
