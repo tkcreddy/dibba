@@ -396,3 +396,76 @@ class RedisInterface:
             ) from e
         return url_list
 
+    # AWS Node Configuration Storage
+    @log_to_file(logger)
+    def save_aws_node_config(self, config: Dict[str, Any]) -> None:
+        """Save AWS node configuration to Redis.
+        
+        Only stores the 4 requested fields:
+            - ami_id: AMI ID
+            - key_name: Key pair name
+            - security_group_ids: List of security group IDs
+            - subnet_id: Subnet ID
+        
+        Args:
+            config: Dictionary containing AWS configuration (only the 4 fields above are stored)
+        """
+        # Only store the 4 requested fields
+        allowed_fields = ['ami_id', 'key_name', 'security_group_ids', 'subnet_id']
+        
+        # Store each field individually for easier updates
+        if 'ami_id' in config:
+            self.redis_client.hset("aws_node_config", "ami_id", config['ami_id'])
+        if 'key_name' in config:
+            self.redis_client.hset("aws_node_config", "key_name", config['key_name'])
+        if 'security_group_ids' in config:
+            self.redis_client.hset("aws_node_config", "security_group_ids", json.dumps(config['security_group_ids']))
+        if 'subnet_id' in config:
+            self.redis_client.hset("aws_node_config", "subnet_id", config['subnet_id'])
+        
+        stored_fields = [k for k in allowed_fields if k in config]
+        logger.info(f"Saved AWS node configuration to Redis: {stored_fields}")
+
+    @log_to_file(logger)
+    def get_aws_node_config(self) -> Optional[Dict[str, Any]]:
+        """Get AWS node configuration from Redis.
+        
+        Only returns the 4 requested fields:
+            - ami_id
+            - key_name
+            - security_group_ids
+            - subnet_id
+        
+        Returns:
+            Dictionary containing only the 4 requested AWS configuration fields, or None if not found
+        """
+        config_data = self.redis_client.hgetall("aws_node_config")
+        if not config_data:
+            return None
+        
+        # Only return the 4 requested fields
+        config = {}
+        if 'ami_id' in config_data:
+            config['ami_id'] = config_data['ami_id']
+        if 'key_name' in config_data:
+            config['key_name'] = config_data['key_name']
+        if 'security_group_ids' in config_data:
+            try:
+                config['security_group_ids'] = json.loads(config_data['security_group_ids'])
+            except (json.JSONDecodeError, TypeError):
+                # Handle legacy single-value or comma-separated format
+                if isinstance(config_data['security_group_ids'], list):
+                    config['security_group_ids'] = config_data['security_group_ids']
+                else:
+                    config['security_group_ids'] = [config_data['security_group_ids']]
+        if 'subnet_id' in config_data:
+            config['subnet_id'] = config_data['subnet_id']
+        
+        return config if config else None
+
+    @log_to_file(logger)
+    def delete_aws_node_config(self) -> None:
+        """Delete AWS node configuration from Redis."""
+        self.redis_client.delete("aws_node_config")
+        logger.info("Deleted AWS node configuration from Redis")
+

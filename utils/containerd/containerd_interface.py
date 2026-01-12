@@ -27,6 +27,11 @@ import base64
 import urllib.request
 import urllib.error
 import urllib.parse
+import threading
+import queue
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 from google.protobuf import any_pb2
@@ -81,6 +86,12 @@ CNI_BIN_DIR = os.environ.get("CNI_PATH", "/opt/cni/bin")
 CNI_CONF_DIR = os.environ.get("CNI_CONF_DIR", "/etc/cni/net.d")
 DEFAULT_CNI_NET_NAME = os.environ.get("CNI_NET_NAME", "calico")  # must match conflist "name"
 DEFAULT_IFNAME = os.environ.get("CNI_IFNAME", "eth0")
+
+# Kubernetes-style log defaults
+LOG_DIR = os.environ.get("CONTAINER_LOG_DIR", "/var/log/pods")
+DEFAULT_MAX_LOG_SIZE = int(os.environ.get("CONTAINER_MAX_LOG_SIZE", 10 * 1024 * 1024))  # 10MB default
+DEFAULT_MAX_LOG_FILES = int(os.environ.get("CONTAINER_MAX_LOG_FILES", 5))  # Keep 5 rotated files
+DEFAULT_LOG_TIMEOUT = 60  # seconds for log streaming timeout
 
 # ----- Media types -----
 OCI_INDEX   = "application/vnd.oci.image.index.v1+json"
@@ -1500,6 +1511,551 @@ class OciSpecBuilder:
         a.value = json.dumps(spec).encode("utf-8")
         return a
 
+# ========== Container Log Manager (FIFO-based, Kubernetes-style) ==========
+def _rfc3339_now() -> str:
+    """Get current timestamp in RFC3339 format with microseconds."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+class ContainerLogManager:
+    """
+    Kubernetes-like FIFO-based logging:
+      - containerd shim writes raw stdout/stderr into FIFOs (CreateTaskRequest stdout/stderr)
+      - Dibba reads FIFOs and writes CRI-style lines into 0.log
+      - optional rotation
+    """
+    
+    @log_to_file(logger)
+    def __init__(self, log_dir: str = LOG_DIR, 
+                 max_log_size: int = DEFAULT_MAX_LOG_SIZE,
+                 max_log_files: int = DEFAULT_MAX_LOG_FILES):
+        self.log_dir = log_dir
+        self.max_bytes = max_log_size
+        self.max_files = max_log_files
+        self._started = set()  # keys we've started streaming for
+        
+        # Ensure log directory exists
+        os.makedirs(self.log_dir, mode=0o755, exist_ok=True)
+    
+    @log_to_file(logger)
+    def _mkfifo(self, path: str):
+        """Create FIFO (named pipe) for container logging."""
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        if os.path.exists(path):
+            try:
+                st = os.stat(path)
+                if not stat.S_ISFIFO(st.st_mode):
+                    os.remove(path)
+                    os.mkfifo(path, 0o600)
+            except Exception:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                os.mkfifo(path, 0o600)
+        else:
+            os.mkfifo(path, 0o600)
+    
+    @log_to_file(logger)
+    def _rotate_if_needed(self, log_file: str):
+        """Rotate log file if it exceeds max_bytes."""
+        try:
+            if os.path.getsize(log_file) < self.max_bytes:
+                return
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+        
+        # Rotate: (max_files-1).log -> max_files.log, ..., 0.log -> 1.log
+        for i in range(self.max_files, 0, -1):
+            src = log_file.replace("0.log", f"{i-1}.log") if i > 1 else log_file
+            dst = log_file.replace("0.log", f"{i}.log")
+            if os.path.exists(src):
+                try:
+                    os.replace(src, dst)
+                except Exception:
+                    pass
+        
+        # Recreate 0.log
+        try:
+            with open(log_file, "a", encoding="utf-8"):
+                pass
+        except Exception:
+            pass
+    
+    @log_to_file(logger)
+    def _write_cri(self, log_file: str, stream: str, flag: str, msg: str):
+        """Write CRI-formatted log entry: '<ts> <stdout|stderr> <F|P> <message>'"""
+        ts = _rfc3339_now()
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"{ts} {stream} {flag} {msg}")
+        except Exception:
+            pass
+    
+    @log_to_file(logger)
+    def _pump_fifo(self, fifo_path: str, log_file: str, stream_name: str):
+        """Read bytes from FIFO and write CRI formatted lines to log file."""
+        while True:
+            try:
+                # Blocks until writer opens the FIFO (containerd shim)
+                with open(fifo_path, "rb", buffering=0) as r:
+                    buf = b""
+                    while True:
+                        chunk = r.read(4096)
+                        if not chunk:
+                            time.sleep(0.05)
+                            continue
+                        buf += chunk
+                        
+                        while True:
+                            nl = buf.find(b"\n")
+                            if nl == -1:
+                                # no full line yet
+                                if buf:
+                                    self._write_cri(
+                                        log_file, stream_name, "P",
+                                        buf.decode("utf-8", "replace")
+                                    )
+                                    buf = b""
+                                    self._rotate_if_needed(log_file)
+                                break
+                            
+                            line = buf[:nl + 1]
+                            buf = buf[nl + 1:]
+                            self._write_cri(
+                                log_file, stream_name, "F",
+                                line.decode("utf-8", "replace")
+                            )
+                            self._rotate_if_needed(log_file)
+            except Exception:
+                time.sleep(0.2)
+    
+    @log_to_file(logger)
+    def prepare_paths(self, namespace: str, pod: str, container_name: str, cid: str) -> Dict[str, str]:
+        """
+        Prepare FIFO paths and log file paths for container logging.
+        
+        Returns:
+            Dict with 'dir', 'stdout_fifo', 'stderr_fifo', 'log_file', 'symlink'
+        """
+        # Kubernetes uses /var/log/pods/<ns>_<pod>_<uid>/<container>/0.log
+        # Use cid to keep uniqueness (since we don't have a separate UID)
+        base = os.path.join(self.log_dir, f"{namespace}_{pod}_{cid}", container_name)
+        stdout_fifo = os.path.join(base, "stdout.fifo")
+        stderr_fifo = os.path.join(base, "stderr.fifo")
+        log_file = os.path.join(base, "0.log")
+        
+        self._mkfifo(stdout_fifo)
+        self._mkfifo(stderr_fifo)
+        
+        # Optional /containers view (handy for tailing)
+        containers_dir = os.path.join(self.log_dir, "..", "containers")
+        os.makedirs(containers_dir, mode=0o755, exist_ok=True)
+        symlink = os.path.join(containers_dir, f"{pod}_{namespace}_{container_name}-{cid}.log")
+        try:
+            if not os.path.exists(symlink):
+                os.symlink(log_file, symlink)
+        except Exception:
+            pass
+        
+        return {
+            "dir": base,
+            "stdout_fifo": stdout_fifo,
+            "stderr_fifo": stderr_fifo,
+            "log_file": log_file,
+            "symlink": symlink,
+        }
+    
+    @log_to_file(logger)
+    def start_streaming(self, key: str, stdout_fifo: str, stderr_fifo: str, log_file: str):
+        """Start background threads to read from FIFOs and write to log file."""
+        if key in self._started:
+            return
+        self._started.add(key)
+        
+        t1 = threading.Thread(target=self._pump_fifo, args=(stdout_fifo, log_file, "stdout"), daemon=True)
+        t2 = threading.Thread(target=self._pump_fifo, args=(stderr_fifo, log_file, "stderr"), daemon=True)
+        t1.start()
+        t2.start()
+    
+    @log_to_file(logger)
+    def _get_pod_log_path(self, namespace: str, pod_name: str, pod_uid: str, 
+                          container_name: str, instance: int = 0) -> str:
+        """
+        Generate Kubernetes-style log path (for compatibility with read_logs):
+        /var/log/pods/<namespace>_<pod-name>_<pod-uid>/<container-name>/<instance>.log
+        """
+        pod_dir_name = f"{namespace}_{pod_name}_{pod_uid}"
+        pod_path = os.path.join(self.log_dir, pod_dir_name, container_name)
+        os.makedirs(pod_path, mode=0o755, exist_ok=True)
+        return os.path.join(pod_path, f"{instance}.log")
+    
+    @log_to_file(logger)
+    def _sanitize_for_filename(self, name: str) -> str:
+        """Sanitize name for use in file paths (Kubernetes-style)."""
+        invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+        sanitized = name
+        for char in invalid_chars:
+            sanitized = sanitized.replace(char, '_')
+        return sanitized
+    
+    @log_to_file(logger)
+    def stop_logging(self, container_id: str) -> None:
+        """Stop logging for a container (for backward compatibility)."""
+        # With FIFO-based logging, streams stop automatically when container exits
+        # This method is kept for backward compatibility but doesn't need to do anything
+        pass
+    
+    @log_to_file(logger)
+    def get_log_path(self, namespace: str, pod_name: str, pod_uid: str, 
+                    container_name: str, instance: int = 0) -> Optional[str]:
+        """Get the log file path for a container (without starting logging)."""
+        sanitized_pod_name = self._sanitize_for_filename(pod_name)
+        sanitized_container_name = self._sanitize_for_filename(container_name)
+        log_path = self._get_pod_log_path(namespace, sanitized_pod_name, pod_uid, 
+                                          sanitized_container_name, instance)
+        return log_path if os.path.exists(log_path) else None
+    
+    @log_to_file(logger)
+    def read_logs(self, namespace: str, pod_name: str, pod_uid: str,
+                  container_name: str, instance: int = 0,
+                  tail_lines: Optional[int] = None,
+                  follow: bool = False,
+                  since: Optional[datetime] = None,
+                  limit_bytes: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Read container logs (similar to kubectl logs).
+        
+        Args:
+            namespace: Kubernetes namespace
+            pod_name: Pod name
+            pod_uid: Pod UID
+            container_name: Container name
+            instance: Container instance number
+            tail_lines: Number of lines to tail (like --tail)
+            follow: If True, follow logs (like --follow)
+            since: Only return logs after this timestamp (like --since-time)
+            limit_bytes: Maximum bytes to return (like --limit-bytes)
+            
+        Returns:
+            Dict with 'logs' (list of log entries) and 'metadata'
+        """
+        sanitized_pod_name = self._sanitize_for_filename(pod_name)
+        sanitized_container_name = self._sanitize_for_filename(container_name)
+        log_path = self._get_pod_log_path(namespace, sanitized_pod_name, pod_uid, 
+                                          sanitized_container_name, instance)
+        
+        if not os.path.exists(log_path):
+            # Check rotated logs
+            rotated_paths = [f"{log_path}.{i}" for i in range(1, self.max_files + 1)]
+            all_paths = [log_path] + rotated_paths
+        else:
+            all_paths = [log_path]
+        
+        logs = []
+        total_bytes = 0
+        
+        # Read from rotated files in reverse order (newest first)
+        for path in reversed(all_paths):
+            if not os.path.exists(path):
+                continue
+            
+            try:
+                with open(path, 'rb') as f:
+                    # For tail_lines, we need to read from end
+                    if tail_lines is not None:
+                        # Seek to end, then read backwards
+                        f.seek(0, 2)  # Seek to end
+                        file_size = f.tell()
+                        if file_size == 0:
+                            continue
+                        
+                        # Read in chunks from end
+                        chunk_size = min(8192, file_size)
+                        chunks = []
+                        lines_read = 0
+                        pos = max(0, file_size - chunk_size)
+                        
+                        while pos >= 0 and lines_read < tail_lines:
+                            f.seek(pos)
+                            chunk = f.read(min(chunk_size, file_size - pos))
+                            if pos > 0:
+                                # Skip partial line at start
+                                newline_pos = chunk.find(b'\n')
+                                if newline_pos >= 0:
+                                    chunk = chunk[newline_pos + 1:]
+                            
+                            # Count lines in chunk
+                            chunk_lines = chunk.count(b'\n')
+                            lines_read += chunk_lines
+                            chunks.insert(0, chunk)
+                            
+                            if pos == 0:
+                                break
+                            pos = max(0, pos - chunk_size)
+                        
+                        # Combine chunks and split into lines
+                        content = b''.join(chunks)
+                        lines = content.split(b'\n')
+                        # Take last tail_lines
+                        lines = lines[-tail_lines:] if len(lines) > tail_lines else lines
+                    else:
+                        # Read entire file
+                        content = f.read()
+                        lines = content.split(b'\n')
+                        # Remove empty last line if file ends with newline
+                        if lines and not lines[-1]:
+                            lines.pop()
+                    
+                    # Filter by timestamp if since is provided
+                    if since:
+                        filtered_lines = []
+                        since_str = since.strftime('%Y-%m-%dT%H:%M:%S').encode('utf-8')
+                        for line in lines:
+                            if len(line) > len(since_str) and line[:len(since_str)] >= since_str:
+                                filtered_lines.append(line)
+                        lines = filtered_lines
+                    
+                    # Apply limit_bytes
+                    for line in lines:
+                        line_bytes = len(line) + 1  # +1 for newline
+                        if limit_bytes and total_bytes + line_bytes > limit_bytes:
+                            break
+                        logs.append(line)
+                        total_bytes += line_bytes
+                    
+                    # If we've read enough, stop
+                    if tail_lines and len(logs) >= tail_lines:
+                        break
+                    if limit_bytes and total_bytes >= limit_bytes:
+                        break
+                        
+            except Exception as e:
+                logger.warning(f"Failed to read log file {path}: {e}")
+                continue
+        
+        # Sort by timestamp (logs should already be mostly sorted, but be safe)
+        def extract_timestamp(log_entry: bytes) -> str:
+            # Extract timestamp from log entry: "<timestamp> <stream> <data>"
+            parts = log_entry.split(b' ', 2)
+            if len(parts) >= 2:
+                return parts[0].decode('utf-8', errors='ignore')
+            return ''
+        
+        logs.sort(key=extract_timestamp)
+        
+        # Take only tail_lines if specified
+        if tail_lines and len(logs) > tail_lines:
+            logs = logs[-tail_lines:]
+        
+        return {
+            'logs': logs,
+            'total_bytes': total_bytes,
+            'log_path': log_path,
+            'follow': follow,  # Note: follow mode requires separate streaming implementation
+        }
+
+
+class _ContainerLogWriter:
+    """
+    Internal class that handles actual log writing for a container.
+    Uses background threads to capture stdout/stderr from containerd shim.
+    """
+    
+    def __init__(self, container_id: str, log_path: str, namespace: str,
+                 pod_name: str, container_name: str, pid: Optional[int],
+                 max_log_size: int, max_log_files: int,
+                 combine_streams: bool,
+                 format_entry: callable,
+                 rotate_log: callable):
+        self.container_id = container_id
+        self.log_path = log_path
+        self.namespace = namespace
+        self.pod_name = pod_name
+        self.container_name = container_name
+        self.pid = pid
+        self.max_log_size = max_log_size
+        self.max_log_files = max_log_files
+        self.combine_streams = combine_streams
+        self.format_entry = format_entry
+        self.rotate_log = rotate_log
+        
+        self._stop_event = threading.Event()
+        self._threads: List[threading.Thread] = []
+        self._file_lock = threading.Lock()
+        self._log_file = None
+    
+    def start(self):
+        """Start background threads to capture logs."""
+        # Open log file
+        os.makedirs(os.path.dirname(self.log_path), mode=0o755, exist_ok=True)
+        self._log_file = open(self.log_path, 'ab', buffering=0)  # Unbuffered for real-time
+        
+        # Try to capture from containerd shim stdout/stderr
+        # Method 1: Read from shim's log files (if available)
+        stdout_path = os.path.join(self.shim_base_path, "stdout")
+        stderr_path = os.path.join(self.shim_base_path, "stderr")
+        
+        # Method 2: Use containerd Tasks.IO API if available (would require gRPC streaming)
+        # For now, we'll use a polling approach with the PID's file descriptors
+        
+        if self.pid and os.path.exists(f"/proc/{self.pid}"):
+            # Capture from /proc/<pid>/fd/1 (stdout) and /proc/<pid>/fd/2 (stderr)
+            self._start_fd_capture()
+        elif os.path.exists(stdout_path) or os.path.exists(stderr_path):
+            # Capture from shim log files
+            self._start_shim_file_capture(stdout_path, stderr_path)
+        else:
+            # Fallback: Periodic log rotation check only (logs will be captured by other means)
+            self._start_rotation_monitor()
+    
+    def _start_fd_capture(self):
+        """Capture logs from container's file descriptors."""
+        if not self.pid:
+            return
+        
+        def capture_fd(fd_num: int, stream_name: str):
+            fd_path = f"/proc/{self.pid}/fd/{fd_num}"
+            if not os.path.exists(fd_path):
+                logger.warning(f"FD {fd_path} does not exist for container {self.container_id}")
+                return
+            
+            try:
+                # Open the fd (read-only)
+                with open(fd_path, 'rb') as fd_file:
+                    buffer = b''
+                    while not self._stop_event.is_set():
+                        try:
+                            data = fd_file.read(4096)
+                            if not data:
+                                time.sleep(0.1)
+                                continue
+                            
+                            buffer += data
+                            # Process complete lines
+                            while b'\n' in buffer:
+                                line, buffer = buffer.split(b'\n', 1)
+                                self._write_log(stream_name, line + b'\n')
+                        except (IOError, OSError) as e:
+                            if "No such file" in str(e) or "Bad file descriptor" in str(e):
+                                # Process/container has exited
+                                break
+                            time.sleep(0.1)
+                    
+                    # Write remaining buffer
+                    if buffer:
+                        self._write_log(stream_name, buffer)
+            except Exception as e:
+                logger.warning(f"Failed to capture {stream_name} for {self.container_id}: {e}")
+        
+        # Start capture threads for stdout and stderr
+        if not self.combine_streams:
+            t1 = threading.Thread(target=capture_fd, args=(1, 'stdout'), daemon=True)
+            t2 = threading.Thread(target=capture_fd, args=(2, 'stderr'), daemon=True)
+            t1.start()
+            t2.start()
+            self._threads = [t1, t2]
+        else:
+            t1 = threading.Thread(target=capture_fd, args=(1, 'stdout'), daemon=True)
+            t1.start()
+            self._threads = [t1]
+    
+    def _start_shim_file_capture(self, stdout_path: str, stderr_path: str):
+        """Capture logs from containerd shim log files."""
+        def tail_file(file_path: str, stream_name: str):
+            if not os.path.exists(file_path):
+                return
+            
+            try:
+                with open(file_path, 'rb') as f:
+                    # Seek to end (tail mode)
+                    f.seek(0, 2)
+                    while not self._stop_event.is_set():
+                        line = f.readline()
+                        if line:
+                            self._write_log(stream_name, line)
+                        else:
+                            time.sleep(0.1)
+            except Exception as e:
+                logger.warning(f"Failed to tail {file_path} for {self.container_id}: {e}")
+        
+        if os.path.exists(stdout_path):
+            t1 = threading.Thread(target=tail_file, args=(stdout_path, 'stdout'), daemon=True)
+            t1.start()
+            self._threads.append(t1)
+        
+        if os.path.exists(stderr_path) and not self.combine_streams:
+            t2 = threading.Thread(target=tail_file, args=(stderr_path, 'stderr'), daemon=True)
+            t2.start()
+            self._threads.append(t2)
+    
+    @property
+    def shim_base_path(self):
+        """Get shim base path."""
+        return f"/run/containerd/io.containerd.runtime.v2.task/{self.namespace}/{self.container_id}"
+    
+    def _start_rotation_monitor(self):
+        """Monitor log file for rotation needs."""
+        def monitor():
+            while not self._stop_event.is_set():
+                time.sleep(60)  # Check every minute
+                try:
+                    with self._file_lock:
+                        self.rotate_log(self.log_path)
+                except Exception:
+                    pass
+        
+        t = threading.Thread(target=monitor, daemon=True)
+        t.start()
+        self._threads.append(t)
+    
+    def _write_log(self, stream: str, data: bytes):
+        """Write log entry to file (thread-safe)."""
+        if not data:
+            return
+        
+        with self._file_lock:
+            try:
+                # Check if rotation is needed
+                if os.path.exists(self.log_path) and os.path.getsize(self.log_path) >= self.max_log_size:
+                    self._log_file.close()
+                    self.rotate_log(self.log_path)
+                    self._log_file = open(self.log_path, 'ab', buffering=0)
+                
+                # Format and write log entry
+                entry = self.format_entry(stream, data)
+                self._log_file.write(entry)
+                self._log_file.flush()
+            except Exception as e:
+                logger.warning(f"Failed to write log for {self.container_id}: {e}")
+    
+    def stop(self):
+        """Stop log capture."""
+        self._stop_event.set()
+        for thread in self._threads:
+            thread.join(timeout=2.0)
+        
+        with self._file_lock:
+            if self._log_file:
+                try:
+                    self._log_file.close()
+                except Exception:
+                    pass
+    
+    def info(self) -> Dict[str, Any]:
+        """Get writer information."""
+        return {
+            'container_id': self.container_id,
+            'log_path': self.log_path,
+            'namespace': self.namespace,
+            'pod_name': self.pod_name,
+            'container_name': self.container_name,
+            'pid': self.pid,
+        }
+
+
 # ========== CNI Manager ==========
 class CniManager:
     """
@@ -1681,9 +2237,10 @@ class CniManager:
 # ========== Container/Task ==========
 class RuntimeManager:
     @log_to_file(logger)
-    def __init__(self, client: ContainerdClient, snapshot_mgr: SnapshotManager):
+    def __init__(self, client: ContainerdClient, snapshot_mgr: SnapshotManager, logs: Optional[ContainerLogManager] = None):
         self.c = client
         self.snapshots = snapshot_mgr
+        self.logs = logs or ContainerLogManager()
 
     @log_to_file(logger)
     def _any_to_dict(self, a: any_pb2.Any) -> dict:
@@ -2037,15 +2594,45 @@ class RuntimeManager:
         )
 
     @log_to_file(logger)
-    def start_task(self, cid: str, mounts, tty: bool = False, create_timeout=15.0, start_timeout=30.0) -> int:
+    def start_task(self,
+                   cid: str,
+                   mounts,
+                   tty: bool = False,
+                   create_timeout=15.0,
+                   start_timeout=30.0,
+                   # NEW: metadata for log directory layout
+                   namespace: str | None = None,
+                   pod: str | None = None,
+                   container_name: str | None = None) -> int:
+        # If tty=True, stdout/stderr are generally merged; keep old behavior.
+        stdout_path = ""
+        stderr_path = ""
+        log_info = None
+        
+        # Enable Dibba-style logging if we have enough info and tty is off
+        if (not tty) and pod and container_name:
+            ns = namespace or getattr(self.c, "namespace", "default")
+            log_info = self.logs.prepare_paths(ns, pod, container_name, cid)
+            
+            # IMPORTANT:
+            # containerd shim expects paths; FIFOs work well here.
+            stdout_path = log_info["stdout_fifo"]
+            stderr_path = log_info["stderr_fifo"]
+            
+            key = f"{ns}/{pod}/{container_name}/{cid}"
+            self.logs.start_streaming(key, stdout_path, stderr_path, log_info["log_file"])
+            logger.info(f"[logs] {cid} -> {log_info['log_file']} (symlink={log_info.get('symlink')})")
+        
         create_req = tasks_pb2.CreateTaskRequest(
             container_id=cid,
             terminal=tty,
-            rootfs=mounts
+            rootfs=mounts,
+            stdout=stdout_path,
+            stderr=stderr_path,
         )
+        
         self.c.tasks.Create(create_req, timeout=create_timeout)
-        resp = self.c.tasks.Start(tasks_pb2.StartRequest(container_id=cid),
-                                   timeout=start_timeout)
+        resp = self.c.tasks.Start(tasks_pb2.StartRequest(container_id=cid), timeout=start_timeout)
         return resp.pid
 
     @log_to_file(logger)
@@ -2281,12 +2868,14 @@ class RuntimeManager:
 # ========== Pod Manager ==========
 class PodManager:
     @log_to_file(logger)
-    def __init__(self, client: ContainerdClient):
+    def __init__(self, client: ContainerdClient, log_manager: Optional[ContainerLogManager] = None):
         self.c = client
         self.images = ImageResolver(client)
         self.snaps = SnapshotManager(client)
-        self.runtime = RuntimeManager(client, self.snaps)
+        log_mgr = log_manager or ContainerLogManager()
+        self.runtime = RuntimeManager(client, self.snaps, logs=log_mgr)
         self.cni = CniManager()
+        self.log_manager = log_mgr
 
     @log_to_file(logger)
     def pull_image(self, image_ref: str, username: str | None = None, password: str | None = None ) -> dict:
@@ -2839,7 +3428,12 @@ class PodManager:
         )
         cid = f"{name}"
         self.runtime.create_container(cid, pause_image, spec_any, labels={"pod": name, "role": "pause"})
-        pid = self.runtime.start_task(cid, mounts)
+        pid = self.runtime.start_task(
+            cid, mounts,
+            namespace=self.c.namespace,
+            pod=name,
+            container_name="pause"
+        )
 
         ns_base = f"/proc/{pid}/ns"
         ns_paths = {k: f"{ns_base}/{k}" for k in ["pid", "net", "ipc", "uts"]}
@@ -2879,13 +3473,25 @@ class PodManager:
         chain_id = self.images.chain_id_for_image(image)
         mounts, snap_key = self.snaps.prepare_rw_snapshot(chain_id, f"{pod_name}-{name}-rootfs",labels={"pod": pod_name, "app": name})
 
-        if args is None:
+        # Handle empty args - normalize empty list to None
+        # Empty args [] would fail at runc level with "args must not be empty"
+        # This ensures we use image Entrypoint/Cmd as fallback
+        if args is None or (isinstance(args, list) and len(args) == 0):
+            logger.debug(f"Container {name}: args is None or empty, extracting Entrypoint/Cmd from image {image}")
             mdesc = self.images.resolve_manifest(image)
             _, cfg = self.images.load_manifest_and_config(mdesc)
             args = list((cfg.get("config") or {}).get("Entrypoint") or [])
             args += list((cfg.get("config") or {}).get("Cmd") or [])
             if not args:
+                # Fallback: use a safe default command if image has no Entrypoint/Cmd
                 args = ["/bin/sh", "-c", "trap : TERM INT; sleep infinity & wait"]
+                logger.warning(f"Container {name}: image {image} has no Entrypoint/Cmd, using fallback: {args}")
+            else:
+                logger.debug(f"Container {name}: extracted args from image: {args}")
+        
+        # Final validation: ensure args is not empty before creating container
+        if not args or (isinstance(args, list) and len(args) == 0):
+            raise ValueError(f"Container {name} cannot be created: args must not be empty. Image: {image}")
 
         namespaces = [
             {"type": "pid", "path": pod_ns["pid"]},
@@ -2904,8 +3510,14 @@ class PodManager:
         )
         cid = f"{pod_name}-{name}"
         self.runtime.create_container(cid, image, spec_any, labels={"pod": pod_name, "app": name,"role": "app"})
-        pid = self.runtime.start_task(cid, mounts)
+        pid = self.runtime.start_task(
+            cid, mounts,
+            namespace=self.c.namespace,
+            pod=pod_name,
+            container_name=name
+        )
         logger.info(f"App started: cid={cid}, pid={pid}, image={image}, mounts={len(volume_mounts) if volume_mounts else 0}")
+        
         return {"cid": cid, "pid": pid, "snapshot_key": snap_key}
 
     @log_to_file(logger)
@@ -2936,6 +3548,7 @@ class PodManager:
     def delete_container(self, app: Dict) -> None:
         """
         Delete an app container:
+          - stop logging
           - stop & delete task
           - delete container object
           - remove active snapshot key
@@ -2943,6 +3556,14 @@ class PodManager:
         """
         cid = app.get("cid")
         snap_key = app.get("snapshot_key")
+        
+        # Stop logging for this container
+        if self.log_manager and cid:
+            try:
+                self.log_manager.stop_logging(cid)
+            except Exception as e:
+                logger.warning(f"Failed to stop logging for container {cid}: {e}")
+        
         if not cid:
             logger.warning("[cleanup] app has no 'cid'; skipping task/container delete")
         else:
@@ -3010,12 +3631,19 @@ class PodManager:
         else:
             logger.debug("[cleanup] skip CNI DEL (missing pause cid or network name)")
 
-        # 3) Stop & delete the pause task/container
+        # 3) Stop logging for pause container
+        if self.log_manager and pause_cid:
+            try:
+                self.log_manager.stop_logging(pause_cid)
+            except Exception as e:
+                logger.warning(f"Failed to stop logging for pause container {pause_cid}: {e}")
+        
+        # 4) Stop & delete the pause task/container
         if pause_cid:
             logger.debug(f"[cleanup] stopping pause container: {pause_cid}")
             self.runtime.stop_and_delete_task(pause_cid)
 
-        # 4) Remove the pause snapshot key (stored as pod['snapshot_key'])
+        # 5) Remove the pause snapshot key (stored as pod['snapshot_key'])
         snap_key = pod.get("snapshot_key")
         if snap_key:
             try:
@@ -3024,7 +3652,7 @@ class PodManager:
             except Exception as e:
                 logger.warning(f"[cleanup] pause snapshot remove warning ({snap_key}): {e}", exc_info=True)
 
-        # 5) Sweep any remaining active snapshots for this pod (even if we lost individual keys)
+        # 6) Sweep any remaining active snapshots for this pod (even if we lost individual keys)
         try:
             res = self.snaps.remove_active_by_label({"pod": pod["name"]})
             if res["removed"]:
@@ -3033,6 +3661,42 @@ class PodManager:
                 logger.debug(f"[cleanup] could not remove some snapshots (likely parents/pinned): {res['kept']}")
         except Exception as e:
             logger.warning(f"[cleanup] snapshot label sweep warning: {e}", exc_info=True)
+    
+    @log_to_file(logger)
+    def read_container_logs(self, namespace: str, pod_name: str, pod_uid: str,
+                           container_name: str, instance: int = 0,
+                           tail_lines: Optional[int] = None,
+                           follow: bool = False,
+                           since: Optional[datetime] = None,
+                           limit_bytes: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Read container logs (similar to kubectl logs).
+        
+        Args:
+            namespace: Kubernetes namespace
+            pod_name: Pod name
+            pod_uid: Pod UID
+            container_name: Container name
+            instance: Container instance number (default: 0)
+            tail_lines: Number of lines to tail (like --tail)
+            follow: If True, follow logs (like --follow) - Note: requires separate streaming implementation
+            since: Only return logs after this timestamp (like --since-time)
+            limit_bytes: Maximum bytes to return (like --limit-bytes)
+            
+        Returns:
+            Dict with 'logs' (list of log entries) and 'metadata'
+        """
+        return self.log_manager.read_logs(
+            namespace=namespace,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            container_name=container_name,
+            instance=instance,
+            tail_lines=tail_lines,
+            follow=follow,
+            since=since,
+            limit_bytes=limit_bytes
+        )
 
 
 

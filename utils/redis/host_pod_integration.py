@@ -172,6 +172,10 @@ class HostPodIntegration:
             creation_time = pod_result.get("creation_time")
             startup_time = pod_result.get("startup_time")
             
+            # Determine pod status from application containers (not pause container)
+            # If no containers, will fall back to pause container status via save_pod
+            pod_status = self.store._determine_pod_status_from_containers(containers, pause_container)
+            
             # Save pod information
             self.store.save_pod(
                 pod_id=pod_id,
@@ -183,7 +187,7 @@ class HostPodIntegration:
                 containers=containers,
                 cni_network=cni,
                 labels=labels,
-                status="running",
+                status=pod_status,  # Use application container status
                 creation_time=creation_time,
                 startup_time=startup_time
             )
@@ -375,6 +379,10 @@ class HostPodIntegration:
                 else:
                     logger.debug(f"No IP address found in pod_data for pod {pod_id}")
                 
+                # Determine pod status from application containers (not pause container)
+                # If no containers, will fall back to pause container status via save_pod
+                pod_status = self.store._determine_pod_status_from_containers(containers, pause)
+                
                 # Save pod information
                 try:
                     self.store.save_pod(
@@ -385,7 +393,7 @@ class HostPodIntegration:
                         pause_container=pause,
                         containers=containers,
                         labels=labels,  # Include labels (preserved from existing pod or from deployment store)
-                        status=pause.get("status", "unknown"),
+                        status=pod_status,  # Use application container status
                         creation_time=creation_time,
                         startup_time=startup_time
                     )

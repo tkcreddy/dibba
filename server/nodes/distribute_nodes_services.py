@@ -437,7 +437,17 @@ def get_worker_nodes_from_redis(
 
 class ClusterWorkerDistribution:
     @log_to_file(logger)
-    def __init__(self, worker_nodes: list[dict[str, int]], cluster_infos: dict[str, dict[str, int]]) -> None:
+    def __init__(self, worker_nodes: list[dict[str, int]], cluster_infos: dict[str, dict[str, int]], existing_pods_per_host: Optional[Dict[str, Dict[str, int]]] = None) -> None:
+        """
+        Initialize ClusterWorkerDistribution.
+        
+        Args:
+            worker_nodes: List of worker nodes with 'cpu', 'memory', and optionally 'hostname'
+            cluster_infos: Dictionary mapping service names to their resource requirements
+            existing_pods_per_host: Optional dictionary mapping hostname to service name to count of existing pods
+                                   Format: {hostname: {service_name: count}}
+                                   This helps ensure distribution across hosts by avoiding hosts with existing pods
+        """
         if not isinstance(worker_nodes, list):
             logger.error("Error: Worker nodes must be a list.")
             return
@@ -446,6 +456,7 @@ class ClusterWorkerDistribution:
             return
         self.worker_nodes = worker_nodes
         self.cluster_infos = cluster_infos
+        self.existing_pods_per_host = existing_pods_per_host or {}
 
     @log_to_file(logger)
     def calculate_nodes_needed(self) -> int:
@@ -525,6 +536,10 @@ class ClusterWorkerDistribution:
         sorted_instances = sorted(all_instances,
                                   key=lambda item: total_cpu_per_cluster[item[0]] + total_memory_per_cluster[item[0]],
                                   reverse=True)
+        
+        # Track how many instances of each service are already placed on each node
+        # This helps ensure we distribute replicas across different hosts
+        service_counts_per_node = {i: {} for i in range(num_nodes)}
 
         # Track which nodes have instances of each service for load balancing
         service_node_counts = {}  # {service_name: {node_index: count}}
@@ -538,7 +553,16 @@ class ClusterWorkerDistribution:
             if service_name not in service_node_counts:
                 service_node_counts[service_name] = {}
                 for i in range(num_nodes):
-                    service_node_counts[service_name][i] = 0
+                    # Start with existing pod counts if available
+                    hostname = self.worker_nodes[i].get('hostname') if i < len(self.worker_nodes) else None
+                    existing_count = 0
+                    if hostname and self.existing_pods_per_host:
+                        # Get existing pod count for this service on this host
+                        host_pods = self.existing_pods_per_host.get(hostname, {})
+                        existing_count = host_pods.get(service_name, 0)
+                    service_node_counts[service_name][i] = existing_count
+                    if existing_count > 0:
+                        logger.info(f"Node {i} ({hostname}) already has {existing_count} existing instance(s) of {service_name}")
             
             logger.info(f"Placing {service_name} instance {instance_num} (CPU: {requirements['cpu']}, Memory: {requirements['memory']})")
 

@@ -528,9 +528,18 @@ def create_aws_nodes_if_needed_task(evaluation_result: Dict[str, Any]) -> Dict[s
         required_nodes = evaluation_result.get('required_nodes', 1)
         namespace = deployment.get('namespace', 'default')
         
-        # Get AWS config
+        # Get AWS config (from Redis with fallback to config file)
+        # Only the 4 requested fields (ami_id, key_name, security_group_ids, subnet_id) come from Redis
+        # instance_type and region still come from config.json
+        from utils.aws.config_helper import get_aws_node_config
+        node_config = get_aws_node_config()  # Only the 4 requested fields from Redis
         read_config = rc()
-        aws_config = read_config.aws_config
+        file_aws_config = read_config.aws_config  # For instance_type and region
+        
+        # Merge: node_config (4 fields from Redis) + instance_type/region from config file
+        aws_config = node_config.copy() if node_config else {}
+        aws_config['instance_type'] = file_aws_config.get('instance_type', 't3.medium')
+        aws_config['region'] = file_aws_config.get('region')
         
         # Create AWS queue info for routing to AWS worker
         key = read_config.encryption_config['key']
@@ -901,11 +910,18 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                     # Build container specs with resources
                     container_specs = []
                     for container in resolved_containers:
+                        # Normalize args: if not provided or empty list, set to None
+                        # Empty args [] would fail at runc level with "args must not be empty"
+                        # None allows fallback logic to extract Entrypoint/Cmd from image
+                        container_args = container.get('args')
+                        if container_args is None or (isinstance(container_args, list) and len(container_args) == 0):
+                            container_args = None
+                        
                         container_spec = {
                             'image': container.get('image'),
                             'name': container.get('name'),
                             'command': container.get('command'),
-                            'args': container.get('args'),
+                            'args': container_args,  # None if not provided or empty, otherwise use as-is
                             'env': container.get('env'),
                             'resources': {
                                 'cpu_millicores': pod_cpu,
@@ -1001,11 +1017,18 @@ def place_and_create_pods_task(evaluation_result: Dict[str, Any]) -> Dict[str, A
                     # Build container specs with resources
                     container_specs = []
                     for container in resolved_containers:
+                        # Normalize args: if not provided or empty list, set to None
+                        # Empty args [] would fail at runc level with "args must not be empty"
+                        # None allows fallback logic to extract Entrypoint/Cmd from image
+                        container_args = container.get('args')
+                        if container_args is None or (isinstance(container_args, list) and len(container_args) == 0):
+                            container_args = None
+                        
                         container_spec = {
                             'image': container.get('image'),
                             'name': container.get('name'),
                             'command': container.get('command'),
-                            'args': container.get('args'),
+                            'args': container_args,  # None if not provided or empty, otherwise use as-is
                             'env': container.get('env'),
                             'resources': {
                                 'cpu_millicores': resource_requirements.cpu_millicores,

@@ -91,6 +91,12 @@ class HostPodConsumer:
     def process_queue(self, max_messages: Optional[int] = None) -> Dict[str, Any]:
         """Process messages from the queue.
         
+        This consumer is COMPLETELY INDEPENDENT of producers:
+        - Reads from Redis queue using RPOP (non-blocking)
+        - Processes messages that were queued by producers (even while consumer was down)
+        - Producers don't need to be restarted when consumer restarts
+        - Messages accumulate in queue when consumer is offline and are processed on restart
+        
         Args:
             max_messages: Maximum number of messages to process (None for unlimited)
             
@@ -101,16 +107,25 @@ class HostPodConsumer:
         error_count = 0
         running = True
         
+        # Get initial queue size for logging
+        initial_queue_size = self.get_queue_size()
+        if initial_queue_size > 0:
+            logger.info(
+                f"Starting consumer - {initial_queue_size} messages already in queue "
+                f"(producers queued messages independently while consumer was offline)"
+            )
+        
         try:
             while running:
                 if max_messages and processed_count >= max_messages:
                     break
                 
-                # Get batch of messages
+                # Get batch of messages from Redis queue (non-blocking, independent of producers)
                 messages = self._get_batch()
                 
                 if not messages:
                     # No messages, wait before next poll
+                    # This is normal - producers queue messages independently
                     time.sleep(self.poll_interval)
                     continue
                 
@@ -124,10 +139,13 @@ class HostPodConsumer:
                 self.stats["errors"] += batch_errors
                 self.stats["last_processed"] = datetime.now(timezone.utc).isoformat()
                 
+                # Get current queue size for logging
+                remaining_queue_size = self.get_queue_size()
+                
                 logger.info(
                     f"Processed batch: {batch_processed} messages, "
                     f"{batch_errors} errors (total processed: {processed_count}, "
-                    f"total errors: {error_count})"
+                    f"total errors: {error_count}, queue remaining: {remaining_queue_size})"
                 )
         
         except KeyboardInterrupt:
@@ -138,9 +156,16 @@ class HostPodConsumer:
             running = False
             raise
         
+        final_queue_size = self.get_queue_size()
+        logger.info(
+            f"Consumer stopped - processed: {processed_count}, errors: {error_count}, "
+            f"queue remaining: {final_queue_size} (producers continue queuing independently)"
+        )
+        
         return {
             "processed": processed_count,
             "errors": error_count,
+            "queue_remaining": final_queue_size,
             "stats": self.stats
         }
     
@@ -148,31 +173,50 @@ class HostPodConsumer:
     def _get_batch(self) -> List[Dict[str, Any]]:
         """Get a batch of messages from the queue.
         
+        This method reads from Redis queue independently - it doesn't require
+        producers to be running. Messages can accumulate in the queue while
+        the consumer is down and will be processed when consumer restarts.
+        
         Returns:
-            List of message dictionaries
+            List of message dictionaries (empty list if no messages available)
         """
         messages: List[Dict[str, Any]] = []
         
         try:
-            # Use RPOP to get messages (FIFO)
+            # Use RPOPLPUSH for atomic operation (if we want reliability)
+            # Or use RPOP for simple FIFO processing
+            # RPOP is fine here since we process in batches and handle errors
             for _ in range(self.batch_size):
+                # RPOP removes and returns the rightmost (oldest) element
+                # This is non-blocking - returns None if queue is empty
                 message_str = self.redis.rpop(INFO_QUEUE_NAME)
                 if not message_str:
+                    # No more messages in queue - this is normal, not an error
                     break
                 
                 try:
+                    # Parse message - handle both string and bytes
+                    if isinstance(message_str, bytes):
+                        message_str = message_str.decode('utf-8')
+                    
                     message = json.loads(message_str)
                     if isinstance(message, dict):
                         messages.append(message)
                     else:
-                        logger.warning(f"Invalid message format: {type(message)}")
-                        self._send_to_error_queue(message_str, "Invalid message format")
+                        logger.warning(f"Invalid message format: {type(message)}, expected dict")
+                        self._send_to_error_queue(message_str, f"Invalid message format: {type(message)}")
                 except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse message: {e}")
+                    logger.error(f"Failed to parse message: {e}, message_str length: {len(message_str) if message_str else 0}")
                     self._send_to_error_queue(message_str, f"JSON decode error: {e}")
+                except UnicodeDecodeError as e:
+                    logger.error(f"Failed to decode message: {e}")
+                    self._send_to_error_queue(message_str if isinstance(message_str, str) else message_str.decode('utf-8', errors='replace'), f"Unicode decode error: {e}")
         
         except Exception as e:
             logger.error(f"Failed to get batch from queue: {e}", exc_info=True)
+        
+        if messages:
+            logger.debug(f"Retrieved {len(messages)} messages from queue (queue remaining: {self.redis.llen(INFO_QUEUE_NAME)})")
         
         return messages
     
@@ -379,8 +423,16 @@ class HostPodConsumer:
                             pod_ip = etcd_ip
                             break
                 
-                # If found, add IP to pod data
+                # If found, strip CIDR notation and add IP to pod data
+                # etcd/Calico stores IPs with CIDR notation (e.g., "192.168.1.1/32")
+                # We need clean IPs for health checks and network operations
                 if pod_ip:
+                    # Strip CIDR notation if present (e.g., "192.168.1.1/32" -> "192.168.1.1")
+                    if '/' in pod_ip:
+                        original_ip = pod_ip
+                        pod_ip = pod_ip.split('/')[0]
+                        logger.debug(f"Stripped CIDR notation from etcd IP: {original_ip} -> {pod_ip}")
+                    
                     pod_data["ip_address"] = pod_ip
                     enriched_count += 1
                     logger.debug(f"Enriched pod {pod_id} with IP {pod_ip} from etcd")

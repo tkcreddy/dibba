@@ -274,6 +274,89 @@ class HostPodStore:
     
     # ==================== Pod Operations ====================
     
+    @staticmethod
+    def _determine_pod_status_from_containers(
+        containers: Optional[List[Dict[str, Any]]],
+        pause_container: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Determine pod status from application container statuses.
+        
+        Priority:
+        1. Application containers status (worst status wins)
+        2. Pause container status (fallback)
+        3. "unknown" if neither exists
+        
+        Status priority (worst to best):
+        - stopped/STOPPED/STOPPING > failed/FAILED > restarting/RESTARTING > 
+          running/RUNNING > created/CREATED > unknown
+        
+        Args:
+            containers: List of application container dictionaries with "status" field
+            pause_container: Optional pause container dictionary with "status" field
+            
+        Returns:
+            Pod status string (RUNNING, STOPPED, FAILED, RESTARTING, CREATED, or UNKNOWN)
+        """
+        # Status priority: worst to best
+        status_priority = {
+            "stopped": 1, "STOPPED": 1, "STOPPING": 1,
+            "failed": 2, "FAILED": 2, "error": 2, "ERROR": 2,
+            "restarting": 3, "RESTARTING": 3, "exited": 3, "EXITED": 3,
+            "running": 4, "RUNNING": 4,
+            "created": 5, "CREATED": 5, "paused": 5, "PAUSED": 5,
+            "unknown": 6, "UNKNOWN": 6
+        }
+        
+        worst_priority = 6  # Start with unknown (lowest priority)
+        worst_status = "UNKNOWN"
+        
+        # Check application containers first (priority)
+        if containers and isinstance(containers, list):
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                container_status = container.get("status", "unknown")
+                if not container_status:
+                    container_status = "unknown"
+                
+                # Normalize status to uppercase for comparison
+                status_key = str(container_status).upper()
+                priority = status_priority.get(container_status, status_priority.get(status_key, 6))
+                
+                # Track worst status (lowest priority number = worst status)
+                if priority < worst_priority:
+                    worst_priority = priority
+                    worst_status = status_key
+        
+        # If no application containers or all unknown, fall back to pause container
+        if worst_status == "UNKNOWN" and pause_container and isinstance(pause_container, dict):
+            pause_status = pause_container.get("status", "unknown")
+            if pause_status:
+                status_key = str(pause_status).upper()
+                priority = status_priority.get(pause_status, status_priority.get(status_key, 6))
+                if priority < worst_priority:
+                    worst_priority = priority
+                    worst_status = status_key
+        
+        # Map worst status back to normalized form
+        # Convert to standard format: RUNNING, STOPPED, FAILED, RESTARTING, CREATED, UNKNOWN
+        status_map = {
+            "STOPPED": "STOPPED", "STOPPING": "STOPPED",
+            "FAILED": "FAILED", "ERROR": "FAILED",
+            "RESTARTING": "RESTARTING", "EXITED": "RESTARTING",
+            "RUNNING": "RUNNING",
+            "CREATED": "CREATED", "PAUSED": "CREATED",
+            "UNKNOWN": "UNKNOWN"
+        }
+        
+        normalized_status = status_map.get(worst_status, "UNKNOWN")
+        
+        # If no containers at all, return UNKNOWN
+        if not containers and not pause_container:
+            normalized_status = "UNKNOWN"
+        
+        return normalized_status
+    
     @log_to_file(logger)
     @handle_errors("save_pod", "REDIS_ERROR")
     def save_pod(
@@ -341,14 +424,6 @@ class HostPodStore:
             # Use created_at as fallback for creation_time if not set
             pod_data["creation_time"] = pod_data.get("created_at", datetime.now(timezone.utc).isoformat())
         
-        # Set startup_time if provided and pod is running, or preserve existing
-        if startup_time:
-            pod_data["startup_time"] = startup_time
-        elif status == "running" and "startup_time" not in pod_data:
-            # If pod is running and startup_time not set, set it now
-            pod_data["startup_time"] = datetime.now(timezone.utc).isoformat()
-        # If status is not running, don't update startup_time (preserve existing)
-        
         # Update fields
         if pod_name:
             pod_data["pod_name"] = pod_name
@@ -372,7 +447,29 @@ class HostPodStore:
         if labels:
             pod_data["labels"] = labels
         
-        pod_data["status"] = status
+        # Determine pod status from application containers if status is "unknown", None, or empty
+        # If status is explicitly provided and not "unknown"/None, use it; otherwise derive from containers
+        if not status or status == "unknown" or status == "UNKNOWN":
+            # Auto-determine from application containers (priority) or pause container (fallback)
+            determined_status = self._determine_pod_status_from_containers(containers, pause_container)
+            pod_data["status"] = determined_status
+            logger.debug(f"Auto-determined pod {pod_id} status from containers: {determined_status}")
+        else:
+            # Use explicitly provided status (normalize to uppercase for consistency)
+            normalized_status = str(status).upper() if status else "UNKNOWN"
+            pod_data["status"] = normalized_status
+            logger.debug(f"Using explicitly provided pod {pod_id} status: {normalized_status}")
+        
+        # Set startup_time if provided and pod is running, or preserve existing
+        # Note: Use determined_status (from pod_data) instead of status parameter
+        final_status = pod_data.get("status", "UNKNOWN")
+        if startup_time:
+            pod_data["startup_time"] = startup_time
+        elif final_status == "RUNNING" and "startup_time" not in pod_data:
+            # If pod is running and startup_time not set, set it now
+            pod_data["startup_time"] = datetime.now(timezone.utc).isoformat()
+        # If status is not running, don't update startup_time (preserve existing)
+        
         pod_data["last_updated"] = datetime.now(timezone.utc).isoformat()
         
         # Save to Redis using pipeline for atomicity

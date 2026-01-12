@@ -86,7 +86,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Read configuration
 read_config = rc()
-aws_config = read_config.aws_config
+# aws_config is now loaded dynamically via get_aws_node_config() helper
+# which checks Redis first, then falls back to config file
 key_read = read_config.encryption_config
 redis_db_config = read_config.redis_db_config
 
@@ -642,12 +643,16 @@ async def create_instances(request: CreateInstanceRequest, user: str = Depends(g
     defined_fields = set(CreateInstanceRequest.__annotations__.keys())
     extra_kwargs = extract_extra_kwargs(request_data, defined_fields)
 
+    # Get AWS config (from Redis with fallback to config file)
+    from utils.aws.config_helper import get_aws_node_config
+    aws_config = get_aws_node_config()
+    
     result = submit_celery_task(
         task=create_worker_nodes,
         args=(
             None,  # aws_access_key - deprecated, read from config
             None,  # aws_secret_key - deprecated, read from config
-            aws_config["region"],  # Optional region override
+            aws_config.get("region"),  # Optional region override
             request.instance_type,
             request.ami_id,
             request.key_name,
@@ -683,12 +688,16 @@ async def terminate_namespace(
             details={"namespace": request.namespace},
         )
 
+    # Get AWS config (from Redis with fallback to config file)
+    from utils.aws.config_helper import get_aws_node_config
+    aws_config = get_aws_node_config()
+
     result = submit_celery_task(
         task=terminate_worker_node,
         args=(
             None,  # aws_access_key - deprecated, read from config
             None,  # aws_secret_key - deprecated, read from config
-            aws_config["region"],  # Optional region override
+            aws_config.get("region"),  # Optional region override
             instances_to_terminate,
         ),
         queue_info=aws_queue_info,
@@ -704,6 +713,10 @@ async def terminate_namespace(
 @app.get("/aws/instances/", tags=["AWS Management"])
 async def list_ec2_instances(user: str = Depends(get_current_user)):
     """List all EC2 instances."""
+    # Get AWS config (from Redis with fallback to config file)
+    from utils.aws.config_helper import get_aws_node_config
+    aws_config = get_aws_node_config()
+    
     result = submit_celery_task(
         task=get_ec2_instances,
         args=(
@@ -727,6 +740,10 @@ async def terminate_instance_ids(
     user: str = Depends(get_current_user)
 ):
     """Terminate specific EC2 instance IDs."""
+    # Get AWS config (from Redis with fallback to config file)
+    from utils.aws.config_helper import get_aws_node_config
+    aws_config = get_aws_node_config()
+    
     instance_ids = request.get("instance_ids", [])
     if not instance_ids or not isinstance(instance_ids, list):
         raise NotFoundError(
@@ -1009,7 +1026,7 @@ async def list_namespaces_and_pods_api(
                                         ip_address=ip_address,
                                         pause_container=p.get("pause_container"),
                                         containers=p.get("containers"),
-                                        status=p.get("status", "running")
+                                        status=p.get("status") or None  # Let save_pod determine from containers if None
                                     )
                                 except Exception as save_err:
                                     logger.debug(f"Failed to save IP to Redis: {save_err}")
@@ -1033,7 +1050,7 @@ async def list_namespaces_and_pods_api(
                                                     ip_address=ip_address,
                                                     pause_container=p.get("pause_container"),
                                                     containers=p.get("containers"),
-                                                    status=p.get("status", "running")
+                                                    status=p.get("status") or None  # Let save_pod determine from containers if None
                                                 )
                                             except Exception as save_err:
                                                 logger.debug(f"Failed to save IP to Redis: {save_err}")
@@ -1050,7 +1067,7 @@ async def list_namespaces_and_pods_api(
                                                     ip_address=ip_address,
                                                     pause_container=p.get("pause_container"),
                                                     containers=p.get("containers"),
-                                                    status=p.get("status", "running")
+                                                    status=p.get("status") or None  # Let save_pod determine from containers if None
                                                 )
                                             except Exception as save_err:
                                                 logger.debug(f"Failed to save IP to Redis: {save_err}")
@@ -2607,7 +2624,7 @@ async def reassociate_deployment_pods_api(
                     cni_network=pod.get("cni_network"),
                     resources=pod.get("resources"),
                     labels=updated_labels,
-                    status=pod.get("status", "running"),
+                    status=pod.get("status") or None,  # Let save_pod determine from containers if None
                     creation_time=pod.get("creation_time"),
                     startup_time=pod.get("startup_time"),
                 )

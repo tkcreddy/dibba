@@ -442,7 +442,16 @@ class DeploymentScheduler:
         self.host_store = HostPodStore(self.redis_interface)
         self.resource_calculator = HostResourceCalculator(self.host_store)
         self.read_config = rc()
-        self.aws_config = self.read_config.aws_config
+        # Get AWS config: 4 fields (ami_id, key_name, security_group_ids, subnet_id) from Redis
+        # instance_type and region come from config.json
+        from utils.aws.config_helper import get_aws_node_config
+        node_config = get_aws_node_config()  # Only the 4 requested fields from Redis
+        file_aws_config = self.read_config.aws_config  # For instance_type and region
+        
+        # Merge: node_config (4 fields from Redis) + instance_type/region from config file
+        self.aws_config = node_config.copy() if node_config else {}
+        self.aws_config['instance_type'] = file_aws_config.get('instance_type', 't3.medium')
+        self.aws_config['region'] = file_aws_config.get('region')
         key = self.read_config.encryption_config['key']
         self.encode_util = UtilitiesExtension(key)
     
@@ -612,11 +621,18 @@ class DeploymentScheduler:
                 # Prepare container specs for containerd with resources properly formatted
                 containers = []
                 for container in deployment.containers:
+                    # Normalize args: if not provided or empty list, set to None
+                    # Empty args [] would fail at runc level with "args must not be empty"
+                    # None allows fallback logic to extract Entrypoint/Cmd from image
+                    container_args = container.get('args')
+                    if container_args is None or (isinstance(container_args, list) and len(container_args) == 0):
+                        container_args = None
+                    
                     container_spec = {
                         'image': container.get('image'),
                         'name': container.get('name'),
                         'command': container.get('command'),
-                        'args': container.get('args'),
+                        'args': container_args,  # None if not provided or empty, otherwise use as-is
                         'env': container.get('env'),
                         'resources': {
                             'cpu_millicores': deployment.resource_requirements.cpu_millicores,
@@ -703,11 +719,18 @@ class DeploymentScheduler:
             if isinstance(resources, dict):
                 # If resources already has cpu_millicores and memory, use it
                 if 'cpu_millicores' in resources and 'memory' in resources:
+                    # Normalize args: if not provided or empty list, set to None
+                    # Empty args [] would fail at runc level with "args must not be empty"
+                    # None allows fallback logic to extract Entrypoint/Cmd from image
+                    container_args = container.get('args')
+                    if container_args is None or (isinstance(container_args, list) and len(container_args) == 0):
+                        container_args = None
+                    
                     container_spec = {
                         'image': container.get('image'),
                         'name': container.get('name'),
                         'command': container.get('command'),
-                        'args': container.get('args', []),
+                        'args': container_args,  # None if not provided or empty, otherwise use as-is
                         'env': container.get('env', {}),
                         'resources': {
                             'cpu_millicores': resources['cpu_millicores'],
@@ -728,11 +751,18 @@ class DeploymentScheduler:
                         memory_str = resources['requests'].get('memory', '0Mi')
                         cpu_millicores = ResourceConverter.parse_cpu(cpu_str)
                     
+                    # Normalize args: if not provided or empty list, set to None
+                    # Empty args [] would fail at runc level with "args must not be empty"
+                    # None allows fallback logic to extract Entrypoint/Cmd from image
+                    container_args = container.get('args')
+                    if container_args is None or (isinstance(container_args, list) and len(container_args) == 0):
+                        container_args = None
+                    
                     container_spec = {
                         'image': container.get('image'),
                         'name': container.get('name'),
                         'command': container.get('command'),
-                        'args': container.get('args', []),
+                        'args': container_args,  # None if not provided or empty, otherwise use as-is
                         'env': container.get('env', {}),
                         'resources': {
                             'cpu_millicores': cpu_millicores,
@@ -741,11 +771,18 @@ class DeploymentScheduler:
                     }
             else:
                 # No resources specified, use defaults
+                # Normalize args: if not provided or empty list, set to None
+                # Empty args [] would fail at runc level with "args must not be empty"
+                # None allows fallback logic to extract Entrypoint/Cmd from image
+                container_args = container.get('args')
+                if container_args is None or (isinstance(container_args, list) and len(container_args) == 0):
+                    container_args = None
+                
                 container_spec = {
                     'image': container.get('image'),
                     'name': container.get('name'),
                     'command': container.get('command'),
-                    'args': container.get('args', []),
+                    'args': container_args,  # None if not provided or empty, otherwise use as-is
                     'env': container.get('env', {}),
                     'resources': {
                         'cpu_millicores': 0,

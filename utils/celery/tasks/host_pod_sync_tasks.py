@@ -252,6 +252,16 @@ def _collect_pod_info(
 def _send_to_queue(redis_client: RedisInterface, info_package: Dict[str, Any]) -> int:
     """Send information package to Redis queue.
     
+    This function is COMPLETELY INDEPENDENT of the consumer - messages are queued
+    in Redis and will be processed whenever the consumer is available.
+    Producers can continue sending messages even if the consumer is down or restarted.
+    
+    The queue is persistent and independent:
+    - Messages accumulate in Redis queue even if consumer is offline
+    - Consumer processes messages when it comes back online
+    - No producer-restart required when consumer restarts
+    - No registration or handshake needed
+    
     Args:
         redis_client: RedisInterface instance
         info_package: Information package to send
@@ -263,12 +273,27 @@ def _send_to_queue(redis_client: RedisInterface, info_package: Dict[str, Any]) -
         # Serialize the package
         message = json.dumps(info_package)
         
-        # Push to Redis list (queue)
-        # Using LPUSH for queue (RPOP for consumer)
+        # Push to Redis list (queue) - producers are completely independent of consumer
+        # Using LPUSH (left push) - consumer uses RPOP (right pop) for FIFO
+        # This is non-blocking, asynchronous, and works regardless of consumer status
         queue_size = redis_client.redis_client.lpush(INFO_QUEUE_NAME, message)
         
-        # Set expiration on queue to prevent unbounded growth (1 hour)
-        redis_client.redis_client.expire(INFO_QUEUE_NAME, 3600)
+        # IMPORTANT: Do NOT set expiration on the queue - allow it to persist indefinitely
+        # This ensures producers can queue messages independently of consumer status
+        # The queue will only grow if consumer is down, but messages will be processed when consumer restarts
+        # We rely on Redis maxmemory policies or manual cleanup instead of expiration
+        # This allows producers to be completely independent - no producer-restart needed when consumer restarts
+        #
+        # Note: If you need to prevent unbounded growth, set Redis maxmemory policy (e.g., allkeys-lru)
+        # or implement a separate cleanup job that removes old messages (not the entire queue)
+        #
+        # DO NOT call expire() here - it would cause the queue to disappear if empty for a while
+        # Queue persistence ensures producers can queue messages even when consumer is offline
+        
+        logger.debug(
+            f"Queued message for host {info_package.get('hostname', 'unknown')} "
+            f"(queue_size: {queue_size}, producers independent of consumer status)"
+        )
         
         return queue_size
         

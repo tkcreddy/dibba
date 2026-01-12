@@ -129,7 +129,18 @@ def _rehydrate_containers(containers_json):
         
         d.setdefault("env", None)
         d.setdefault("mounts", None)
-        d.setdefault("args", None)
+        
+        # Normalize args: if not provided or empty list, set to None
+        # This ensures the fallback logic in add_container() can extract Entrypoint/Cmd from image
+        # Empty args [] would fail at runc level with "args must not be empty"
+        args = d.get("args")
+        if args is None or (isinstance(args, list) and len(args) == 0):
+            d["args"] = None
+            logger.debug(f"Container {d.get('name', idx)}: normalized empty args to None (will use image Entrypoint/Cmd)")
+        elif not isinstance(args, list):
+            # If args is not a list, convert it to a list or set to None
+            logger.warning(f"Container {d.get('name', idx)}: args is not a list (type: {type(args)}), setting to None")
+            d["args"] = None
         
         # Log volume mount information for debugging
         if d.get("mounts"):

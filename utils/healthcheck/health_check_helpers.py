@@ -28,7 +28,7 @@ def check_http_probe(http_get: Dict[str, Any], pod_ip: str, container_port: int,
     
     Args:
         http_get: HTTP probe configuration with 'path' and optional 'port'
-        pod_ip: Pod IP address
+        pod_ip: Pod IP address (may contain CIDR notation like /32 - will be stripped)
         container_port: Default container port
         timeout_seconds: Timeout in seconds (from probe config, not httpGet)
         
@@ -36,6 +36,12 @@ def check_http_probe(http_get: Dict[str, Any], pod_ip: str, container_port: int,
         True if probe succeeds, False otherwise
     """
     try:
+        # Strip CIDR notation from IP address if present (e.g., "192.168.1.1/32" -> "192.168.1.1")
+        # This can happen when IPs come from etcd/Calico which stores them with CIDR notation
+        if '/' in pod_ip:
+            pod_ip = pod_ip.split('/')[0]
+            logger.debug(f"Stripped CIDR notation from pod IP, using: {pod_ip}")
+        
         path = http_get.get('path', '/')
         port = http_get.get('port', container_port)
         scheme = http_get.get('scheme', 'HTTP').upper()
@@ -72,7 +78,7 @@ def check_tcp_probe(tcp_socket: Dict[str, Any], pod_ip: str, container_port: int
     
     Args:
         tcp_socket: TCP probe configuration with optional 'port'
-        pod_ip: Pod IP address
+        pod_ip: Pod IP address (may contain CIDR notation like /32 - will be stripped)
         container_port: Default container port
         timeout_seconds: Timeout in seconds (from probe config, not tcpSocket)
         
@@ -80,6 +86,12 @@ def check_tcp_probe(tcp_socket: Dict[str, Any], pod_ip: str, container_port: int
         True if TCP connection succeeds, False otherwise
     """
     try:
+        # Strip CIDR notation from IP address if present (e.g., "192.168.1.1/32" -> "192.168.1.1")
+        # This can happen when IPs come from etcd/Calico which stores them with CIDR notation
+        if '/' in pod_ip:
+            pod_ip = pod_ip.split('/')[0]
+            logger.debug(f"Stripped CIDR notation from pod IP for TCP probe, using: {pod_ip}")
+        
         port = tcp_socket.get('port', container_port)
         # Use timeout from probe config (passed as parameter), fallback to tcpSocket if not provided
         timeout = timeout_seconds if timeout_seconds > 0 else tcp_socket.get('timeoutSeconds', 1)
@@ -106,7 +118,7 @@ async def check_http_probe_async(http_get: Dict[str, Any], pod_ip: str, containe
     
     Args:
         http_get: HTTP probe configuration with 'path' and optional 'port'
-        pod_ip: Pod IP address
+        pod_ip: Pod IP address (may contain CIDR notation like /32 - will be stripped)
         container_port: Default container port
         timeout_seconds: Timeout in seconds (from probe config)
         session: Optional aiohttp session (creates new one if not provided)
@@ -115,6 +127,12 @@ async def check_http_probe_async(http_get: Dict[str, Any], pod_ip: str, containe
         True if probe succeeds, False otherwise
     """
     try:
+        # Strip CIDR notation from IP address if present (e.g., "192.168.1.1/32" -> "192.168.1.1")
+        # This can happen when IPs come from etcd/Calico which stores them with CIDR notation
+        if '/' in pod_ip:
+            pod_ip = pod_ip.split('/')[0]
+            logger.debug(f"Stripped CIDR notation from pod IP, using: {pod_ip}")
+        
         path = http_get.get('path', '/')
         port = http_get.get('port', container_port)
         scheme = http_get.get('scheme', 'HTTP').upper()
@@ -180,7 +198,7 @@ async def check_tcp_probe_async(tcp_socket: Dict[str, Any], pod_ip: str, contain
     
     Args:
         tcp_socket: TCP probe configuration with optional 'port'
-        pod_ip: Pod IP address
+        pod_ip: Pod IP address (may contain CIDR notation like /32 - will be stripped)
         container_port: Default container port
         timeout_seconds: Timeout in seconds (from probe config)
         
@@ -188,6 +206,12 @@ async def check_tcp_probe_async(tcp_socket: Dict[str, Any], pod_ip: str, contain
         True if TCP connection succeeds, False otherwise
     """
     try:
+        # Strip CIDR notation from IP address if present (e.g., "192.168.1.1/32" -> "192.168.1.1")
+        # This can happen when IPs come from etcd/Calico which stores them with CIDR notation
+        if '/' in pod_ip:
+            pod_ip = pod_ip.split('/')[0]
+            logger.debug(f"Stripped CIDR notation from pod IP for TCP probe, using: {pod_ip}")
+        
         port = tcp_socket.get('port', container_port)
         # Use timeout from probe config (passed as parameter), fallback to tcpSocket if not provided
         timeout = timeout_seconds if timeout_seconds > 0 else tcp_socket.get('timeoutSeconds', 1)

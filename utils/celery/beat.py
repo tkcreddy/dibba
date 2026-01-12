@@ -30,15 +30,15 @@ celery_app.conf.update(
             'expires': 60,  # Expire if not processed within 60 seconds
         }
     },
-    'recover-missing-replicas-every-60-seconds': {
+    'recover-missing-replicas-every-10-seconds': {
         'task': 'deployment.recover_missing_replicas',
-        'schedule': 60.0,  # Run every 60 seconds
+        'schedule': 10.0,  # Run every 10 seconds for faster recovery
         'options': {
             'queue': scheduler_queue_name,
             'exchange': secure_exchange,
             'routing_key': scheduler_queue_name,
             'delivery_mode': 2,
-            'expires': 120,  # Expire if not processed within 120 seconds
+            'expires': 30,  # Expire if not processed within 30 seconds
         }
     },
     'refresh-health-check-workers-every-60-seconds': {
@@ -76,6 +76,21 @@ celery_app.conf.update(
             'routing_key': health_check_queue_name,
             'delivery_mode': 2,
             'expires': 60,  # Expire if not processed within 60 seconds (allows for task execution time and catch-up)
+        }
+    },
+    'cleanup-orphaned-calico-nodes-every-10-minutes': {
+        'task': 'etcd.cleanup_orphaned_nodes',
+        'schedule': 600.0,  # Run every 10 minutes (600 seconds)
+        # CLEANUP DESIGN:
+        # - Compares active worker nodes in Redis with Calico nodes in etcd
+        # - Removes Calico nodes that are not in the active worker pool
+        # - Prevents accumulation of stale node entries in etcd
+        'options': {
+            'queue': scheduler_queue_name,  # Use scheduler queue
+            'exchange': secure_exchange,
+            'routing_key': scheduler_queue_name,
+            'delivery_mode': 2,
+            'expires': 1200,  # Expire if not processed within 20 minutes
         }
     },
     },

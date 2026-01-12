@@ -87,13 +87,19 @@ def log_to_file(logger: LogKCld):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             try:
-                logger.info(f"Calling Class & function: {func.__name__}")
-                logger.info(f"Arguments: {args}, {kwargs}")
-                result = func(*args, **kwargs)
-                logger.info(f"Function returned: {func.__name__} {result}")
+                # Skip verbose logging for __init__ methods to reduce log noise
+                # These are called frequently and rarely provide useful debugging information
+                if func.__name__ != "__init__":
+                    logger.info(f"Calling Class & function: {func.__name__}")
+                    logger.info(f"Arguments: {args}, {kwargs}")
+                    result = func(*args, **kwargs)
+                    logger.info(f"Function returned: {func.__name__} {result}")
+                else:
+                    # For __init__, only log errors if they occur
+                    result = func(*args, **kwargs)
                 return result
             except Exception as e:
-                # exc_info is valid now because our logger methods accept **kwargs
+                # Always log errors, even for __init__ methods
                 logger.error(
                     f"Error in function {func.__name__}: {str(e)}",
                     exc_info=True

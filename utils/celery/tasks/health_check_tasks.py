@@ -969,6 +969,15 @@ async def check_all_pods_health_task(max_concurrency: int = 100) -> Dict[str, An
                                 
                                 if liveness == 'failed':
                                     results['unhealthy'] += 1
+                                    # Track failed pods for recreation
+                                    if 'failed_pods' not in results:
+                                        results['failed_pods'] = []
+                                    results['failed_pods'].append({
+                                        'pod_id': pod_id,
+                                        'hostname': health_result.get('hostname'),
+                                        'namespace': health_result.get('namespace'),
+                                        'health_result': health_result
+                                    })
                                 elif readiness == 'success' and liveness == 'success':
                                     results['healthy'] += 1
                                 elif readiness != 'success':
@@ -1048,6 +1057,7 @@ async def check_all_pods_health_task(max_concurrency: int = 100) -> Dict[str, An
             logger.info(f"[TIMING] notfound_pod_cleanup: {notfound_cleanup_time:.3f}s ({len(notfound_pods_for_cleanup)} pods)")
         
         # Check if we need to trigger deployment recovery
+        # Failed pods (liveness probe reached failureThreshold) will be handled by recovery/scaling tasks
         # Reasons: unhealthy pods detected OR we're below min_replicas for any deployment
         min_replicas_check_start = time.time()
         should_trigger_recovery = False
