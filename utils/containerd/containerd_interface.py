@@ -3508,7 +3508,8 @@ class PodManager:
             resources=resources,
             volume_mounts=volume_mounts
         )
-        cid = f"{pod_name}-{name}"
+        cid = f"{name}-{pod_name}"
+
         self.runtime.create_container(cid, image, spec_any, labels={"pod": pod_name, "app": name,"role": "app"})
         pid = self.runtime.start_task(
             cid, mounts,
