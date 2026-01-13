@@ -62,7 +62,7 @@ def handle_errors(
                 log_message = {
                     "operation": operation_name,
                     "error_code": error_code,
-                    "message": dibba_exc.message,
+                    "error_message": dibba_exc.message,  # Changed from "message" to avoid LogRecord conflict
                     "function": func.__name__,
                     "original_error": str(e)
                 }
@@ -126,7 +126,7 @@ def handle_async_errors(
                 log_message = {
                     "operation": operation_name,
                     "error_code": error_code,
-                    "message": dibba_exc.message,
+                    "error_message": dibba_exc.message,  # Changed from "message" to avoid LogRecord conflict
                     "function": func.__name__,
                     "original_error": str(e)
                 }

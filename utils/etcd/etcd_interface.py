@@ -529,6 +529,9 @@ class EtcdInterface:
                     if not node_name:
                         # Try to extract from key
                         key = meta.key if hasattr(meta, 'key') else str(meta)
+                        # Handle bytes (decode to string)
+                        if isinstance(key, bytes):
+                            key = key.decode('utf-8')
                         if key.startswith(self.CALICO_NODE_PREFIX):
                             node_name = key[len(self.CALICO_NODE_PREFIX):]
                     
@@ -611,19 +614,33 @@ class EtcdInterface:
                 try:
                     data = json.loads(value)
                     # IPAM blocks have affinity to nodes
-                    # Check if this block is associated with the node
-                    affinities = data.get("affinity", {})
-                    block_node = affinities.get("node") or affinities.get("hostname")
+                    # Affinity can be a string (e.g., "host:ip-172-31-16-125") or a dict
+                    affinity = data.get("affinity")
+                    block_node = None
+                    
+                    if isinstance(affinity, str):
+                        # Affinity is a string like "host:ip-172-31-16-125"
+                        # Extract node name after "host:" prefix
+                        if affinity.startswith("host:"):
+                            block_node = affinity[5:]  # Remove "host:" prefix
+                        else:
+                            block_node = affinity
+                    elif isinstance(affinity, dict):
+                        # Affinity is a dict (fallback for different formats)
+                        block_node = affinity.get("node") or affinity.get("hostname")
                     
                     if block_node == node_name:
                         # Extract block CIDR from key
                         key = meta.key if hasattr(meta, 'key') else str(meta)
+                        # Handle bytes (decode to string)
+                        if isinstance(key, bytes):
+                            key = key.decode('utf-8')
                         if key.startswith(self.CALICO_IPAM_BLOCK_PREFIX):
                             block_cidr = key[len(self.CALICO_IPAM_BLOCK_PREFIX):]
                             blocks.append(block_cidr)
                             logger.debug(f"Found IPAM block {block_cidr} for node {node_name}")
                 
-                except (json.JSONDecodeError, KeyError) as e:
+                except (json.JSONDecodeError, KeyError, AttributeError) as e:
                     logger.warning(f"Failed to parse IPAM block data: {e}")
                     continue
         
@@ -662,12 +679,27 @@ class EtcdInterface:
                     
                     # Extract block CIDR from key
                     key = meta.key if hasattr(meta, 'key') else str(meta)
+                    # Handle bytes (decode to string)
+                    if isinstance(key, bytes):
+                        key = key.decode('utf-8')
                     if key.startswith(self.CALICO_IPAM_BLOCK_PREFIX):
                         block_cidr = key[len(self.CALICO_IPAM_BLOCK_PREFIX):]
                         
                         # Get node affinity
-                        affinities = data.get("affinity", {})
-                        block_node = affinities.get("node") or affinities.get("hostname") or ""
+                        # Affinity can be a string (e.g., "host:ip-172-31-16-125") or a dict
+                        affinity = data.get("affinity")
+                        block_node = ""
+                        
+                        if isinstance(affinity, str):
+                            # Affinity is a string like "host:ip-172-31-16-125"
+                            # Extract node name after "host:" prefix
+                            if affinity.startswith("host:"):
+                                block_node = affinity[5:]  # Remove "host:" prefix
+                            else:
+                                block_node = affinity
+                        elif isinstance(affinity, dict):
+                            # Affinity is a dict (fallback for different formats)
+                            block_node = affinity.get("node") or affinity.get("hostname") or ""
                         
                         blocks[block_cidr] = {
                             "cidr": block_cidr,

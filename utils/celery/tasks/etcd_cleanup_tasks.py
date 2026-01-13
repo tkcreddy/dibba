@@ -53,18 +53,26 @@ def cleanup_orphaned_calico_nodes_task() -> Dict[str, Any]:
         # Get all active worker nodes from Redis
         hosts = host_pod_store.get_all_hosts()
         active_worker_hostnames: Set[str] = set()
+        all_hostnames_in_redis: Set[str] = set()  # For debugging
         
         for host in hosts:
-            # Only include online hosts
-            if host.get("status") == HostStatus.ONLINE.value:
-                hostname = host.get("hostname")
-                if hostname:
+            hostname = host.get("hostname")
+            host_status = host.get("status")
+            if hostname:
+                all_hostnames_in_redis.add(hostname)
+                # Only include online hosts
+                if host_status == HostStatus.ONLINE.value:
                     active_worker_hostnames.add(hostname)
+                    logger.debug(f"Added online host to active list: {hostname}")
+                else:
+                    logger.debug(f"Excluded host from active list (status={host_status}): {hostname}")
         
         # Always include the current hostname (health_check node) to prevent deletion
         active_worker_hostnames.add(current_hostname)
         
+        logger.info(f"Found {len(hosts)} total hosts in Redis: {sorted(all_hostnames_in_redis)}")
         logger.info(f"Found {len(active_worker_hostnames)} active worker nodes in Redis (including current node): {sorted(active_worker_hostnames)}")
+        logger.info(f"Offline hosts in Redis: {sorted(all_hostnames_in_redis - active_worker_hostnames)}")
         
         # Get etcd interface
         etcd_interface = get_etcd_interface_from_config()
@@ -88,6 +96,12 @@ def cleanup_orphaned_calico_nodes_task() -> Dict[str, Any]:
         calico_node_names: Set[str] = set(calico_nodes.keys())
         
         logger.info(f"Found {len(calico_node_names)} Calico nodes in etcd: {sorted(calico_node_names)}")
+        
+        # Debug: Show comparison details
+        logger.info(f"Active worker hostnames: {sorted(active_worker_hostnames)}")
+        logger.info(f"Calico node names: {sorted(calico_node_names)}")
+        logger.info(f"Calico nodes NOT in active workers: {sorted(calico_node_names - active_worker_hostnames)}")
+        logger.info(f"Active workers NOT in Calico: {sorted(active_worker_hostnames - calico_node_names)}")
         
         # Find orphaned nodes (in etcd but not in active workers)
         orphaned_nodes = calico_node_names - active_worker_hostnames
