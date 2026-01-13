@@ -710,6 +710,48 @@ async def terminate_namespace(
 
 @log_to_file(logger)
 @handle_async_errors("list_ec2_instances", "TASK_SUBMISSION_ERROR")
+@app.get("/aws/config/", tags=["AWS Management"])
+@handle_async_errors("get_aws_config", "CONFIG_ERROR")
+async def get_aws_config(user: str = Depends(get_current_user)):
+    """Get AWS configuration from Redis with fallback to config file.
+    
+    This endpoint returns the AWS configuration that can be used to prepopulate
+    the EC2 instance creation form. It includes:
+    - ami_id: AMI ID
+    - key_name: Key pair name
+    - security_group_ids: List of security group IDs
+    - subnet_id: Subnet ID
+    - instance_type: Instance type (from config file)
+    - region: AWS region (from config file)
+    """
+    from utils.aws.config_helper import get_aws_node_config
+    from utils.ReadConfig import ReadConfig as rc
+    
+    # Get the 4 fields from Redis/config (synchronous function)
+    aws_node_config = get_aws_node_config()
+    
+    # Get instance_type and region from config file (synchronous)
+    read_config = rc()
+    file_aws_config = read_config.aws_config
+    
+    # Merge: node_config (4 fields from Redis) + instance_type/region from config file
+    config = aws_node_config.copy() if aws_node_config else {}
+    config['instance_type'] = file_aws_config.get('instance_type', 't3.micro')
+    config['region'] = file_aws_config.get('region', 'us-east-1')
+    
+    # Convert security_group_ids to comma-separated string for form input
+    if 'security_group_ids' in config and isinstance(config['security_group_ids'], list):
+        config['security_group_ids_string'] = ', '.join(config['security_group_ids'])
+    elif 'security_group_ids' in config and isinstance(config['security_group_ids'], str):
+        config['security_group_ids_string'] = config['security_group_ids']
+    else:
+        config['security_group_ids_string'] = ''
+    
+    # Return plain dict, not coroutine
+    result = _envelope_success("AWS configuration retrieved successfully", config)
+    return result
+
+
 @app.get("/aws/instances/", tags=["AWS Management"])
 async def list_ec2_instances(user: str = Depends(get_current_user)):
     """List all EC2 instances."""
