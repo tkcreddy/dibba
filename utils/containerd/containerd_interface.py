@@ -3400,7 +3400,11 @@ class PodManager:
     def create_pod(self, name: str, pause_image: str = "registry.k8s.io/pause:3.9",
                    resources: Optional[ResourceSpec] = None,
                    cni_network: str = DEFAULT_CNI_NET_NAME,
-                   cni_ifname: str = DEFAULT_IFNAME) -> Dict:
+                   cni_ifname: str = DEFAULT_IFNAME,
+                   pod_id: Optional[str] = None,
+                   namespace: Optional[str] = None,
+                   app_name: Optional[str] = None,
+                   owner_team: Optional[str] = None) -> Dict:
         logger.info(f"Using platform: {PLATFORM_OS}/{PLATFORM_ARCH}")
         self._ensure_unpacked(pause_image)
 
@@ -3427,7 +3431,24 @@ class PodManager:
             resources=resources,
         )
         cid = f"{name}"
-        self.runtime.create_container(cid, pause_image, spec_any, labels={"pod": name, "role": "pause"})
+        
+        # Build container labels with dibba_* prefixes
+        container_labels = {
+            "pod": name,
+            "role": "pause"
+        }
+        
+        # Add dibba labels if provided
+        if pod_id:
+            container_labels["dibba_pod"] = pod_id
+        if namespace:
+            container_labels["dibba_namespace"] = namespace
+        if app_name:
+            container_labels["dibba_app"] = app_name
+        if owner_team:
+            container_labels["dibba_owner"] = owner_team
+        
+        self.runtime.create_container(cid, pause_image, spec_any, labels=container_labels)
         pid = self.runtime.start_task(
             cid, mounts,
             namespace=self.c.namespace,
@@ -3463,7 +3484,11 @@ class PodManager:
                       args: Optional[List[str]] = None,
                       env: Optional[Dict[str, str]] = None,
                       resources: Optional[ResourceSpec] = None,
-                      volume_mounts: Optional[List[Dict[str, Any]]] = None) -> Dict:
+                      volume_mounts: Optional[List[Dict[str, Any]]] = None,
+                      pod_id: Optional[str] = None,
+                      namespace: Optional[str] = None,
+                      app_name: Optional[str] = None,
+                      owner_team: Optional[str] = None) -> Dict:
 
         pod_name = pod["name"]
         pod_ns = pod["ns"]
@@ -3510,7 +3535,24 @@ class PodManager:
         )
         cid = f"{name}-{pod_name}"
 
-        self.runtime.create_container(cid, image, spec_any, labels={"pod": pod_name, "app": name,"role": "app"})
+        # Build container labels with dibba_* prefixes
+        container_labels = {
+            "pod": pod_name,
+            "app": name,
+            "role": "app"
+        }
+        
+        # Add dibba labels if provided
+        if pod_id:
+            container_labels["dibba_pod"] = pod_id
+        if namespace:
+            container_labels["dibba_namespace"] = namespace
+        if app_name:
+            container_labels["dibba_app"] = app_name
+        if owner_team:
+            container_labels["dibba_owner"] = owner_team
+
+        self.runtime.create_container(cid, image, spec_any, labels=container_labels)
         pid = self.runtime.start_task(
             cid, mounts,
             namespace=self.c.namespace,
@@ -3522,7 +3564,11 @@ class PodManager:
         return {"cid": cid, "pid": pid, "snapshot_key": snap_key}
 
     @log_to_file(logger)
-    def add_containers(self, pod: Dict, specs: List[ContainerSpec]) -> Dict[str, Dict]:
+    def add_containers(self, pod: Dict, specs: List[ContainerSpec],
+                       pod_id: Optional[str] = None,
+                       namespace: Optional[str] = None,
+                       app_name: Optional[str] = None,
+                       owner_team: Optional[str] = None) -> Dict[str, Dict]:
         """
         Launch multiple containers (apps/sidecars) into the same pod namespaces.
         Returns a dict: { <name>: {"cid":..., "pid":..., "snapshot_key":...}, ... }
@@ -3536,7 +3582,11 @@ class PodManager:
                 args=spec.args,
                 env=spec.env,
                 resources=spec.resources,
-                volume_mounts=spec.mounts
+                volume_mounts=spec.mounts,
+                pod_id=pod_id,
+                namespace=namespace,
+                app_name=app_name,
+                owner_team=owner_team
             )
             results[spec.name] = res
         return results

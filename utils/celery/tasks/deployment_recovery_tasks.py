@@ -56,6 +56,8 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
         PODS_CREATING_KEY = "pods:creating"
         # Key pattern for tracking AWS nodes currently being created (per namespace)
         AWS_NODES_CREATING_KEY_PREFIX = "aws_nodes:creating"
+        # Key pattern for tracking when we first detected creating keys with no pods (for stale detection)
+        STALE_CREATING_KEYS_TRACKER_PREFIX = "stale_creating_keys:tracker"
         
         # Get all deployments from Redis
         deployments = deployment_store.get_all_deployments()
@@ -294,15 +296,26 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                         logger.warning(f"Pod {pod.get('pod_id')} on down host {pod_hostname} will be terminated and recreated")
                         continue
                     
-                    # Check if pod was updated in the last 60 seconds
+                    # Check if pod was updated recently
+                    # For newly created pods, they might not have last_updated yet or it might be very recent
+                    # Use a longer window (5 minutes) to account for pod sync delays
                     last_updated_str = pod.get('last_updated')
-                    if last_updated_str:
+                    pod_status = pod.get('status', '').upper()
+                    
+                    # For CREATED/PENDING pods, be more lenient (they're being created)
+                    # These pods will be counted in pending_pods and we'll wait for them
+                    if pod_status in ('CREATED', 'PENDING', 'RESTARTING'):
+                        # These pods are in transition, accept them even without last_updated
+                        # They'll be counted in pending_pods and we'll wait for them
+                        pass  # Don't exclude based on last_updated for pending pods
+                    elif last_updated_str:
                         try:
                             last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
                             time_since_update = (now - last_updated).total_seconds()
-                            if time_since_update > 60:
+                            # Use 5 minutes (300s) instead of 60s to account for sync delays
+                            if time_since_update > 300:
                                 logger.debug(
-                                    f"Pod {pod.get('pod_id')} excluded: last updated {time_since_update:.1f}s ago (>60s)"
+                                    f"Pod {pod.get('pod_id')} excluded: last updated {time_since_update:.1f}s ago (>300s)"
                                 )
                                 continue
                         except Exception as e:
@@ -310,9 +323,12 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                             # If we can't parse, exclude it to be safe
                             continue
                     else:
-                        # No last_updated timestamp, exclude to be safe
-                        logger.debug(f"Pod {pod.get('pod_id')} excluded: no last_updated timestamp")
-                        continue
+                        # No last_updated timestamp - for RUNNING pods, this might indicate a stale entry
+                        # But for CREATED/PENDING pods, this is normal (they're new)
+                        if pod_status == 'RUNNING':
+                            logger.debug(f"Pod {pod.get('pod_id')} excluded: RUNNING but no last_updated timestamp (likely stale)")
+                            continue
+                        # For CREATED/PENDING pods without last_updated, we'll include them (they're being created)
                     
                     validated_pods.append(pod)
                 
@@ -568,13 +584,13 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                                 creating_key = creating_key_map[instance_str]
                                 pods_to_remove_from_creating.append(creating_key)
                     
-                    # Also clean up stale entries: if we have more creating keys than could possibly be needed
-                    # This is a safety mechanism - if we already have enough pods, remove all creating keys
-                    if len(candidate_pods) >= min_replicas:
-                        # We have enough pods, remove all creating keys for this deployment
-                        if creating_pod_keys_for_deployment:
-                            pods_to_remove_from_creating = list(creating_pod_keys_for_deployment)
-                            logger.info(f"Deployment {namespace}/{name}: Already have {len(candidate_pods)} pods (>= min {min_replicas}), removing all {len(pods_to_remove_from_creating)} creating keys")
+                    # Also clean up stale entries: Only remove creating keys if we have RUNNING pods that match
+                    # DO NOT remove creating keys just because we have enough pods - pods might still be syncing to Redis
+                    # Only remove creating keys when:
+                    # 1. The pod actually appears in Redis with matching instance (handled above)
+                    # 2. We have RUNNING pods >= min_replicas AND the creating keys are old (stale)
+                    # For now, we only remove keys when pods appear in Redis (handled above)
+                    # Creating keys will expire automatically via TTL (600s) if pods never appear
                     
                     # Remove pods that have appeared in Redis from the creating set
                     if pods_to_remove_from_creating:
@@ -594,7 +610,87 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     creating_pod_keys_for_deployment = set()
                 
                 # Count existing pods + in-flight pod creations for this deployment
+                # IMPORTANT: Also count pods in CREATED/PENDING states as they're being created
+                # These pods might not have last_updated yet or might be too new
+                creating_state_pods = [
+                    p for p in candidate_pods
+                    if p.get('status', '').upper() in ('CREATED', 'PENDING', 'RESTARTING')
+                ]
+                # Count all pods including those being created (both in Redis and in-flight)
                 all_pods_count = len(candidate_pods) + len(creating_pod_keys_for_deployment)
+                
+                # CRITICAL: Clean up stale creating keys if no pods exist
+                # If we have creating keys but no candidate_pods, and we have zero running replicas,
+                # the creating keys might be stale. However, pods can take 30-60 seconds to sync to Redis,
+                # so we should wait a reasonable time before cleaning up.
+                # 
+                # Strategy: Track when we first detect creating keys with no pods
+                # If this state persists for more than 90 seconds (3x the sync interval), clean up
+                if (creating_pod_keys_for_deployment and 
+                    len(candidate_pods) == 0 and 
+                    current_replicas == 0 and 
+                    all_pods_count < min_replicas):
+                    # Track when we first detected this stale state
+                    stale_tracker_key = f"{STALE_CREATING_KEYS_TRACKER_PREFIX}:{namespace}:{name}"
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc)
+                    
+                    try:
+                        # Check if we have a timestamp for when we first detected this state
+                        tracker_timestamp_str = redis_client.get(stale_tracker_key)
+                        if tracker_timestamp_str:
+                            # We've seen this state before - check how long it's been
+                            tracker_timestamp = datetime.fromisoformat(tracker_timestamp_str.decode('utf-8') if isinstance(tracker_timestamp_str, bytes) else tracker_timestamp_str)
+                            time_since_first_detection = (now - tracker_timestamp).total_seconds()
+                            
+                            # STALE_KEY_TIMEOUT: If creating keys exist but no pods appear after 90 seconds,
+                            # they're likely stale (pods should sync within 30-60 seconds)
+                            STALE_KEY_TIMEOUT = 90  # seconds
+                            
+                            if time_since_first_detection > STALE_KEY_TIMEOUT:
+                                # Keys are stale - clean them up
+                                logger.warning(f"Deployment {namespace}/{name}: Found {len(creating_pod_keys_for_deployment)} creating keys but zero pods in Redis for {time_since_first_detection:.1f}s (>{STALE_KEY_TIMEOUT}s). These keys are stale - cleaning them up.")
+                                stale_keys_list = list(creating_pod_keys_for_deployment)
+                                redis_client.srem(PODS_CREATING_KEY, *stale_keys_list)
+                                redis_client.delete(stale_tracker_key)  # Clear tracker
+                                logger.info(f"Deployment {namespace}/{name}: Removed {len(stale_keys_list)} stale creating keys: {stale_keys_list}")
+                                creating_pod_keys_for_deployment = set()
+                                all_pods_count = len(candidate_pods)  # Update count after cleanup
+                            else:
+                                # Still waiting - pods might be syncing
+                                logger.warning(f"Deployment {namespace}/{name}: Found {len(creating_pod_keys_for_deployment)} creating keys but zero pods in Redis (waiting {time_since_first_detection:.1f}s / {STALE_KEY_TIMEOUT}s). Pods may still be syncing.")
+                        else:
+                            # First time detecting this state - record timestamp
+                            redis_client.setex(stale_tracker_key, 120, now.isoformat())  # 2 minute TTL
+                            logger.warning(f"Deployment {namespace}/{name}: Found {len(creating_pod_keys_for_deployment)} creating keys but zero pods in Redis. Tracking timestamp - will clean up if no pods appear within 90 seconds.")
+                    except Exception as tracker_error:
+                        logger.warning(f"Failed to track/cleanup stale creating keys: {tracker_error}", exc_info=True)
+                        # Fallback: if tracking fails and we're definitely below min_replicas, be more aggressive
+                        # Only do this if we're significantly below min (e.g., 0 vs min_replicas)
+                        if current_replicas == 0 and all_pods_count == 0:
+                            logger.warning(f"Deployment {namespace}/{name}: Tracking failed, but have 0 pods and need {min_replicas}. Cleaning up creating keys as fallback.")
+                            try:
+                                stale_keys_list = list(creating_pod_keys_for_deployment)
+                                redis_client.srem(PODS_CREATING_KEY, *stale_keys_list)
+                                logger.info(f"Deployment {namespace}/{name}: Removed {len(stale_keys_list)} creating keys (fallback cleanup): {stale_keys_list}")
+                                creating_pod_keys_for_deployment = set()
+                                all_pods_count = len(candidate_pods)
+                            except Exception as cleanup_error:
+                                logger.warning(f"Failed to cleanup creating keys (fallback): {cleanup_error}")
+                else:
+                    # We have pods or creating keys are valid - clear any stale tracker
+                    stale_tracker_key = f"{STALE_CREATING_KEYS_TRACKER_PREFIX}:{namespace}:{name}"
+                    try:
+                        redis_client.delete(stale_tracker_key)
+                    except Exception:
+                        pass
+                
+                # Log detailed pod state for debugging
+                logger.warning(f"Deployment {namespace}/{name}: Pod state breakdown - Total: {all_pods_count} (candidate_pods: {len(candidate_pods)}, creating_keys: {len(creating_pod_keys_for_deployment)}, creating_state: {len(creating_state_pods)}), min: {min_replicas}, max: {max_replicas}, current_replicas: {current_replicas}")
+                if creating_pod_keys_for_deployment:
+                    logger.warning(f"Deployment {namespace}/{name}: Pods marked as creating: {creating_pod_keys_for_deployment}")
+                else:
+                    logger.warning(f"Deployment {namespace}/{name}: No pods marked as creating (checking if pods were just created)")
                 
                 # Get health check configuration to check readiness wait period
                 # Check for initialDelaySeconds in readinessProbe (default: 5 seconds)
@@ -657,7 +753,12 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                 
                 # CRITICAL SAFETY CHECK: If we already have enough pods (including in-flight), don't create more
                 if all_pods_count >= max_replicas:
-                    logger.info(f"Deployment {namespace}/{name}: Already at or above max_replicas (all_pods_count={all_pods_count} >= max={max_replicas}). Skipping pod creation.")
+                    logger.warning(f"Deployment {namespace}/{name}: Already at or above max_replicas (all_pods_count={all_pods_count} >= max={max_replicas}). Skipping pod creation.")
+                    continue
+                
+                # Log why we might not be creating pods
+                if all_pods_count >= min_replicas:
+                    logger.warning(f"Deployment {namespace}/{name}: Already at or above min_replicas (all_pods_count={all_pods_count} >= min={min_replicas}). No pods to create.")
                     continue
                 
                 # Only scale up if we're below min_replicas AND below max_replicas
@@ -673,9 +774,11 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     
                     # CRITICAL SAFETY CHECK: If we're already creating pods, don't create more
                     # This prevents race conditions where multiple tasks try to create pods
-                    if len(creating_pod_keys_for_deployment) > 0:
+                    # Check both: pods marked as creating AND pods in CREATED/PENDING states
+                    total_creating = len(creating_pod_keys_for_deployment) + len(creating_state_pods)
+                    if total_creating > 0:
                         # We're already creating pods, wait for them to finish
-                        logger.info(f"Deployment {namespace}/{name}: Already creating {len(creating_pod_keys_for_deployment)} pods. Waiting for them to complete before creating more. (all_pods_count={all_pods_count}, creating={len(creating_pod_keys_for_deployment)})")
+                        logger.info(f"Deployment {namespace}/{name}: Already creating {total_creating} pods (creating_keys: {len(creating_pod_keys_for_deployment)}, creating_state: {len(creating_state_pods)}). Waiting for them to complete before creating more. (all_pods_count={all_pods_count})")
                         continue
                     
                     # Safety check: never create negative or zero pods
@@ -707,26 +810,16 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                             logger.warning(f"Deployment {namespace}/{name}: After safety check, no pods to create. Skipping.")
                             continue
                     
-                    # Get available worker nodes
-                    worker_nodes = get_worker_nodes_from_redis(redis_interface)
-                    if not worker_nodes:
-                        logger.error(f"Deployment {namespace}/{name}: No worker nodes available for recovery")
-                        recovery_results['errors'].append({
-                            'deployment': f"{namespace}/{name}",
-                            'error': 'No worker nodes available'
-                        })
-                        continue
-                    
-                    # Convert to millicores and MB for distribution
-                    worker_nodes_millicores = [
-                        {
-                            'cpu': int(node['cpu'] * 1000),  # Convert cores to millicores
-                            'memory': node['memory'],  # Already in MB
-                            'hostname': node.get('hostname'),
-                            'ip_address': node.get('ip_address'),
-                        }
-                        for node in worker_nodes
-                    ]
+                    # Check if AWS nodes are already being created for this namespace
+                    # This prevents duplicate AWS node creation attempts
+                    aws_nodes_creating_key = f"{AWS_NODES_CREATING_KEY_PREFIX}:{namespace}"
+                    try:
+                        lock_exists = redis_client.exists(aws_nodes_creating_key)
+                        if lock_exists:
+                            logger.info(f"Deployment {namespace}/{name}: AWS nodes are already being created for namespace {namespace}. Waiting for them to be ready.")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"Failed to check AWS nodes creating lock: {e}", exc_info=True)
                     
                     # Count existing pods per host per service to ensure distribution
                     # This prevents placing multiple replicas on the same host
@@ -742,261 +835,89 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     
                     logger.info(f"Deployment {namespace}/{name}: Existing pods per host: {existing_pods_per_host}")
                     
-                    # Prepare cluster_info for distribution
-                    cpu_millicores = resource_reqs.get('cpu_millicores', 0)
-                    memory_mb = resource_reqs.get('memory_mb', 0)
+                    # Acquire AWS node creation lock before calling scheduler
+                    # The scheduler will check for worker nodes and create AWS nodes if needed
+                    aws_lock_acquired = False
+                    try:
+                        lock_acquired = redis_client.set(aws_nodes_creating_key, "1", nx=True, ex=300)  # 5 minute TTL
+                        if lock_acquired:
+                            aws_lock_acquired = True
+                            logger.info(f"Acquired AWS node creation lock for namespace {namespace}")
+                    except Exception as e:
+                        logger.warning(f"Failed to acquire AWS nodes creating lock: {e}", exc_info=True)
                     
-                    cluster_info = {
-                        app_label: {
-                            'cpu': cpu_millicores,
-                            'memory': memory_mb,
-                            'instances': missing_count
-                        }
-                    }
-                    
-                    # Use distribute_nodes_services to find placement
-                    # Pass existing_pods_per_host so the distribution algorithm can avoid hosts with existing pods
-                    distribution = ClusterWorkerDistribution(worker_nodes_millicores, cluster_info, existing_pods_per_host=existing_pods_per_host)
-                    placement_by_index = distribution.distribute_cluster_nodes()
-                    
-                    if not placement_by_index:
-                        logger.warning(f"Deployment {namespace}/{name}: Could not find placement for {missing_count} missing replicas on existing nodes. Attempting to create AWS nodes...")
-                        
-                        # Check if AWS nodes are already being created for this namespace to prevent duplicate creation
-                        aws_nodes_creating_key = f"{AWS_NODES_CREATING_KEY_PREFIX}:{namespace}"
-                        try:
-                            is_creating = redis_client.exists(aws_nodes_creating_key)
-                            if is_creating:
-                                logger.info(f"Deployment {namespace}/{name}: AWS nodes are already being created for namespace {namespace}. Skipping duplicate creation attempt.")
-                                recovery_results['errors'].append({
-                                    'deployment': f"{namespace}/{name}",
-                                    'error': 'AWS nodes already being created for this namespace'
-                                })
-                                continue
-                        except Exception as e:
-                            logger.warning(f"Failed to check AWS nodes creating status: {e}", exc_info=True)
-                        
-                        # Calculate required AWS nodes
-                        required_nodes = max(1, (missing_count + 1) // 2)
-                        logger.info(f"Creating {required_nodes} AWS node(s) to accommodate {missing_count} missing replicas")
-                        
-                        # Mark AWS nodes as being created to prevent concurrent creation
-                        try:
-                            redis_client.setex(aws_nodes_creating_key, 300, "1")  # 5 minute TTL
-                            logger.debug(f"Marked AWS node creation in progress for namespace {namespace}")
-                        except Exception as e:
-                            logger.warning(f"Failed to mark AWS node creation: {e}", exc_info=True)
-                        
-                        # Get AWS config (from Redis with fallback to config file)
-                        # Only the 4 requested fields (ami_id, key_name, security_group_ids, subnet_id) come from Redis
-                        # instance_type and region still come from config.json
-                        from utils.celery.tasks.aws_tasks import create_worker_nodes
-                        from utils.aws.config_helper import get_aws_node_config
-                        
-                        node_config = get_aws_node_config()  # Only the 4 requested fields from Redis
-                        read_config = rc()
-                        file_aws_config = read_config.aws_config  # For instance_type and region
-                        
-                        # Merge: node_config (4 fields from Redis/fallback) + instance_type/region from config file
-                        # get_aws_node_config() already handles fallback to config.json for the 4 fields
-                        aws_config = node_config.copy() if node_config else {}
-                        
-                        # Always get instance_type and region from config.json
-                        aws_config['instance_type'] = file_aws_config.get('instance_type', 't3.medium')
-                        aws_config['region'] = file_aws_config.get('region')
-                        
-                        # Validate required fields are present (check if None or empty string/list)
-                        required_fields = ['ami_id', 'key_name', 'security_group_ids', 'subnet_id']
-                        missing_fields = []
-                        for field in required_fields:
-                            value = aws_config.get(field)
-                            if not value or (isinstance(value, list) and len(value) == 0):
-                                missing_fields.append(field)
-                        
-                        if missing_fields:
-                            logger.error(f"Deployment {namespace}/{name}: AWS configuration missing required fields: {missing_fields}. Cannot create nodes.")
-                            recovery_results['errors'].append({
-                                'deployment': f"{namespace}/{name}",
-                                'error': f'AWS configuration missing required fields: {missing_fields}'
-                            })
-                            continue
-                        
-                        # Create AWS queue info with proper encoding
-                        key = read_config.encryption_config['key']
-                        encode_util = UtilitiesExtension(key)
-                        aws_queue_info = create_queue_info("aws_interface", utilities_extension=encode_util)
-                        logger.info(f"Routing AWS node creation to queue: {aws_queue_info.get('queue')}")
-                        
-                        # Submit AWS node creation task
-                        try:
-                            aws_result = submit_celery_task(
-                                task=create_worker_nodes,
-                                args=(
-                                    None,  # aws_access_key - deprecated, read from config
-                                    None,  # aws_secret_key - deprecated, read from config
-                                    aws_config.get("region"),  # Optional region override
-                                ),
-                                kwargs={
-                                    'instance_type': aws_config.get('instance_type', 't3.medium'),
-                                    'ami_id': aws_config.get('ami_id'),
-                                    'key_name': aws_config.get('key_name'),
-                                    'security_group_ids': aws_config.get('security_group_ids', []),
-                                    'subnet_id': aws_config.get('subnet_id'),
-                                    'namespace': namespace,
-                                    'MaxCount': required_nodes,
-                                },
-                                queue_info=aws_queue_info,
-                                operation_name="create_aws_nodes_for_scaling",
-                                error_code="AWS_NODE_CREATION_ERROR",
-                            )
-                            
-                            aws_task_id = aws_result.get("data", {}).get("task_id")
-                            if aws_task_id:
-                                logger.info(f"Deployment {namespace}/{name}: AWS node creation task submitted: {aws_task_id}")
-                                recovery_results['deployments_recovered'] += 1
-                                # Keep the lock until nodes are ready (TTL will expire automatically)
-                                # The lock will be cleared when nodes come online and are detected
-                            else:
-                                logger.error(f"Deployment {namespace}/{name}: AWS node creation task failed to submit")
-                                # Clear the lock since creation failed
-                                try:
-                                    redis_client.delete(aws_nodes_creating_key)
-                                except Exception:
-                                    pass
-                                recovery_results['errors'].append({
-                                    'deployment': f"{namespace}/{name}",
-                                    'error': 'AWS node creation task failed to submit'
-                                })
-                        except Exception as e:
-                            logger.error(f"Deployment {namespace}/{name}: Failed to create AWS nodes: {e}", exc_info=True)
-                            # Clear the lock since creation failed
-                            try:
-                                redis_client.delete(aws_nodes_creating_key)
-                            except Exception:
-                                pass
-                            recovery_results['errors'].append({
-                                'deployment': f"{namespace}/{name}",
-                                'error': f'Failed to create AWS nodes: {str(e)}'
-                            })
-                        
-                        continue
-                    
-                    # Convert placement from indices to hostnames
-                    placement = {}
-                    total_placement_count = 0
-                    for node_index, placements in placement_by_index.items():
-                        if node_index < len(worker_nodes):
-                            hostname = worker_nodes[node_index]['hostname']
-                            placement[hostname] = placements
-                            total_placement_count += len(placements)
-                    
-                    # CRITICAL SAFETY CHECK: Verify placement count matches missing_count
-                    if total_placement_count != missing_count:
-                        logger.error(f"Deployment {namespace}/{name}: ERROR - Distribution algorithm returned {total_placement_count} placements but expected {missing_count}. Adjusting to create only {missing_count} pods.")
-                        # Limit placement to exactly missing_count
-                        placement_limited = {}
-                        count_so_far = 0
-                        for hostname, placements in placement.items():
-                            if count_so_far >= missing_count:
-                                break
-                            remaining = missing_count - count_so_far
-                            placement_limited[hostname] = placements[:remaining]
-                            count_so_far += len(placement_limited[hostname])
-                        placement = placement_limited
-                        logger.warning(f"Deployment {namespace}/{name}: Limited placement to {count_so_far} pods (expected: {missing_count})")
-                    
-                    # Create missing pods using centralized scheduler function
-                    # IMPORTANT: Track how many pods we create to ensure we don't exceed missing_count
-                    pods_recreated = 0
+                    # Use scheduler's schedule_recovery_pods method to handle everything
+                    # This method will:
+                    # 1. Check for worker nodes (calls get_worker_nodes_from_redis)
+                    # 2. Create AWS nodes if needed (calls create_aws_nodes_for_recovery)
+                    # 3. Use distribution algorithm to find placement (calls ClusterWorkerDistribution)
+                    # 4. Create pods on assigned hosts (calls create_pod_on_host)
+                    logger.info(f"Deployment {namespace}/{name}: Calling scheduler.schedule_recovery_pods for {missing_count} replicas")
                     scheduler = DeploymentScheduler()
+                    try:
+                        result = scheduler.schedule_recovery_pods(
+                            namespace=namespace,
+                            deployment_name=name,
+                            app_label=app_label,
+                            missing_replicas=missing_count,
+                            containers=containers,
+                            resource_reqs=resource_reqs,
+                            existing_pods_per_host=existing_pods_per_host
+                        )
+                        logger.info(f"Deployment {namespace}/{name}: Scheduler returned: status={result.get('status')}, pods_created={result.get('pods_created', 0)}, error={result.get('error')}")
+                    except Exception as scheduler_error:
+                        logger.error(f"Deployment {namespace}/{name}: Exception calling scheduler: {scheduler_error}", exc_info=True)
+                        result = {
+                            'status': 'error',
+                            'pods_created': 0,
+                            'error': str(scheduler_error)
+                        }
                     
-                    for hostname, placements in placement.items():
-                        host_info = next((n for n in worker_nodes if n.get('hostname') == hostname), None)
-                        if not host_info:
-                            continue
-                        
-                        # CRITICAL SAFETY CHECK: Ensure we don't create more pods than missing_count
-                        if pods_recreated >= missing_count:
-                            logger.warning(f"Deployment {namespace}/{name}: Already created {pods_recreated} pods (target: {missing_count}). Stopping pod creation.")
-                            break
-                        
-                        for app_name, instance_num in placements:
-                            # CRITICAL SAFETY CHECK: Ensure we don't create more pods than missing_count
-                            if pods_recreated >= missing_count:
-                                logger.warning(f"Deployment {namespace}/{name}: Already created {pods_recreated} pods (target: {missing_count}). Stopping pod creation.")
-                                break
-                            try:
-                                # Find the next available instance number (avoid conflicts)
-                                existing_instances = [p.get('labels', {}).get('instance') for p in running_pods]
-                                # Use a high instance number to avoid conflicts
-                                recovery_instance_num = max([int(i) for i in existing_instances if i and str(i).isdigit()], default=-1) + 1 + instance_num
-                                
-                                # Prepare container specs with resources properly formatted
-                                # The scheduler's create_pod_on_host will handle resource conversion
-                                container_specs = []
-                                for container in containers:
-                                    # Include resources in the container spec - scheduler will handle conversion
-                                    # Normalize args: if not provided or empty list, set to None
-                                    # Empty args [] would fail at runc level with "args must not be empty"
-                                    # None allows fallback logic to extract Entrypoint/Cmd from image
-                                    container_args = container.get('args')
-                                    if container_args is None or (isinstance(container_args, list) and len(container_args) == 0):
-                                        container_args = None
-                                    
-                                    container_spec = {
-                                        'name': container.get('name'),
-                                        'image': container.get('image'),
-                                        'args': container_args,  # None if not provided or empty, otherwise use as-is
-                                        'env': container.get('env', {}),
-                                        'ports': container.get('ports', []),
-                                    }
-                                    # Include resources if present (scheduler will convert if needed)
-                                    if 'resources' in container:
-                                        container_spec['resources'] = container['resources']
-                                    container_specs.append(container_spec)
-                                
-                                # Use centralized scheduler function to create pod
-                                result = scheduler.create_pod_on_host(
-                                    containers=container_specs,
-                                    namespace=namespace,
-                                    hostname=hostname,
-                                    labels={'app': app_label, 'instance': str(recovery_instance_num)},
-                                    deployment_name=name,
-                                    replica_num=recovery_instance_num
-                                )
-                                
-                                if result.get('status') == 'submitted':
-                                    pods_recreated += 1
-                                    logger.info(f"Recovered pod for {namespace}/{name} instance {recovery_instance_num} on {hostname} (task_id: {result.get('task_id')})")
-                                    # Mark pod as being created to prevent recovery task from trying again
-                                    # Use format: namespace:name:instance_num
-                                    creating_pod_key = f"{namespace}:{name}:{recovery_instance_num}"
-                                    try:
-                                        redis_client.sadd(PODS_CREATING_KEY, creating_pod_key)
-                                        redis_client.expire(PODS_CREATING_KEY, 300)  # 5 minutes TTL (should be enough for pod creation)
-                                        logger.debug(f"Marked pod creation {creating_pod_key} as in-flight")
-                                    except Exception as mark_error:
-                                        logger.warning(f"Failed to mark pod creation {creating_pod_key} as in-flight: {mark_error}")
-                                else:
-                                    raise Exception(result.get('error', 'Unknown error'))
-                                
-                            except Exception as e:
-                                logger.error(f"Failed to recover pod for {namespace}/{name} on {hostname}: {e}", exc_info=True)
-                                recovery_results['errors'].append({
-                                    'deployment': f"{namespace}/{name}",
-                                    'hostname': hostname,
-                                    'error': str(e)
-                                })
+                    # Release lock if AWS node creation failed
+                    if aws_lock_acquired and result.get('status') == 'error' and result.get('aws_task_id') is None:
+                        try:
+                            redis_client.delete(aws_nodes_creating_key)
+                            logger.info(f"Released AWS node creation lock due to error")
+                        except Exception:
+                            pass
                     
+                    pods_recreated = result.get('pods_created', 0)
+                    result_status = result.get('status', 'error')
+                    
+                    # Handle different result statuses
                     if pods_recreated > 0:
+                        # Pods were created successfully
+                        # Mark each created pod instance as creating
+                        created_instances = result.get('created_instances', [])
+                        for instance_num in created_instances:
+                            creating_pod_key = f"{namespace}:{name}:{instance_num}"
+                            try:
+                                redis_client.sadd(PODS_CREATING_KEY, creating_pod_key)
+                                redis_client.expire(PODS_CREATING_KEY, 300)  # 10 minutes TTL (safety net - stale keys cleaned up after 90s)
+                                logger.info(f"Marked pod creation {creating_pod_key} as in-flight (TTL: 600s, stale detection: 90s)")
+                            except Exception as mark_error:
+                                logger.warning(f"Failed to mark pod creation {creating_pod_key} as in-flight: {mark_error}")
+                        
                         recovery_results['deployments_recovered'] += 1
                         recovery_results['pods_recreated'] += pods_recreated
                         logger.info(f"Recovered {pods_recreated} pods for deployment {namespace}/{name} (expected: {missing_count}). Will wait for readiness before creating more.")
-                        # CRITICAL SAFETY CHECK: Log if we created more pods than expected
-                        if pods_recreated > missing_count:
-                            logger.error(f"Deployment {namespace}/{name}: ERROR - Created {pods_recreated} pods but expected only {missing_count}. This indicates a bug in pod creation logic.")
-                    elif pods_recreated == 0 and missing_count > 0:
-                        logger.warning(f"Deployment {namespace}/{name}: Expected to create {missing_count} pods but created 0. This may indicate an issue with pod creation.")
+                    elif result_status == 'submitted':
+                        # AWS nodes are being created (no pods created yet)
+                        logger.info(f"Deployment {namespace}/{name}: AWS node creation initiated (task_id: {result.get('aws_task_id')}). Pods will be created once nodes are ready.")
+                        recovery_results['deployments_recovered'] += 1
+                        # Lock will expire automatically via TTL when nodes come online
+                    elif result_status == 'success' and pods_recreated == 0:
+                        # This shouldn't happen, but handle gracefully
+                        logger.warning(f"Deployment {namespace}/{name}: Scheduler returned success but no pods were created. This may indicate an issue.")
+                    elif result_status == 'error':
+                        logger.error(f"Deployment {namespace}/{name}: Scheduler returned error: {result.get('error', 'Unknown error')}")
+                        recovery_results['errors'].append({
+                            'deployment': f"{namespace}/{name}",
+                            'error': result.get('error', 'Scheduler error')
+                        })
+                    else:
+                        # Unknown status
+                        logger.warning(f"Deployment {namespace}/{name}: Scheduler returned unknown status: {result_status}, pods_created: {pods_recreated}")
                 elif all_pods_count >= max_replicas:
                     logger.info(f"Deployment {namespace}/{name}: At or above max_replicas (Total pods: {all_pods_count} >= {max_replicas}, Running: {current_replicas})")
                 elif all_pods_count >= min_replicas:

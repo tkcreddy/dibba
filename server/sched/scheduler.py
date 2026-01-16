@@ -18,7 +18,7 @@ from utils.redis.host_pod_store import HostPodStore, HostStatus
 from server.nodes.distribute_nodes_services import get_worker_nodes_from_redis,ClusterWorkerDistribution
 from utils.celery.tasks.aws_tasks import create_worker_nodes
 from utils.celery.tasks.containerd_tasks import create_pod_task
-from utils.celery.queue_utils import create_host_queue_info, submit_celery_task
+from utils.celery.queue_utils import create_host_queue_info, create_queue_info, submit_celery_task
 from utils.extensions.utilities_extention import UtilitiesExtension
 from utils.ReadConfig import ReadConfig as rc
 
@@ -839,6 +839,269 @@ class DeploymentScheduler:
                 'status': 'error',
                 'error': str(e),
                 'hostname': hostname
+            }
+    
+    @log_to_file(logger)
+    def schedule_recovery_pods(
+        self,
+        namespace: str,
+        deployment_name: str,
+        app_label: str,
+        missing_replicas: int,
+        containers: List[Dict[str, Any]],
+        resource_reqs: Dict[str, Any],
+        existing_pods_per_host: Optional[Dict[str, Dict[str, int]]] = None
+    ) -> Dict[str, Any]:
+        """Schedule pods for deployment recovery.
+        
+        This method handles the full recovery flow:
+        1. Checks for available worker nodes
+        2. Creates AWS nodes if none exist
+        3. Creates pods on available nodes using distribution algorithm
+        
+        Args:
+            namespace: Deployment namespace
+            deployment_name: Deployment name
+            app_label: Application label
+            missing_replicas: Number of replicas needed
+            containers: Container specifications
+            resource_reqs: Resource requirements dict with cpu_millicores and memory_mb
+            existing_pods_per_host: Optional dict mapping hostname to service name to count
+            
+        Returns:
+            Dictionary with status, pods_created, and any errors
+        """
+        logger.info(f"Scheduling recovery pods for {namespace}/{deployment_name}: {missing_replicas} replicas needed")
+        
+        # 1. Get available worker nodes
+        worker_nodes = get_worker_nodes_from_redis(self.redis_interface)
+        
+        if not worker_nodes:
+            # No worker nodes - create AWS nodes
+            logger.warning(f"No worker nodes available for {namespace}/{deployment_name}. Creating AWS nodes.")
+            
+            # Check if AWS nodes are already being created (lock check should be done by caller)
+            # But we'll create them here if needed
+            result = self.create_aws_nodes_for_recovery(
+                namespace=namespace,
+                deployment_name=deployment_name,
+                app_label=app_label,
+                missing_replicas=missing_replicas,
+                containers=containers,
+                resource_reqs=resource_reqs
+            )
+            return {
+                'status': result.get('status', 'error'),
+                'pods_created': 0,
+                'aws_task_id': result.get('task_id'),
+                'message': result.get('message', 'Creating AWS nodes'),
+                'error': result.get('error')
+            }
+        
+        # 2. Convert worker nodes to millicores format for distribution
+        worker_nodes_millicores = [
+            {
+                'cpu': int(node['cpu'] * 1000),  # Convert cores to millicores
+                'memory': node['memory'],  # Already in MB
+                'hostname': node.get('hostname'),
+                'ip_address': node.get('ip_address'),
+            }
+            for node in worker_nodes
+        ]
+        
+        # 3. Prepare cluster_info for distribution
+        cpu_millicores = resource_reqs.get('cpu_millicores', 0)
+        memory_mb = resource_reqs.get('memory_mb', 0)
+        
+        cluster_info = {
+            app_label: {
+                'cpu': cpu_millicores,
+                'memory': memory_mb,
+                'instances': missing_replicas
+            }
+        }
+        
+        # 4. Use distribute_nodes_services to find placement
+        distribution = ClusterWorkerDistribution(
+            worker_nodes_millicores, 
+            cluster_info, 
+            existing_pods_per_host=existing_pods_per_host
+        )
+        placement_by_index = distribution.distribute_cluster_nodes()
+        
+        if not placement_by_index:
+            # Could not place pods - create AWS nodes
+            logger.warning(f"Could not find placement for {missing_replicas} replicas. Creating AWS nodes.")
+            result = self.create_aws_nodes_for_recovery(
+                namespace=namespace,
+                deployment_name=deployment_name,
+                app_label=app_label,
+                missing_replicas=missing_replicas,
+                containers=containers,
+                resource_reqs=resource_reqs
+            )
+            return {
+                'status': result.get('status', 'error'),
+                'pods_created': 0,
+                'aws_task_id': result.get('task_id'),
+                'message': result.get('message', 'Creating AWS nodes'),
+                'error': result.get('error')
+            }
+        
+        # 5. Convert placement from indices to hostnames
+        placement = {}
+        total_placement_count = 0
+        for node_index, placements in placement_by_index.items():
+            if node_index < len(worker_nodes):
+                hostname = worker_nodes[node_index]['hostname']
+                placement[hostname] = placements
+                total_placement_count += len(placements)
+        
+        # 6. Verify placement count matches missing_replicas
+        if total_placement_count != missing_replicas:
+            logger.warning(f"Placement count ({total_placement_count}) != missing_replicas ({missing_replicas}). Limiting to {missing_replicas}.")
+            placement_limited = {}
+            count_so_far = 0
+            for hostname, placements in placement.items():
+                if count_so_far >= missing_replicas:
+                    break
+                remaining = missing_replicas - count_so_far
+                placement_limited[hostname] = placements[:remaining]
+                count_so_far += len(placement_limited[hostname])
+            placement = placement_limited
+        
+        # 7. Create pods using existing method
+        pods_created = 0
+        created_instances = []  # Track instance numbers for marking as creating
+        for hostname, placements in placement.items():
+            for app_name, instance_num in placements:
+                if pods_created >= missing_replicas:
+                    break
+                
+                # Prepare container specs
+                container_specs = []
+                for container in containers:
+                    container_args = container.get('args')
+                    if container_args is None or (isinstance(container_args, list) and len(container_args) == 0):
+                        container_args = None
+                    
+                    container_spec = {
+                        'name': container.get('name'),
+                        'image': container.get('image'),
+                        'args': container_args,
+                        'env': container.get('env', {}),
+                        'ports': container.get('ports', []),
+                    }
+                    if 'resources' in container:
+                        container_spec['resources'] = container['resources']
+                    container_specs.append(container_spec)
+                
+                # Create pod
+                result = self.create_pod_on_host(
+                    containers=container_specs,
+                    namespace=namespace,
+                    hostname=hostname,
+                    labels={'app': app_label, 'instance': str(instance_num)},
+                    deployment_name=deployment_name,
+                    replica_num=instance_num
+                )
+                
+                if result.get('status') == 'submitted':
+                    pods_created += 1
+                    created_instances.append(instance_num)
+                    logger.info(f"Created pod {pods_created}/{missing_replicas} for {namespace}/{deployment_name} on {hostname} (instance: {instance_num})")
+                else:
+                    logger.error(f"Failed to create pod: {result.get('error', 'Unknown error')}")
+        
+        return {
+            'status': 'success' if pods_created > 0 else 'error',
+            'pods_created': pods_created,
+            'expected': missing_replicas,
+            'created_instances': created_instances,  # Return instance numbers for tracking
+            'message': f"Created {pods_created} pods for {namespace}/{deployment_name}"
+        }
+    
+    @log_to_file(logger)
+    def create_aws_nodes_for_recovery(
+        self,
+        namespace: str,
+        deployment_name: str,
+        app_label: str,
+        missing_replicas: int,
+        containers: List[Dict[str, Any]],
+        resource_reqs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Create AWS nodes for deployment recovery when no worker nodes are available.
+        
+        This method is used by the recovery task when there are no worker nodes.
+        It creates AWS nodes and returns a result that can be used to track the creation.
+        
+        Args:
+            namespace: Deployment namespace
+            deployment_name: Deployment name
+            app_label: Application label
+            missing_replicas: Number of replicas needed
+            containers: Container specifications
+            resource_reqs: Resource requirements dict with cpu_millicores and memory_mb
+            
+        Returns:
+            Dictionary with status and task_id
+        """
+        logger.info(f"Creating AWS nodes for recovery: {namespace}/{deployment_name}, missing_replicas={missing_replicas}")
+        
+        # Calculate required AWS nodes
+        required_nodes = max(1, (missing_replicas + 1) // 2)
+        logger.info(f"Creating {required_nodes} AWS node(s) to accommodate {missing_replicas} missing replicas")
+        
+        # Create AWS queue info with proper encoding
+        aws_queue_info = create_queue_info("aws_interface", utilities_extension=self.encode_util)
+        logger.info(f"Routing AWS node creation to queue: {aws_queue_info.get('queue')}")
+        
+        # Submit AWS node creation task using scheduler's AWS config
+        try:
+            result = submit_celery_task(
+                task=create_worker_nodes,
+                args=(
+                    None,  # aws_access_key - deprecated, read from config
+                    None,  # aws_secret_key - deprecated, read from config
+                    self.aws_config.get("region"),  # Optional region override
+                ),
+                kwargs={
+                    'instance_type': self.aws_config.get('instance_type', 't3.medium'),
+                    'ami_id': self.aws_config.get('ami_id'),
+                    'key_name': self.aws_config.get('key_name'),
+                    'security_group_ids': self.aws_config.get('security_group_ids', []),
+                    'subnet_id': self.aws_config.get('subnet_id'),
+                    'namespace': namespace,
+                    'MaxCount': required_nodes,
+                },
+                queue_info=aws_queue_info,
+                operation_name="create_aws_nodes_for_recovery",
+                error_code="AWS_NODE_CREATION_ERROR",
+            )
+            
+            # submit_celery_task returns {"status": "success", "data": {"task_id": ...}}
+            aws_task_id = result.get('data', {}).get('task_id')
+            if aws_task_id:
+                logger.info(f"AWS node creation task submitted for {namespace}/{deployment_name}: {aws_task_id}")
+                return {
+                    'status': 'submitted',
+                    'task_id': aws_task_id,
+                    'required_nodes': required_nodes,
+                    'message': f"Creating {required_nodes} AWS nodes. Pods will be created once nodes are ready."
+                }
+            else:
+                logger.error(f"AWS node creation task failed to submit for {namespace}/{deployment_name}. Result: {result}")
+                return {
+                    'status': 'error',
+                    'error': 'AWS node creation task failed to submit'
+                }
+        
+        except Exception as e:
+            logger.error(f"Failed to create AWS nodes for {namespace}/{deployment_name}: {e}", exc_info=True)
+            return {
+                'status': 'error',
+                'error': f"Failed to create AWS nodes: {str(e)}"
             }
     
     @log_to_file(logger)

@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dibba Architecture - Container Orchestration Platform</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+            background: #0f1419;
+            padding: 0;
+            min-height: 100vh;
+            color: #e8eaed;
+            line-height: 1.6;
+        }
+        
+        .header {
+            text-align: center;
+            padding: 80px 20px 60px;
+            background: linear-gradient(135deg, #1a2332 0%, #0f1419 100%);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at 50% 0%, rgba(66, 153, 225, 0.1) 0%, transparent 70%);
+            pointer-events: none;
+        }
+        
+        .header h1 {
+            font-size: 4rem;
+            font-weight: 700;
+            color: #ffffff;
+            margin-bottom: 15px;
+            text-shadow: 0 2px 20px rgba(66, 153, 225, 0.3);
+            letter-spacing: -2px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .header .subtitle {
+            font-size: 1.5rem;
+            color: #9aa0a6;
+            font-weight: 400;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .header .tagline {
+            font-size: 1rem;
+            color: #5f6368;
+            margin-top: 10px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 80px 40px;
+        }
+        
+        .workflow-container {
+            background: #1a2332;
+            border-radius: 24px;
+            padding: 60px 50px;
+            margin-bottom: 80px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+        
+        .workflow-title {
+            text-align: center;
+            font-size: 2.8rem;
+            font-weight: 600;
+            margin-bottom: 60px;
+            color: #ffffff;
+            letter-spacing: -1px;
+        }
+        
+        .workflow {
+            display: flex;
+            flex-direction: column;
+            gap: 35px;
+            position: relative;
+            padding-left: 20px;
+        }
+        
+        .workflow::before {
+            content: '';
+            position: absolute;
+            left: 60px;
+            top: 0;
+            bottom: 0;
+            width: 2px;
+            background: linear-gradient(180deg, 
+                rgba(66, 153, 225, 0.6) 0%, 
+                rgba(66, 153, 225, 0.3) 50%,
+                rgba(66, 153, 225, 0.6) 100%);
+            z-index: 0;
+        }
+        
+        .step {
+            display: flex;
+            align-items: flex-start;
+            gap: 35px;
+            padding: 0;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .step-icon {
+            width: 90px;
+            height: 90px;
+            background: linear-gradient(135deg, #4289e1 0%, #5b8def 100%);
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2.8rem;
+            color: white;
+            flex-shrink: 0;
+            box-shadow: 0 8px 24px rgba(66, 153, 225, 0.4),
+                        0 0 0 4px rgba(66, 153, 225, 0.1),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.2);
+            position: relative;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .step-icon::after {
+            content: '';
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            background: #4289e1;
+            border-radius: 50%;
+            border: 3px solid #1a2332;
+            right: -10px;
+            top: 50%;
+            transform: translateY(-50%);
+            box-shadow: 0 0 0 2px rgba(66, 153, 225, 0.3);
+        }
+        
+        .step-content {
+            flex: 1;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 30px 35px;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(10px);
+        }
+        
+        .step-content:hover {
+            background: rgba(255, 255, 255, 0.06);
+            transform: translateX(8px);
+            border-color: rgba(66, 153, 225, 0.3);
+            box-shadow: 0 8px 32px rgba(66, 153, 225, 0.15);
+        }
+        
+        .step-number {
+            display: inline-block;
+            background: linear-gradient(135deg, #4289e1 0%, #5b8def 100%);
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 32px;
+            font-weight: 600;
+            font-size: 0.95rem;
+            margin-right: 15px;
+            box-shadow: 0 4px 12px rgba(66, 153, 225, 0.3);
+        }
+        
+        .step-title {
+            font-size: 1.7rem;
+            font-weight: 600;
+            color: #ffffff;
+            margin-bottom: 12px;
+            display: inline-block;
+            letter-spacing: -0.5px;
+        }
+        
+        .step-description {
+            font-size: 1.05rem;
+            color: #9aa0a6;
+            line-height: 1.8;
+            margin-top: 8px;
+        }
+        
+        .architecture-section {
+            margin-top: 80px;
+            background: #1a2332;
+            border-radius: 24px;
+            padding: 60px 50px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+        
+        .section-title {
+            font-size: 2.8rem;
+            color: #ffffff;
+            margin-bottom: 50px;
+            text-align: center;
+            letter-spacing: -1px;
+            font-weight: 600;
+        }
+        
+        .components-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+            gap: 30px;
+            margin-top: 40px;
+        }
+        
+        .component-card {
+            background: rgba(255, 255, 255, 0.04);
+            padding: 35px;
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(10px);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .component-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #4289e1 0%, #5b8def 100%);
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        
+        .component-card:hover {
+            transform: translateY(-4px);
+            background: rgba(255, 255, 255, 0.06);
+            border-color: rgba(66, 153, 225, 0.3);
+            box-shadow: 0 12px 40px rgba(66, 153, 225, 0.2);
+        }
+        
+        .component-card:hover::before {
+            opacity: 1;
+        }
+        
+        .component-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #4289e1;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            letter-spacing: -0.3px;
+        }
+        
+        .component-list {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .component-list li {
+            padding: 12px 0;
+            color: #bdc1c6;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            font-size: 1.05rem;
+            line-height: 1.7;
+            transition: color 0.2s;
+        }
+        
+        .component-list li:last-child {
+            border-bottom: none;
+        }
+        
+        .component-list li:hover {
+            color: #e8eaed;
+        }
+        
+        .component-list li::before {
+            content: "▸ ";
+            color: #4289e1;
+            font-weight: bold;
+            margin-right: 12px;
+            font-size: 1.1rem;
+        }
+        
+        .flow-diagram {
+            margin-top: 80px;
+            background: #1a2332;
+            border-radius: 24px;
+            padding: 60px 50px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+        
+        .flow-row {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 40px 0;
+            flex-wrap: wrap;
+            gap: 30px;
+        }
+        
+        .flow-box {
+            background: linear-gradient(135deg, #4289e1 0%, #5b8def 100%);
+            color: white;
+            padding: 28px 45px;
+            border-radius: 18px;
+            text-align: center;
+            min-width: 240px;
+            box-shadow: 0 8px 24px rgba(66, 153, 225, 0.4),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .flow-box::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+            transition: left 0.5s;
+        }
+        
+        .flow-box:hover {
+            transform: scale(1.05) translateY(-2px);
+            box-shadow: 0 12px 36px rgba(66, 153, 225, 0.5),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.3);
+        }
+        
+        .flow-box:hover::before {
+            left: 100%;
+        }
+        
+        .flow-box h3 {
+            font-size: 1.3rem;
+            margin-bottom: 10px;
+            font-weight: 600;
+            letter-spacing: -0.3px;
+        }
+        
+        .flow-box p {
+            font-size: 1rem;
+            opacity: 0.95;
+        }
+        
+        .flow-arrow {
+            font-size: 2.8rem;
+            color: #4289e1;
+            font-weight: 300;
+            filter: drop-shadow(0 2px 8px rgba(66, 153, 225, 0.3));
+        }
+        
+        .control-plane {
+            background: linear-gradient(135deg, #34a853 0%, #2d8f47 100%);
+        }
+        
+        .data-plane {
+            background: linear-gradient(135deg, #4289e1 0%, #5b8def 100%);
+        }
+        
+        .storage {
+            background: linear-gradient(135deg, #ea8600 0%, #d97706 100%);
+        }
+        
+        .network {
+            background: linear-gradient(135deg, #9334e6 0%, #7c3aed 100%);
+        }
+        
+        .features-section {
+            margin-top: 80px;
+            padding: 60px 50px;
+            background: #1a2332;
+            border-radius: 24px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+            margin-top: 50px;
+        }
+        
+        .feature-card {
+            background: rgba(255, 255, 255, 0.04);
+            padding: 30px;
+            border-radius: 16px;
+            border-left: 4px solid #4289e1;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(10px);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        .feature-card:hover {
+            background: rgba(255, 255, 255, 0.06);
+            transform: translateX(6px);
+            border-left-color: #5b8def;
+            box-shadow: 0 8px 24px rgba(66, 153, 225, 0.15);
+        }
+        
+        .feature-card h3 {
+            color: #4289e1;
+            margin-bottom: 15px;
+            font-size: 1.3rem;
+            font-weight: 600;
+            letter-spacing: -0.3px;
+        }
+        
+        .feature-card p {
+            color: #9aa0a6;
+            line-height: 1.7;
+            font-size: 1.05rem;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 50px 20px;
+            background: #0f1419;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            margin-top: 80px;
+        }
+        
+        .footer p {
+            color: #5f6368;
+            font-size: 1rem;
+            margin: 5px 0;
+        }
+        
+        .footer .brand {
+            color: #4289e1;
+            font-weight: 600;
+            font-size: 1.2rem;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 40px 20px;
+            }
+            
+            .header h1 {
+                font-size: 2.5rem;
+            }
+            
+            .workflow::before {
+                left: 45px;
+            }
+            
+            .step-icon {
+                width: 70px;
+                height: 70px;
+                font-size: 2.2rem;
+            }
+            
+            .step-icon::after {
+                right: -8px;
+                width: 14px;
+                height: 14px;
+            }
+            
+            .flow-row {
+                flex-direction: column;
+            }
+            
+            .flow-arrow {
+                transform: rotate(90deg);
+            }
+            
+            .workflow-container,
+            .architecture-section,
+            .flow-diagram,
+            .features-section {
+                padding: 40px 25px;
+            }
+            
+            .workflow-title,
+            .section-title {
+                font-size: 2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚀 Dibba</h1>
+        <p class="subtitle">Container Orchestration Platform</p>
+        <p class="tagline">From Code to Running Application</p>
+    </div>
+    
+    <div class="container">
+        <div class="workflow-container">
+            <h2 class="workflow-title">Deployment Workflow</h2>
+            
+            <div class="workflow">
+                <div class="step">
+                    <div class="step-icon">📝</div>
+                    <div class="step-content">
+                        <span class="step-number">1</span>
+                        <span class="step-title">Application Code & Configuration</span>
+                        <div class="step-description">
+                            Developer provides application code, Dockerfile, and deployment YAML configuration 
+                            specifying containers, resources, health checks, and scaling requirements.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🌐</div>
+                    <div class="step-content">
+                        <span class="step-number">2</span>
+                        <span class="step-title">FastAPI REST API</span>
+                        <div class="step-description">
+                            API server receives deployment requests, validates configuration, authenticates users, 
+                            and submits tasks to Celery for asynchronous processing.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">⚙️</div>
+                    <div class="step-content">
+                        <span class="step-number">3</span>
+                        <span class="step-title">Celery Task Queue</span>
+                        <div class="step-description">
+                            Tasks are queued in Redis and distributed to worker nodes. Celery Beat schedules 
+                            periodic tasks for deployment recovery, health checks, and cleanup operations.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">💾</div>
+                    <div class="step-content">
+                        <span class="step-number">4</span>
+                        <span class="step-title">Redis State Store</span>
+                        <div class="step-description">
+                            Centralized state management: deployment configurations, pod status, host information, 
+                            health check results, and AWS node configurations. All state is persisted in Redis.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🎯</div>
+                    <div class="step-content">
+                        <span class="step-number">5</span>
+                        <span class="step-title">Scheduler & Deployment Recovery</span>
+                        <div class="step-description">
+                            Intelligent scheduler distributes pods across worker nodes based on CPU/memory availability. 
+                            Recovery system automatically creates missing pods, scales down excess pods, and handles failures.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🖥️</div>
+                    <div class="step-content">
+                        <span class="step-number">6</span>
+                        <span class="step-title">Worker Nodes</span>
+                        <div class="step-description">
+                            Worker nodes run Celery workers that execute tasks: create pods, terminate pods, 
+                            collect host/pod information, and perform health checks. Each node has containerd runtime.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🐳</div>
+                    <div class="step-content">
+                        <span class="step-number">7</span>
+                        <span class="step-title">Containerd Runtime</span>
+                        <div class="step-description">
+                            Containerd creates and manages containers, handles image pulls, manages snapshots, 
+                            and provides container lifecycle management. Supports OCI-compliant containers.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🌐</div>
+                    <div class="step-content">
+                        <span class="step-number">8</span>
+                        <span class="step-title">Calico CNI Networking</span>
+                        <div class="step-description">
+                            Calico provides pod networking, IP address management (IPAM), network policies, 
+                            and BGP routing. etcd stores network state and node information.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">✅</div>
+                    <div class="step-content">
+                        <span class="step-number">9</span>
+                        <span class="step-title">Running Application</span>
+                        <div class="step-description">
+                            Application pods are running with automatic health checks, log aggregation, 
+                            service discovery, and self-healing capabilities. System monitors and maintains desired state.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="architecture-section">
+            <h2 class="section-title">🏛️ Architecture Components</h2>
+            
+            <div class="components-grid">
+                <div class="component-card">
+                    <div class="component-title">🎮 Control Plane</div>
+                    <ul class="component-list">
+                        <li>FastAPI REST API Server</li>
+                        <li>Celery Beat (Task Scheduler)</li>
+                        <li>Celery Workers (Task Executors)</li>
+                        <li>Deployment Scheduler</li>
+                        <li>Recovery System</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">💾 State Management</div>
+                    <ul class="component-list">
+                        <li>Redis (State Store)</li>
+                        <li>Deployment Configurations</li>
+                        <li>Pod & Host Information</li>
+                        <li>Health Check Results</li>
+                        <li>AWS Node Config</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">🖥️ Worker Nodes</div>
+                    <ul class="component-list">
+                        <li>Celery Worker Processes</li>
+                        <li>Containerd Runtime</li>
+                        <li>Host/Pod Sync Tasks</li>
+                        <li>Health Check Workers</li>
+                        <li>AWS Worker Nodes</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">🐳 Container Runtime</div>
+                    <ul class="component-list">
+                        <li>Containerd gRPC API</li>
+                        <li>Image Management</li>
+                        <li>Container Lifecycle</li>
+                        <li>Snapshot Management</li>
+                        <li>Task Management</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">🌐 Networking</div>
+                    <ul class="component-list">
+                        <li>Calico CNI Plugin</li>
+                        <li>etcd (Network State)</li>
+                        <li>IPAM (IP Allocation)</li>
+                        <li>BGP Routing</li>
+                        <li>Network Policies</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">📊 Monitoring & Operations</div>
+                    <ul class="component-list">
+                        <li>Health Checks (Liveness/Readiness)</li>
+                        <li>Log Aggregation (CRI Format)</li>
+                        <li>Resource Metrics</li>
+                        <li>Auto-Scaling</li>
+                        <li>Self-Healing</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        
+        <div class="flow-diagram">
+            <h2 class="section-title">🔄 Data Flow Architecture</h2>
+            
+            <div class="flow-row">
+                <div class="flow-box control-plane">
+                    <h3>Control Plane</h3>
+                    <p>FastAPI + Celery</p>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box storage">
+                    <h3>Redis</h3>
+                    <p>State Store</p>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box data-plane">
+                    <h3>Worker Nodes</h3>
+                    <p>Containerd Runtime</p>
+                </div>
+            </div>
+            
+            <div class="flow-row" style="margin-top: 50px;">
+                <div class="flow-box data-plane">
+                    <h3>Pods & Containers</h3>
+                    <p>Running Applications</p>
+                </div>
+                <div class="flow-arrow">↔</div>
+                <div class="flow-box network">
+                    <h3>Calico CNI</h3>
+                    <p>Pod Networking</p>
+                </div>
+                <div class="flow-arrow">↔</div>
+                <div class="flow-box storage">
+                    <h3>etcd</h3>
+                    <p>Network State</p>
+                </div>
+            </div>
+            
+            <div class="flow-row" style="margin-top: 50px;">
+                <div class="flow-box control-plane">
+                    <h3>Health Checks</h3>
+                    <p>Liveness & Readiness</p>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box storage">
+                    <h3>Redis</h3>
+                    <p>Health Status</p>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box control-plane">
+                    <h3>Recovery System</h3>
+                    <p>Auto-Healing</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="features-section">
+            <h2 class="section-title">✨ Key Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <h3>🔄 Auto-Scaling</h3>
+                    <p>Automatic pod creation and termination based on min/max replicas</p>
+                </div>
+                <div class="feature-card">
+                    <h3>💚 Self-Healing</h3>
+                    <p>Automatic recovery from failures and pod restarts</p>
+                </div>
+                <div class="feature-card">
+                    <h3>📊 Health Monitoring</h3>
+                    <p>Liveness and readiness probes with automatic status updates</p>
+                </div>
+                <div class="feature-card">
+                    <h3>🌐 Networking</h3>
+                    <p>Calico CNI with BGP routing and network policies</p>
+                </div>
+                <div class="feature-card">
+                    <h3>📝 Logging</h3>
+                    <p>CRI-formatted logs with rotation and aggregation</p>
+                </div>
+                <div class="feature-card">
+                    <h3>☁️ Cloud Integration</h3>
+                    <p>AWS EC2 instance management and auto-scaling</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="footer">
+        <p class="brand">Dibba</p>
+        <p>Lightweight Container Orchestration Platform</p>
+        <p>Built with Python, containerd, Celery, and Redis</p>
+    </div>
+</body>
+</html>
+

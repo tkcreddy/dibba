@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dibba Architecture - Container Orchestration Platform</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+            background: linear-gradient(135deg, #1a1f3a 0%, #2d3561 50%, #1a1f3a 100%);
+            padding: 0;
+            min-height: 100vh;
+            color: #ffffff;
+        }
+        
+        .header {
+            text-align: center;
+            padding: 60px 20px 40px;
+            background: linear-gradient(135deg, #2d3561 0%, #1a1f3a 100%);
+            border-bottom: 3px solid #4a90e2;
+        }
+        
+        .header h1 {
+            font-size: 3.5rem;
+            font-weight: 700;
+            color: #ffffff;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            letter-spacing: -1px;
+        }
+        
+        .header .subtitle {
+            font-size: 1.4rem;
+            color: #b8c5d6;
+            font-weight: 300;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 60px 40px;
+        }
+        
+        .workflow-container {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            padding: 50px;
+            margin-bottom: 60px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+        }
+        
+        .workflow-title {
+            text-align: center;
+            font-size: 2.5rem;
+            font-weight: 600;
+            margin-bottom: 50px;
+            color: #ffffff;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        
+        .workflow {
+            display: flex;
+            flex-direction: column;
+            gap: 25px;
+            position: relative;
+        }
+        
+        .workflow::before {
+            content: '';
+            position: absolute;
+            left: 50px;
+            top: 0;
+            bottom: 0;
+            width: 3px;
+            background: linear-gradient(180deg, #4a90e2 0%, #7b68ee 100%);
+            border-radius: 2px;
+            z-index: 0;
+        }
+        
+        .step {
+            display: flex;
+            align-items: center;
+            gap: 30px;
+            padding: 0;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .step-icon {
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, #4a90e2 0%, #7b68ee 100%);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2.5rem;
+            color: white;
+            flex-shrink: 0;
+            box-shadow: 0 8px 20px rgba(74, 144, 226, 0.4);
+            border: 3px solid rgba(255, 255, 255, 0.2);
+            position: relative;
+        }
+        
+        .step-icon::after {
+            content: '';
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            background: #4a90e2;
+            border-radius: 50%;
+            border: 4px solid #1a1f3a;
+            right: -8px;
+            top: 50%;
+            transform: translateY(-50%);
+        }
+        
+        .step-content {
+            flex: 1;
+            background: rgba(255, 255, 255, 0.08);
+            padding: 25px 30px;
+            border-radius: 12px;
+            border-left: 4px solid #4a90e2;
+            backdrop-filter: blur(5px);
+            transition: all 0.3s ease;
+        }
+        
+        .step-content:hover {
+            background: rgba(255, 255, 255, 0.12);
+            transform: translateX(10px);
+            box-shadow: 0 8px 25px rgba(74, 144, 226, 0.2);
+        }
+        
+        .step-number {
+            display: inline-block;
+            background: #4a90e2;
+            color: white;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 28px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            margin-right: 12px;
+        }
+        
+        .step-title {
+            font-size: 1.6rem;
+            font-weight: 600;
+            color: #ffffff;
+            margin-bottom: 10px;
+            display: inline-block;
+        }
+        
+        .step-description {
+            font-size: 1rem;
+            color: #b8c5d6;
+            line-height: 1.7;
+        }
+        
+        .architecture-section {
+            margin-top: 60px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            padding: 50px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+        }
+        
+        .section-title {
+            font-size: 2.5rem;
+            color: #ffffff;
+            margin-bottom: 40px;
+            text-align: center;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            font-weight: 600;
+        }
+        
+        .components-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 25px;
+            margin-top: 30px;
+        }
+        
+        .component-card {
+            background: linear-gradient(135deg, rgba(74, 144, 226, 0.15) 0%, rgba(123, 104, 238, 0.15) 100%);
+            padding: 30px;
+            border-radius: 16px;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.3);
+            border: 1px solid rgba(74, 144, 226, 0.3);
+            transition: all 0.3s ease;
+            backdrop-filter: blur(5px);
+        }
+        
+        .component-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 35px rgba(74, 144, 226, 0.4);
+            border-color: rgba(74, 144, 226, 0.6);
+        }
+        
+        .component-title {
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: #4a90e2;
+            margin-bottom: 18px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .component-list {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .component-list li {
+            padding: 10px 0;
+            color: #e0e6ed;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            font-size: 1rem;
+            line-height: 1.6;
+        }
+        
+        .component-list li:last-child {
+            border-bottom: none;
+        }
+        
+        .component-list li::before {
+            content: "▸ ";
+            color: #4a90e2;
+            font-weight: bold;
+            margin-right: 10px;
+            font-size: 1.2rem;
+        }
+        
+        .flow-diagram {
+            margin-top: 60px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            padding: 50px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+        }
+        
+        .flow-row {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 30px 0;
+            flex-wrap: wrap;
+            gap: 25px;
+        }
+        
+        .flow-box {
+            background: linear-gradient(135deg, #4a90e2 0%, #7b68ee 100%);
+            color: white;
+            padding: 25px 40px;
+            border-radius: 16px;
+            text-align: center;
+            min-width: 220px;
+            box-shadow: 0 8px 25px rgba(74, 144, 226, 0.4);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            transition: all 0.3s ease;
+        }
+        
+        .flow-box:hover {
+            transform: scale(1.05);
+            box-shadow: 0 12px 35px rgba(74, 144, 226, 0.6);
+        }
+        
+        .flow-box h3 {
+            font-size: 1.2rem;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        
+        .flow-box p {
+            font-size: 0.95rem;
+            opacity: 0.95;
+        }
+        
+        .flow-arrow {
+            font-size: 2.5rem;
+            color: #4a90e2;
+            font-weight: bold;
+        }
+        
+        .control-plane {
+            background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+        }
+        
+        .data-plane {
+            background: linear-gradient(135deg, #4299e1 0%, #3182ce 100%);
+        }
+        
+        .storage {
+            background: linear-gradient(135deg, #ed8936 0%, #dd6b20 100%);
+        }
+        
+        .network {
+            background: linear-gradient(135deg, #9f7aea 0%, #805ad5 100%);
+        }
+        
+        .features-section {
+            margin-top: 60px;
+            padding: 50px;
+            background: linear-gradient(135deg, rgba(26, 31, 58, 0.9) 0%, rgba(45, 53, 97, 0.9) 100%);
+            border-radius: 20px;
+            border: 1px solid rgba(74, 144, 226, 0.3);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 25px;
+            margin-top: 40px;
+        }
+        
+        .feature-card {
+            background: rgba(255, 255, 255, 0.08);
+            padding: 25px;
+            border-radius: 12px;
+            border-left: 4px solid #4a90e2;
+            backdrop-filter: blur(5px);
+            transition: all 0.3s ease;
+        }
+        
+        .feature-card:hover {
+            background: rgba(255, 255, 255, 0.12);
+            transform: translateX(5px);
+        }
+        
+        .feature-card h3 {
+            color: #4a90e2;
+            margin-bottom: 12px;
+            font-size: 1.2rem;
+        }
+        
+        .feature-card p {
+            color: #b8c5d6;
+            line-height: 1.6;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 40px 20px;
+            background: rgba(26, 31, 58, 0.8);
+            border-top: 2px solid rgba(74, 144, 226, 0.3);
+            margin-top: 60px;
+        }
+        
+        .footer p {
+            color: #b8c5d6;
+            font-size: 1rem;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 30px 20px;
+            }
+            
+            .header h1 {
+                font-size: 2.2rem;
+            }
+            
+            .workflow::before {
+                left: 40px;
+            }
+            
+            .step-icon {
+                width: 60px;
+                height: 60px;
+                font-size: 2rem;
+            }
+            
+            .flow-row {
+                flex-direction: column;
+            }
+            
+            .flow-arrow {
+                transform: rotate(90deg);
+            }
+            
+            .workflow-container,
+            .architecture-section,
+            .flow-diagram,
+            .features-section {
+                padding: 30px 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <img src="https://www.dibba.cloud/dibba.jpeg" alt="Dibba Logo" style="width: 120px; height: 120px;">
+        <h1> Dibba</h1>
+        <p class="subtitle">Container Orchestration Platform</p>
+        <p class="subtitle" style="font-size: 1.1rem; margin-top: 10px;">From Code to Running Application</p>
+    </div>
+    
+    <div class="container">
+        <div class="workflow-container">
+            <h2 class="workflow-title">Deployment Workflow</h2>
+            
+            <div class="workflow">
+                <div class="step">
+                    <div class="step-icon">📝</div>
+                    <div class="step-content">
+                        <span class="step-number">1</span>
+                        <span class="step-title">Application Code & Configuration</span>
+                        <div class="step-description">
+                            Developer provides application code, Dockerfile, and deployment YAML configuration 
+                            specifying containers, resources, health checks, and scaling requirements.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🌐</div>
+                    <div class="step-content">
+                        <span class="step-number">2</span>
+                        <span class="step-title">FastAPI REST API</span>
+                        <div class="step-description">
+                            API server receives deployment requests, validates configuration, authenticates users, 
+                            and submits tasks to Celery for asynchronous processing.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">⚙️</div>
+                    <div class="step-content">
+                        <span class="step-number">3</span>
+                        <span class="step-title">Celery Task Queue</span>
+                        <div class="step-description">
+                            Tasks are queued in Redis and distributed to worker nodes. Celery Beat schedules 
+                            periodic tasks for deployment recovery, health checks, and cleanup operations.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">💾</div>
+                    <div class="step-content">
+                        <span class="step-number">4</span>
+                        <span class="step-title">Redis State Store</span>
+                        <div class="step-description">
+                            Centralized state management: deployment configurations, pod status, host information, 
+                            health check results, and AWS node configurations. All state is persisted in Redis.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🎯</div>
+                    <div class="step-content">
+                        <span class="step-number">5</span>
+                        <span class="step-title">Scheduler & Deployment Recovery</span>
+                        <div class="step-description">
+                            Intelligent scheduler distributes pods across worker nodes based on CPU/memory availability. 
+                            Recovery system automatically creates missing pods, scales down excess pods, and handles failures.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🖥️</div>
+                    <div class="step-content">
+                        <span class="step-number">6</span>
+                        <span class="step-title">Worker Nodes</span>
+                        <div class="step-description">
+                            Worker nodes run Celery workers that execute tasks: create pods, terminate pods, 
+                            collect host/pod information, and perform health checks. Each node has containerd runtime.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🐳</div>
+                    <div class="step-content">
+                        <span class="step-number">7</span>
+                        <span class="step-title">Containerd Runtime</span>
+                        <div class="step-description">
+                            Containerd creates and manages containers, handles image pulls, manages snapshots, 
+                            and provides container lifecycle management. Supports OCI-compliant containers.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">🌐</div>
+                    <div class="step-content">
+                        <span class="step-number">8</span>
+                        <span class="step-title">Calico CNI Networking</span>
+                        <div class="step-description">
+                            Calico provides pod networking, IP address management (IPAM), network policies, 
+                            and BGP routing. etcd stores network state and node information.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-icon">✅</div>
+                    <div class="step-content">
+                        <span class="step-number">9</span>
+                        <span class="step-title">Running Application</span>
+                        <div class="step-description">
+                            Application pods are running with automatic health checks, log aggregation, 
+                            service discovery, and self-healing capabilities. System monitors and maintains desired state.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="architecture-section">
+            <h2 class="section-title">🏛️ Architecture Components</h2>
+            
+            <div class="components-grid">
+                <div class="component-card">
+                    <div class="component-title">🎮 Control Plane</div>
+                    <ul class="component-list">
+                        <li>FastAPI REST API Server</li>
+                        <li>Celery Beat (Task Scheduler)</li>
+                        <li>Celery Workers (Task Executors)</li>
+                        <li>Deployment Scheduler</li>
+                        <li>Recovery System</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">💾 State Management</div>
+                    <ul class="component-list">
+                        <li>Redis (State Store)</li>
+                        <li>Deployment Configurations</li>
+                        <li>Pod & Host Information</li>
+                        <li>Health Check Results</li>
+                        <li>AWS Node Config</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">🖥️ Worker Nodes</div>
+                    <ul class="component-list">
+                        <li>Celery Worker Processes</li>
+                        <li>Containerd Runtime</li>
+                        <li>Host/Pod Sync Tasks</li>
+                        <li>Health Check Workers</li>
+                        <li>AWS Worker Nodes</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">🐳 Container Runtime</div>
+                    <ul class="component-list">
+                        <li>Containerd gRPC API</li>
+                        <li>Image Management</li>
+                        <li>Container Lifecycle</li>
+                        <li>Snapshot Management</li>
+                        <li>Task Management</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">🌐 Networking</div>
+                    <ul class="component-list">
+                        <li>Calico CNI Plugin</li>
+                        <li>etcd (Network State)</li>
+                        <li>IPAM (IP Allocation)</li>
+                        <li>BGP Routing</li>
+                        <li>Network Policies</li>
+                    </ul>
+                </div>
+                
+                <div class="component-card">
+                    <div class="component-title">📊 Monitoring & Operations</div>
+                    <ul class="component-list">
+                        <li>Health Checks (Liveness/Readiness)</li>
+                        <li>Log Aggregation (CRI Format)</li>
+                        <li>Resource Metrics</li>
+                        <li>Auto-Scaling</li>
+                        <li>Self-Healing</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        
+        <div class="flow-diagram">
+            <h2 class="section-title">🔄 Data Flow Architecture</h2>
+            
+            <div class="flow-row">
+                <div class="flow-box control-plane">
+                    <h3>Control Plane</h3>
+                    <p>FastAPI + Celery</p>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box storage">
+                    <h3>Redis</h3>
+                    <p>State Store</p>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box data-plane">
+                    <h3>Worker Nodes</h3>
+                    <p>Containerd Runtime</p>
+                </div>
+            </div>
+            
+            <div class="flow-row" style="margin-top: 40px;">
+                <div class="flow-box data-plane">
+                    <h3>Pods & Containers</h3>
+                    <p>Running Applications</p>
+                </div>
+                <div class="flow-arrow">↔</div>
+                <div class="flow-box network">
+                    <h3>Calico CNI</h3>
+                    <p>Pod Networking</p>
+                </div>
+                <div class="flow-arrow">↔</div>
+                <div class="flow-box storage">
+                    <h3>etcd</h3>
+                    <p>Network State</p>
+                </div>
+            </div>
+            
+            <div class="flow-row" style="margin-top: 40px;">
+                <div class="flow-box control-plane">
+                    <h3>Health Checks</h3>
+                    <p>Liveness & Readiness</p>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box storage">
+                    <h3>Redis</h3>
+                    <p>Health Status</p>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box control-plane">
+                    <h3>Recovery System</h3>
+                    <p>Auto-Healing</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="features-section">
+            <h2 class="section-title">✨ Key Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <h3>🔄 Auto-Scaling</h3>
+                    <p>Automatic pod creation and termination based on min/max replicas</p>
+                </div>
+                <div class="feature-card">
+                    <h3>💚 Self-Healing</h3>
+                    <p>Automatic recovery from failures and pod restarts</p>
+                </div>
+                <div class="feature-card">
+                    <h3>📊 Health Monitoring</h3>
+                    <p>Liveness and readiness probes with automatic status updates</p>
+                </div>
+                <div class="feature-card">
+                    <h3>🌐 Networking</h3>
+                    <p>Calico CNI with BGP routing and network policies</p>
+                </div>
+                <div class="feature-card">
+                    <h3>📝 Logging</h3>
+                    <p>CRI-formatted logs with rotation and aggregation</p>
+                </div>
+                <div class="feature-card">
+                    <h3>☁️ Cloud Integration</h3>
+                    <p>AWS EC2 instance management and auto-scaling</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="footer">
+        <p>Dibba - Lightweight Container Orchestration Platform</p>
+        <p style="margin-top: 10px; font-size: 0.9rem; opacity: 0.8;">Built with Python, containerd, Celery, and Redis</p>
+    </div>
+</body>
+</html>
+

@@ -343,17 +343,38 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, labels: Opt
                 }
 
         # -------------------------------------------------
-        # 3) Create pod (pause container + CNI attach)
+        # 3) Extract container label metadata from extra_kwargs
+        # -------------------------------------------------
+        pod_id = extra_kwargs.get('pod_id') or pod_labels.get('pod_id')
+        app_name = extra_kwargs.get('app_name') or pod_labels.get('app_name') or extra_kwargs.get('app_label')
+        owner_team = extra_kwargs.get('owner_team') or pod_labels.get('owner_team') or extra_kwargs.get('owner')
+        
+        # If app_name not found, try to extract from first container spec
+        if not app_name and container_specs:
+            app_name = getattr(container_specs[0], 'name', None)
+        
+        # -------------------------------------------------
+        # 4) Create pod (pause container + CNI attach)
         #    create_pod() will still call _ensure_unpacked(),
         #    which uses the same CRI pull path as a safety net.
         # -------------------------------------------------
         pause_resources = ResourceSpec(cpu_millicores=100, memory="64Mi")
+        pod_name = f"{uuid.uuid4().hex[:16]}"
+        
+        # Use pod_name as pod_id if not provided
+        if not pod_id:
+            pod_id = pod_name
+        
         pod = pods.create_pod(
-            name=f"{uuid.uuid4().hex[:16]}",
+            name=pod_name,
             pause_image=pause_image,
             resources=pause_resources,
             cni_network=cni_net,
             cni_ifname=cni_dev,
+            pod_id=pod_id,
+            namespace=ns,
+            app_name=app_name,
+            owner_team=owner_team,
         )
 
         # Check if pod creation failed
@@ -367,7 +388,7 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, labels: Opt
             }
 
         # -------------------------------------------------
-        # 4) Extract pod IPv4 (from CNI result or via netns)
+        # 5) Extract pod IPv4 (from CNI result or via netns)
         # -------------------------------------------------
         pod_ipv4 = _extract_ipv4_from_cni_result(pod.get("cni_result"), cni_dev)
         if not pod_ipv4:
@@ -377,9 +398,16 @@ def create_pod_task(containers, app_namespace: Optional[str] = None, labels: Opt
                 pod_ipv4 = _ipv4_from_netns(pause_pid, cni_dev)
 
         # -------------------------------------------------
-        # 5) Add app containers into the same pod namespaces
+        # 6) Add app containers into the same pod namespaces
         # -------------------------------------------------
-        apps = pods.add_containers(pod, container_specs)
+        apps = pods.add_containers(
+            pod, 
+            container_specs,
+            pod_id=pod_id,
+            namespace=ns,
+            app_name=app_name,
+            owner_team=owner_team,
+        )
         
         # Capture startup time when all containers are added (pod is running)
         startup_time = datetime.now(timezone.utc).isoformat()
