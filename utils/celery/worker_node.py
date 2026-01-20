@@ -42,7 +42,8 @@ celery_app.conf.task_queues = [
 celery_app.autodiscover_tasks(['utils.celery.tasks.worker_node_tasks'])
 celery_app.conf.include = [
     "utils.celery.tasks.containerd_tasks",
-    "utils.celery.tasks.host_pod_sync_tasks"
+    "utils.celery.tasks.host_pod_sync_tasks",
+    "utils.celery.tasks.container_cleanup_tasks"
 ]
 
 

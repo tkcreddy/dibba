@@ -22,6 +22,7 @@ celery_app.conf.include = [
     "utils.celery.tasks.scheduler_tasks",
     "utils.celery.tasks.deployment_recovery_tasks",
     "utils.celery.tasks.etcd_cleanup_tasks",
+    "utils.celery.tasks.container_cleanup_tasks",  # For dispatch_cleanup_to_workers_task
     # Health check tasks are excluded - they run on separate health_check_worker node
 ]
 

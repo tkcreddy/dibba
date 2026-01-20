@@ -93,5 +93,23 @@ celery_app.conf.update(
             'expires': 1200,  # Expire if not processed within 20 minutes
         }
     },
+    'cleanup-lingering-containers-every-120-seconds': {
+        'task': 'containerd.dispatch_cleanup_to_workers',
+        'schedule': 120.0,  # Run every 120 seconds (2 minutes)
+        # CLEANUP DESIGN:
+        # - Dispatcher runs on scheduler queue to discover active worker nodes
+        # - Dispatcher sends cleanup_lingering_containers_task to each worker's hostname_queue_name
+        # - Each worker processes cleanup from its own hostname_queue_name
+        # - cleanup_lingering_containers_task cleans up local containerd containers
+        # - Identifies containers that don't have corresponding active tasks
+        # - Removes lingering/orphaned containers from containerd
+        'options': {
+            'queue': scheduler_queue_name,  # Dispatcher runs on scheduler queue
+            'exchange': secure_exchange,
+            'routing_key': scheduler_queue_name,
+            'delivery_mode': 2,
+            'expires': 300,  # Expire if not processed within 5 minutes
+        }
+    },
     },
 )
