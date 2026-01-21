@@ -1,0 +1,54 @@
+metadata:
+  name: cust-sales-deployment
+  namespace: Production
+  labels:
+    app: simple-api
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: simple-api
+
+  template:
+    metadata:
+      labels:
+        app: simple-api
+
+    spec:
+      containers:
+        - name: simple-api
+          image: docker.io/jkaninda/simple-api:latest
+
+          # Dibba uses args as the full command array (like you already do)
+          resources:
+            cpu_millicores: 500
+            memory: 256Mi
+            cpuset_cpus: "0-1"
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          
+          # Readiness probe - checks if container is ready to receive traffic
+          readinessProbe:
+            httpGet:
+              path: /  # Change this to your actual readiness endpoint
+              port: 8080
+            initialDelaySeconds: 5   # Wait 5 seconds before first check
+            periodSeconds: 5          # Check every 5 seconds
+            timeoutSeconds: 2         # Timeout after 2 seconds
+            successThreshold: 1       # Need 1 success to mark as ready
+            failureThreshold: 3       # Mark as not ready after 3 failures
+          
+          # Liveness probe - checks if container is still alive
+          livenessProbe:
+            httpGet:
+              path: /  # Change this to your actual health endpoint
+              port: 8080
+            initialDelaySeconds: 20   # Wait 20 seconds before first check (give app time to start)
+            periodSeconds: 10         # Check every 10 seconds
+            timeoutSeconds: 2         # Timeout after 2 seconds
+            successThreshold: 1       # Need 1 success to mark as healthy
+            failureThreshold: 3       # Restart container after 3 failures
+

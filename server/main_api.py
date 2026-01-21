@@ -924,18 +924,7 @@ async def create_pods(request: CreatePodsRequest, user: str = Depends(get_curren
     return _envelope_success("Task submitted successfully", result.get("data", result))
 
 
-# @log_to_file(logger)
-# @app.post("/containerd/list_namespaces_and_pods/", tags=["Containerd - Pods"])
-# async def list_namespaces_and_pods_api(request: ContainerdHostRequest, user: str = Depends(get_current_user)):
-#     result = submit_celery_task(
-#         task=list_namespaces_and_pods_task,
-#         queue_info=create_host_queue_info(request.host_name, ue),
-#         operation_name="list_namespaces_and_pods",
-#         error_code="LIST_NAMESPACES_PODS_ERROR",
-#         additional_data={"host_name": request.host_name},
-#     )
-#     return _envelope_success("Task submitted successfully", result.get("data", result))
-#
+
 
 @log_to_file(logger)
 def _filter_pause_containers(containers: list, pause_container: dict = None) -> list:
@@ -1883,85 +1872,76 @@ async def list_pods_by_filter_api(
                 except Exception as e:
                     logger.debug(f"Failed to get deployment_name for pod {pod_id}: {e}", exc_info=True)
             
-            # Build pod view
-            pod_view = {
-                "pod_id": pod_id,
-                "pod_name": p.get("pod_name") or pod_id,
-                "namespace": pod_ns,
-                "hostname": hostname,
-                "ip_address": ip_address,
-                "ports": sorted(list(set(ports))),
-                "status": p.get("status") or "unknown",
-                "containers": [c.get("name") for c in containers if isinstance(c, dict)],
-                "creation_time": p.get("creation_time") or p.get("created_at"),
-                "startup_time": p.get("startup_time"),
-                "app_label": pod_app_label,
-                "deployment_name": deployment_name,  # Use metadata.name from deployment YAML
-            }
+            # Build container views (one per application container) instead of pod view
+            # Iterate through each container in the pod and create a separate entry
+            containers_processed = False
             
-            # Add health check success rate for last 180 seconds
-            try:
-                from utils.healthcheck import get_health_check_success_rate
-                health_data = {
-                    'liveness': None,
-                    'readiness': None,
-                    'overall_success_rate': None,
-                    'overall_total_checks': 0,
-                    'overall_successful_checks': 0,
-                    'overall_failed_checks': 0
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                
+                container_id = container.get("cid") or container.get("container_id")
+                container_name = container.get("name") or "unknown"
+                container_status = container.get("status") or "unknown"
+                
+                # Skip pause containers if they slip through
+                if pause_container and isinstance(pause_container, dict):
+                    pause_cid = pause_container.get("cid") or pause_container.get("container_id")
+                    if container_id == pause_cid:
+                        continue
+                
+                containers_processed = True
+                
+                # Build container view (similar to pod_view but with container info)
+                container_view = {
+                    "container_id": container_id,  # This replaces pod_id as primary identifier
+                    "container_name": container_name,
+                    "pod_id": pod_id,  # Keep pod_id for reference
+                    "pod_name": p.get("pod_name") or pod_id,
+                    "namespace": pod_ns,
+                    "hostname": hostname,
+                    "ip_address": ip_address,  # Pod IP (shared by all containers in pod)
+                    "ports": sorted(list(set(ports))),  # Ports for this container
+                    "status": container_status,  # Container status instead of pod status
+                    "creation_time": p.get("creation_time") or p.get("created_at"),
+                    "startup_time": p.get("startup_time"),
+                    "app_label": pod_app_label,
+                    "deployment_name": deployment_name,  # Use metadata.name from deployment YAML
                 }
                 
-                # Get fresh pod data from Redis to ensure we have latest health_checks field
-                fresh_pod = None
+                # Add health check data for this specific container
                 try:
-                    fresh_pod = store.get_pod(pod_id)
-                except Exception as e:
-                    logger.debug(f"Could not get fresh pod data for {pod_id}: {e}")
-                
-                # Get health check data for each container
-                # Note: containers might be a list of strings (container names) or list of dicts
-                if containers:
-                    liveness_rates = []
-                    readiness_rates = []
-                    total_checks = 0
+                    from utils.healthcheck import get_health_check_success_rate
+                    health_data = {
+                        'liveness': None,
+                        'readiness': None,
+                        'overall_success_rate': None,
+                        'overall_total_checks': 0,
+                        'overall_successful_checks': 0,
+                        'overall_failed_checks': 0
+                    }
                     
-                    logger.debug(f"Getting health check data for pod {pod_id} with {len(containers)} containers (type: {type(containers[0]) if containers else 'empty'})")
+                    # Get fresh pod data from Redis to ensure we have latest health_checks field
+                    fresh_pod = None
+                    try:
+                        fresh_pod = store.get_pod(pod_id)
+                    except Exception as e:
+                        logger.debug(f"Could not get fresh pod data for {pod_id}: {e}")
                     
-                    # Get container names - handle both string list and dict list
-                    container_names = []
-                    for container in containers:
-                        if isinstance(container, dict):
-                            container_name = container.get('name') or 'unknown'
-                            container_names.append(container_name)
-                        elif isinstance(container, str):
-                            container_names.append(container)
-                    
-                    # If no container names found, try to get from fresh_pod or original pod data
-                    if not container_names and fresh_pod:
-                        pod_containers = fresh_pod.get('containers', [])
-                        for c in pod_containers:
-                            if isinstance(c, dict):
-                                container_names.append(c.get('name', 'unknown'))
-                            elif isinstance(c, str):
-                                container_names.append(c)
-                    
-                    logger.debug(f"Container names for pod {pod_id}: {container_names}")
-                    
-                    # Check if readiness has already succeeded (if so, don't count readiness checks)
-                    readiness_succeeded = False
-                    if fresh_pod:
-                        health_checks = fresh_pod.get('health_checks', {})
-                        readiness_data = health_checks.get('readiness', {})
-                        if readiness_data.get('status') == 'success':
-                            readiness_succeeded = True
-                            logger.debug(f"Readiness has already succeeded for pod {pod_id}, excluding readiness checks from count")
-                    
-                    for container_name in container_names:
-                        if not container_name or container_name == 'unknown':
-                            continue
-                        logger.debug(f"Checking health history for pod {pod_id}, container {container_name}")
+                    # Get health check data for THIS SPECIFIC container
+                    if container_name and container_name != 'unknown':
+                        logger.debug(f"Getting health check data for pod {pod_id}, container {container_name}")
                         
-                        # Get liveness probe success rate
+                        # Check if readiness has already succeeded
+                        readiness_succeeded = False
+                        if fresh_pod:
+                            health_checks = fresh_pod.get('health_checks', {})
+                            readiness_data = health_checks.get('readiness', {})
+                            if readiness_data.get('status') == 'success':
+                                readiness_succeeded = True
+                                logger.debug(f"Readiness has already succeeded for pod {pod_id}, excluding readiness checks from count")
+                        
+                        # Get liveness probe success rate for this container
                         try:
                             liveness_rate = get_health_check_success_rate(
                                 rd, pod_id, 'liveness', container_name, seconds=180
@@ -1969,132 +1949,131 @@ async def list_pods_by_filter_api(
                             total_liveness_checks = liveness_rate.get('total_checks', 0)
                             logger.debug(f"Liveness rate for pod {pod_id} container {container_name}: {liveness_rate}")
                             if total_liveness_checks > 0:
-                                liveness_rates.append(liveness_rate)
-                                total_checks += total_liveness_checks
-                            else:
-                                logger.debug(f"No liveness history found for pod {pod_id} container {container_name} (total_checks=0)")
+                                health_data['liveness'] = {
+                                    'success_rate': (liveness_rate.get('successful_checks', 0) / total_liveness_checks * 100) if total_liveness_checks > 0 else 0.0,
+                                    'total_checks': total_liveness_checks,
+                                    'successful_checks': liveness_rate.get('successful_checks', 0)
+                                }
                         except Exception as e:
                             logger.warning(f"Could not get liveness rate for pod {pod_id} container {container_name}: {e}", exc_info=True)
                         
-                        # Get readiness probe success rate - ALWAYS include readiness history from last 180 seconds
-                        # Even if readiness has succeeded, we should count ALL historical readiness checks in the 180-second window
-                        # The 180-second window should include both readiness and liveness checks
+                        # Get readiness probe success rate for this container
                         try:
                             readiness_rate = get_health_check_success_rate(
                                 rd, pod_id, 'readiness', container_name, seconds=180
                             )
                             total_readiness_checks = readiness_rate.get('total_checks', 0)
-                            logger.debug(f"Readiness rate for pod {pod_id} container {container_name}: {readiness_rate} (readiness_succeeded={readiness_succeeded})")
+                            logger.debug(f"Readiness rate for pod {pod_id} container {container_name}: {readiness_rate}")
                             if total_readiness_checks > 0:
-                                readiness_rates.append(readiness_rate)
-                                # ALWAYS add readiness checks to total count - they happened in the last 180 seconds
-                                # Even if readiness succeeded and we stopped checking, the historical checks count
-                                total_checks += total_readiness_checks
-                                if readiness_succeeded:
-                                    logger.debug(f"Readiness succeeded for pod {pod_id}, but including historical readiness checks ({total_readiness_checks}) in 180-second window")
-                            else:
-                                logger.debug(f"No readiness history found for pod {pod_id} container {container_name} (total_checks=0)")
+                                health_data['readiness'] = {
+                                    'success_rate': (readiness_rate.get('successful_checks', 0) / total_readiness_checks * 100) if total_readiness_checks > 0 else 0.0,
+                                    'total_checks': total_readiness_checks,
+                                    'successful_checks': readiness_rate.get('successful_checks', 0)
+                                }
+                                health_data['overall_total_checks'] += total_readiness_checks
                         except Exception as e:
                             logger.warning(f"Could not get readiness rate for pod {pod_id} container {container_name}: {e}", exc_info=True)
-                    
-                    # Calculate overall success rates
-                    if liveness_rates:
-                        total_liveness = sum(r.get('total_checks', 0) for r in liveness_rates)
-                        successful_liveness = sum(r.get('successful_checks', 0) for r in liveness_rates)
-                        health_data['liveness'] = {
-                            'success_rate': (successful_liveness / total_liveness * 100) if total_liveness > 0 else 0.0,
-                            'total_checks': total_liveness,
-                            'successful_checks': successful_liveness
-                        }
-                    
-                    if readiness_rates:
-                        total_readiness = sum(r.get('total_checks', 0) for r in readiness_rates)
-                        successful_readiness = sum(r.get('successful_checks', 0) for r in readiness_rates)
-                        health_data['readiness'] = {
-                            'success_rate': (successful_readiness / total_readiness * 100) if total_readiness > 0 else 0.0,
-                            'total_checks': total_readiness,
-                            'successful_checks': successful_readiness
-                        }
-                    
-                    # Calculate overall success rate (combined liveness + readiness)
-                    if total_checks > 0:
-                        total_successful = sum(r.get('successful_checks', 0) for r in liveness_rates + readiness_rates)
-                        total_failed = total_checks - total_successful
-                        health_data['overall_success_rate'] = (total_successful / total_checks * 100) if total_checks > 0 else 0.0
-                        health_data['overall_total_checks'] = total_checks
-                        health_data['overall_successful_checks'] = total_successful
-                        health_data['overall_failed_checks'] = total_failed
-                        logger.info(f"Health check data for pod {pod_id}: {total_successful}/{total_failed}/{total_checks} (rate: {health_data['overall_success_rate']:.1f}%)")
-                    else:
-                        logger.debug(f"No health check history found for pod {pod_id} (total_checks=0), trying fallback from pod data")
-                        # Fallback: Try to get health check data from pod's stored health_checks field
-                        logger.debug(f"No health check history found for pod {pod_id} (total_checks=0), trying fallback from pod data")
-                        # Use fresh_pod if we already fetched it, otherwise get it now
-                        if not fresh_pod:
-                            try:
-                                fresh_pod = store.get_pod(pod_id)
-                            except Exception as e:
-                                logger.debug(f"Could not get fresh pod data for {pod_id}: {e}")
                         
-                        pod_health_checks = {}
-                        if fresh_pod:
-                            pod_health_checks = fresh_pod.get('health_checks', {})
-                            logger.debug(f"Retrieved fresh pod data for {pod_id}, health_checks keys: {list(pod_health_checks.keys()) if pod_health_checks else 'empty'}")
+                        # Calculate overall success rate for this container
+                        total_checks = health_data['liveness'].get('total_checks', 0) if health_data['liveness'] else 0
+                        total_checks += health_data['readiness'].get('total_checks', 0) if health_data['readiness'] else 0
+                        
+                        if total_checks > 0:
+                            total_successful = (health_data['liveness'].get('successful_checks', 0) if health_data['liveness'] else 0) + \
+                                              (health_data['readiness'].get('successful_checks', 0) if health_data['readiness'] else 0)
+                            total_failed = total_checks - total_successful
+                            health_data['overall_success_rate'] = (total_successful / total_checks * 100) if total_checks > 0 else 0.0
+                            health_data['overall_total_checks'] = total_checks
+                            health_data['overall_successful_checks'] = total_successful
+                            health_data['overall_failed_checks'] = total_failed
+                            logger.info(f"Health check data for pod {pod_id} container {container_name}: {total_successful}/{total_failed}/{total_checks} (rate: {health_data['overall_success_rate']:.1f}%)")
                         else:
-                            logger.debug(f"Pod {pod_id} not found in Redis, trying original pod data")
-                            pod_health_checks = p.get('health_checks', {})
-                        
-                        if pod_health_checks:
-                            # Extract health check data from stored health_checks field
-                            liveness_data = pod_health_checks.get('liveness', {})
-                            readiness_data = pod_health_checks.get('readiness', {})
+                            # Fallback: Try to get health check data from pod's stored health_checks field
+                            if not fresh_pod:
+                                try:
+                                    fresh_pod = store.get_pod(pod_id)
+                                except Exception as e:
+                                    logger.debug(f"Could not get fresh pod data for {pod_id}: {e}")
                             
-                            # Use consecutive successes/failures to estimate health check stats
-                            liveness_successes = liveness_data.get('consecutive_successes', 0)
-                            liveness_failures = liveness_data.get('consecutive_failures', 0)
-                            readiness_successes = readiness_data.get('consecutive_successes', 0)
-                            readiness_failures = readiness_data.get('consecutive_failures', 0)
-                            
-                            logger.debug(f"Pod {pod_id} health check stats: liveness={liveness_successes}/{liveness_failures}, readiness={readiness_successes}/{readiness_failures}")
-                            
-                            # Calculate totals
-                            liveness_total = liveness_successes + liveness_failures
-                            readiness_total = readiness_successes + readiness_failures
-                            estimated_total = liveness_total + readiness_total
-                            
-                            if estimated_total > 0:
-                                estimated_successful = liveness_successes + readiness_successes
-                                estimated_failed = liveness_failures + readiness_failures
-                                
-                                health_data['overall_success_rate'] = (estimated_successful / estimated_total * 100) if estimated_total > 0 else 0.0
-                                health_data['overall_total_checks'] = estimated_total
-                                health_data['overall_successful_checks'] = estimated_successful
-                                health_data['overall_failed_checks'] = estimated_failed
-                                
-                                if liveness_total > 0:
-                                    health_data['liveness'] = {
-                                        'success_rate': (liveness_successes / liveness_total * 100) if liveness_total > 0 else 0.0,
-                                        'total_checks': liveness_total,
-                                        'successful_checks': liveness_successes
-                                    }
-                                
-                                if readiness_total > 0:
-                                    health_data['readiness'] = {
-                                        'success_rate': (readiness_successes / readiness_total * 100) if readiness_total > 0 else 0.0,
-                                        'total_checks': readiness_total,
-                                        'successful_checks': readiness_successes
-                                    }
-                                
-                                logger.info(f"Using fallback health data for pod {pod_id}: {estimated_successful}/{estimated_failed}/{estimated_total} (rate: {health_data['overall_success_rate']:.1f}%)")
+                            pod_health_checks = {}
+                            if fresh_pod:
+                                pod_health_checks = fresh_pod.get('health_checks', {})
                             else:
-                                logger.debug(f"Pod {pod_id} has health_checks field but no consecutive_successes/failures data")
-                        else:
-                            logger.debug(f"Pod {pod_id} has no health_checks field in stored data")
+                                pod_health_checks = p.get('health_checks', {})
+                            
+                            if pod_health_checks:
+                                liveness_data = pod_health_checks.get('liveness', {})
+                                readiness_data = pod_health_checks.get('readiness', {})
+                                
+                                liveness_successes = liveness_data.get('consecutive_successes', 0)
+                                liveness_failures = liveness_data.get('consecutive_failures', 0)
+                                readiness_successes = readiness_data.get('consecutive_successes', 0)
+                                readiness_failures = readiness_data.get('consecutive_failures', 0)
+                                
+                                liveness_total = liveness_successes + liveness_failures
+                                readiness_total = readiness_successes + readiness_failures
+                                estimated_total = liveness_total + readiness_total
+                                
+                                if estimated_total > 0:
+                                    estimated_successful = liveness_successes + readiness_successes
+                                    estimated_failed = liveness_failures + readiness_failures
+                                    
+                                    health_data['overall_success_rate'] = (estimated_successful / estimated_total * 100) if estimated_total > 0 else 0.0
+                                    health_data['overall_total_checks'] = estimated_total
+                                    health_data['overall_successful_checks'] = estimated_successful
+                                    health_data['overall_failed_checks'] = estimated_failed
+                                    
+                                    if liveness_total > 0:
+                                        health_data['liveness'] = {
+                                            'success_rate': (liveness_successes / liveness_total * 100) if liveness_total > 0 else 0.0,
+                                            'total_checks': liveness_total,
+                                            'successful_checks': liveness_successes
+                                        }
+                                    
+                                    if readiness_total > 0:
+                                        health_data['readiness'] = {
+                                            'success_rate': (readiness_successes / readiness_total * 100) if readiness_total > 0 else 0.0,
+                                            'total_checks': readiness_total,
+                                            'successful_checks': readiness_successes
+                                        }
+                    
+                    container_view['health_check'] = health_data
+                except Exception as e:
+                    logger.warning(f"Could not get health check data for pod {pod_id} container {container_name}: {e}", exc_info=True)
+                    container_view['health_check'] = {
+                        'liveness': None,
+                        'readiness': None,
+                        'overall_success_rate': None,
+                        'overall_total_checks': 0,
+                        'overall_successful_checks': 0,
+                        'overall_failed_checks': 0
+                    }
                 
-                pod_view['health_check'] = health_data
-            except Exception as e:
-                logger.warning(f"Could not get health check data for pod {pod_id}: {e}", exc_info=True)
-                pod_view['health_check'] = {
+                filtered_pods.append(container_view)
+            
+            # If no containers were processed, create a fallback entry using pod-level info
+            # This ensures we still show pods even if they have no application containers
+            if not containers_processed:
+                # Build a fallback entry using pod-level information
+                # Use pod_id as container_id when there are no containers
+                container_view = {
+                    "container_id": pod_id,  # Fallback to pod_id when no containers
+                    "container_name": None,  # No container name
+                    "pod_id": pod_id,
+                    "pod_name": p.get("pod_name") or pod_id,
+                    "namespace": pod_ns,
+                    "hostname": hostname,
+                    "ip_address": ip_address,
+                    "ports": sorted(list(set(ports))),
+                    "status": p.get("status") or "unknown",  # Use pod status as fallback
+                    "creation_time": p.get("creation_time") or p.get("created_at"),
+                    "startup_time": p.get("startup_time"),
+                    "app_label": pod_app_label,
+                    "deployment_name": deployment_name,
+                }
+                
+                # Add empty health check data for fallback entry
+                container_view['health_check'] = {
                     'liveness': None,
                     'readiness': None,
                     'overall_success_rate': None,
@@ -2102,8 +2081,8 @@ async def list_pods_by_filter_api(
                     'overall_successful_checks': 0,
                     'overall_failed_checks': 0
                 }
-            
-            filtered_pods.append(pod_view)
+                
+                filtered_pods.append(container_view)
         
         return _envelope_success("Pods filtered successfully", {
             "namespace": namespace,
