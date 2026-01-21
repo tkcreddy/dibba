@@ -893,7 +893,7 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                             creating_pod_key = f"{namespace}:{name}:{instance_num}"
                             try:
                                 redis_client.sadd(PODS_CREATING_KEY, creating_pod_key)
-                                redis_client.expire(PODS_CREATING_KEY, 300)  # 10 minutes TTL (safety net - stale keys cleaned up after 90s)
+                                redis_client.expire(PODS_CREATING_KEY, 300)  # 5 minutes TTL (safety net - stale keys cleaned up after 90s)
                                 logger.info(f"Marked pod creation {creating_pod_key} as in-flight (TTL: 600s, stale detection: 90s)")
                             except Exception as mark_error:
                                 logger.warning(f"Failed to mark pod creation {creating_pod_key} as in-flight: {mark_error}")

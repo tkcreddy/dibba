@@ -9,3 +9,4 @@
 /.venv2
 /cri-api/
 /dibba-ui/
+*.md
