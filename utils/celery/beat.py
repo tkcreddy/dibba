@@ -78,6 +78,23 @@ celery_app.conf.update(
             'expires': 60,  # Expire if not processed within 60 seconds (allows for task execution time and catch-up)
         }
     },
+    'check-http-pods-tcp-health-every-3-seconds': {
+        'task': 'tcp.check_http_pods_tcp_health',
+        'schedule': 3.0,  # Run every 3 seconds for TCP health checks
+        # TCP HEALTH CHECK DESIGN:
+        # - Performs TCP 3-way handshake checks every 3 seconds for all pods with HTTP health checks
+        # - Independent of periodSeconds configuration in deployment specs
+        # - Runs concurrently using async TCPHealthCheckBase
+        # - Detects connection failures, timeouts, and network issues
+        # - Logs all failures for troubleshooting
+        'options': {
+            'queue': health_check_queue_name,  # Use dedicated health_check queue
+            'exchange': secure_exchange,
+            'routing_key': health_check_queue_name,
+            'delivery_mode': 2,
+            'expires': 10,  # Expire if not processed within 10 seconds
+        }
+    },
     'cleanup-orphaned-calico-nodes-every-10-minutes': {
         'task': 'etcd.cleanup_orphaned_nodes',
         'schedule': 600.0,  # Run every 10 minutes (600 seconds)

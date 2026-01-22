@@ -80,20 +80,22 @@ def _list_all_containers(client: ContainerdClient) -> List[str]:
 @celery_app.task(name="containerd.discover_lingering_containers")
 @log_to_file(logger)
 @handle_errors("discover_lingering_containers", "CONTAINER_CLEANUP_ERROR")
-def discover_lingering_containers_task(namespace: str = "Production") -> Dict[str, Any]:
-    """Discover lingering containers on this worker node (does not delete them).
+def discover_lingering_containers_task(namespace: str = "Production", auto_cleanup: bool = False) -> Dict[str, Any]:
+    """Discover lingering containers on this worker node and optionally dispatch cleanup tasks.
     
     This task runs on worker nodes to discover containers that need cleanup.
-    It does NOT delete containers - deletion is done by destroy_container_by_id_task.
+    If auto_cleanup=True, it will automatically dispatch destroy_container_by_id_task
+    for each lingering container found.
     
     Args:
         namespace: Containerd namespace to check (default: "Production")
+        auto_cleanup: If True, automatically dispatch cleanup tasks for lingering containers
         
     Returns:
         Dictionary with discovery results (includes lingering_containers list)
     """
     try:
-        logger.info(f"Discovering lingering containers in namespace: {namespace}")
+        logger.info(f"Discovering lingering containers in namespace: {namespace} (auto_cleanup={auto_cleanup})")
         
         # Create containerd client for the namespace
         client = ContainerdClient(namespace=namespace)
@@ -111,13 +113,42 @@ def discover_lingering_containers_task(namespace: str = "Production") -> Dict[st
         lingering_containers = [cid for cid in container_ids if cid not in active_task_ids]
         logger.info(f"Found {len(lingering_containers)} lingering containers without active tasks")
         
+        # If auto_cleanup is enabled, dispatch cleanup tasks for each lingering container
+        cleanup_tasks_dispatched = []
+        if auto_cleanup and lingering_containers:
+            from utils.celery.tasks.containerd_tasks import destroy_container_by_id_task
+            from socket import gethostname
+            
+            hostname = gethostname()
+            hostname_queue_name = encode_util.encode_hostname_with_key(hostname)
+            host_queue_info = {
+                'exchange': secure_exchange,
+                'queue': hostname_queue_name,
+                'routing_key': hostname_queue_name,
+                'delivery_mode': 2,
+                'expires': 60,
+            }
+            
+            for cid in lingering_containers:
+                try:
+                    destroy_result = destroy_container_by_id_task.apply_async(
+                        args=(namespace, cid),
+                        **host_queue_info
+                    )
+                    cleanup_tasks_dispatched.append(cid)
+                    logger.info(f"Auto-dispatched cleanup task for lingering container {cid} (task_id: {destroy_result.id})")
+                except Exception as e:
+                    logger.error(f"Failed to dispatch cleanup task for container {cid}: {e}", exc_info=True)
+        
         return {
             "success": True,
             "namespace": namespace,
             "total_containers": total_containers,
             "active_tasks": len(active_task_ids),
             "lingering_containers": lingering_containers,
-            "message": f"Found {len(lingering_containers)} lingering containers"
+            "cleanup_tasks_dispatched": cleanup_tasks_dispatched if auto_cleanup else [],
+            "message": f"Found {len(lingering_containers)} lingering containers" + 
+                      (f", dispatched {len(cleanup_tasks_dispatched)} cleanup tasks" if auto_cleanup else "")
         }
     
     except Exception as e:
@@ -128,6 +159,7 @@ def discover_lingering_containers_task(namespace: str = "Production") -> Dict[st
             "total_containers": 0,
             "active_tasks": 0,
             "lingering_containers": [],
+            "cleanup_tasks_dispatched": [],
             "message": f"Error: {str(e)}"
         }
 
@@ -322,7 +354,9 @@ def dispatch_cleanup_to_workers_task(namespace: str = "Production") -> Dict[str,
         tasks_dispatched = {}  # {hostname: [cid1, cid2, ...]}
         failed_dispatches = []
         
-        # For each worker, discover lingering containers
+        # For each worker, discover lingering containers and auto-dispatch cleanup tasks
+        # We use auto_cleanup=True so discovery task dispatches cleanup tasks automatically
+        # This avoids blocking on result.get() which is not allowed in Celery tasks
         for hostname in worker_hostnames:
             try:
                 # Create hostname-specific queue info for discovery
@@ -335,49 +369,21 @@ def dispatch_cleanup_to_workers_task(namespace: str = "Production") -> Dict[str,
                     'expires': 60,  # Expire if not processed within 60 seconds
                 }
                 
-                # Query this worker to list containers and tasks in the namespace
-                # We'll use cleanup_lingering_containers_task in discovery-only mode
-                # Actually, we need to discover on the worker side - let's query it
-                # For now, let's use the existing cleanup task but modify it to return discovery results
-                # Or better: send a discovery task first, then cleanup tasks
-                
-                # Send discovery task to get lingering containers on this worker
-                result = discover_lingering_containers_task.apply_async(
-                    args=(namespace,),
-                    **host_queue_info
-                )
-                
+                # Send discovery task with auto_cleanup=True
+                # This will discover lingering containers AND automatically dispatch cleanup tasks
+                # We fire-and-forget since we can't use result.get() in a Celery task
                 try:
-                    # Wait for result (with timeout)
-                    discovery_result = result.get(timeout=30)
-                    lingering_cids = discovery_result.get('lingering_containers', [])
-                    
-                    if lingering_cids:
-                        lingering_containers_found[hostname] = lingering_cids
-                        logger.info(f"Worker {hostname} has {len(lingering_cids)} lingering containers: {lingering_cids}")
-                        
-                        # Dispatch destroy_container_by_id_task for each lingering container
-                        dispatched_cids = []
-                        for cid in lingering_cids:
-                            try:
-                                destroy_result = destroy_container_by_id_task.apply_async(
-                                    args=(namespace, cid),
-                                    **host_queue_info
-                                )
-                                dispatched_cids.append(cid)
-                                logger.info(f"Dispatched destroy_container_by_id_task for {cid} to worker {hostname} (task_id: {destroy_result.id})")
-                            except Exception as e:
-                                failed_dispatches.append({"hostname": hostname, "cid": cid, "error": str(e)})
-                                logger.error(f"Failed to dispatch destroy task for container {cid} on worker {hostname}: {e}", exc_info=True)
-                        
-                        if dispatched_cids:
-                            tasks_dispatched[hostname] = dispatched_cids
-                    else:
-                        logger.info(f"Worker {hostname} has no lingering containers")
-                        
+                    discovery_result = discover_lingering_containers_task.apply_async(
+                        args=(namespace, True),  # namespace, auto_cleanup=True
+                        **host_queue_info
+                    )
+                    logger.info(f"Dispatched discovery task with auto-cleanup to worker {hostname} (task_id: {discovery_result.id})")
+                    # Note: We don't wait for results since that would require result.get() which blocks
+                    # The discovery task will handle cleanup automatically via auto_cleanup=True
+                    tasks_dispatched[hostname] = ["auto-cleanup-enabled"]  # Mark that cleanup was auto-dispatched
                 except Exception as e:
-                    failed_dispatches.append({"hostname": hostname, "cid": None, "error": f"Discovery failed: {str(e)}"})
-                    logger.error(f"Failed to discover containers on worker {hostname}: {e}", exc_info=True)
+                    failed_dispatches.append({"hostname": hostname, "cid": None, "error": f"Failed to dispatch discovery task: {str(e)}"})
+                    logger.error(f"Failed to dispatch discovery task to worker {hostname}: {e}", exc_info=True)
                 
             except Exception as e:
                 failed_dispatches.append({"hostname": hostname, "cid": None, "error": str(e)})

@@ -24,4 +24,7 @@ celery_app.conf.task_queues = [
 ]
 
 # Autodiscover health check tasks
-celery_app.autodiscover_tasks(['utils.celery.tasks.health_check_tasks'])
+celery_app.autodiscover_tasks([
+    'utils.celery.tasks.health_check_tasks',
+    'utils.celery.tasks.tcp_health_check_tasks'
+])

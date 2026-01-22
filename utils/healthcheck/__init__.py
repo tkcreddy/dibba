@@ -28,6 +28,12 @@ from utils.healthcheck.health_check_helpers import (
     get_health_check_success_rate,
     get_health_check_history_key,
 )
+from utils.healthcheck.tcp_health_check import (
+    TCPHealthCheckBase,
+    TCPHealthCheckResult,
+    TCPHealthCheckSummary,
+    TCPConnectionStatus,
+)
 
 __all__ = [
     'check_http_probe',
@@ -48,5 +54,9 @@ __all__ = [
     'get_health_check_history',
     'get_health_check_success_rate',
     'get_health_check_history_key',
+    'TCPHealthCheckBase',
+    'TCPHealthCheckResult',
+    'TCPHealthCheckSummary',
+    'TCPConnectionStatus',
 ]
 

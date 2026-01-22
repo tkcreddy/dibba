@@ -898,6 +898,37 @@ class DeploymentScheduler:
                 'error': result.get('error')
             }
         
+        # Check for redundancy requirement: If only 1 worker node exists and we need 2+ replicas,
+        # create an additional worker node for redundancy
+        if len(worker_nodes) == 1 and missing_replicas >= 2:
+            logger.warning(
+                f"Only 1 worker node available but {missing_replicas} replicas needed for {namespace}/{deployment_name}. "
+                f"Creating additional worker node for redundancy."
+            )
+            result = self.create_aws_nodes_for_recovery(
+                namespace=namespace,
+                deployment_name=deployment_name,
+                app_label=app_label,
+                missing_replicas=1,  # Create 1 additional node for redundancy
+                containers=containers,
+                resource_reqs=resource_reqs
+            )
+            if result.get('status') != 'submitted':
+                logger.error(f"Failed to create additional worker node for redundancy: {result.get('error', 'Unknown error')}")
+                # Continue with single node - better than failing completely
+            else:
+                logger.info(f"Triggered creation of additional worker node for redundancy (task_id: {result.get('task_id')})")
+                # Return early - wait for new node to be created before scheduling
+                # The recovery task will retry on next cycle
+                return {
+                    'status': 'waiting_for_node',
+                    'pods_created': 0,
+                    'aws_task_id': result.get('task_id'),
+                    'message': f'Creating additional worker node for redundancy. Will retry pod creation after node is ready.',
+                    'worker_nodes_before': 1,
+                    'worker_nodes_needed': 2
+                }
+        
         # 2. Convert worker nodes to millicores format for distribution
         worker_nodes_millicores = [
             {
@@ -956,6 +987,40 @@ class DeploymentScheduler:
                 hostname = worker_nodes[node_index]['hostname']
                 placement[hostname] = placements
                 total_placement_count += len(placements)
+        
+        # 5.5. Check for redundancy: If we need 2+ replicas but all are placed on the same node,
+        # create an additional worker node for redundancy
+        if missing_replicas >= 2 and len(placement) == 1:
+            # All replicas are being placed on a single node - need redundancy
+            single_hostname = list(placement.keys())[0]
+            logger.warning(
+                f"All {missing_replicas} replicas for {namespace}/{deployment_name} are being placed on a single node "
+                f"({single_hostname}). This violates redundancy requirements. Creating additional worker node."
+            )
+            result = self.create_aws_nodes_for_recovery(
+                namespace=namespace,
+                deployment_name=deployment_name,
+                app_label=app_label,
+                missing_replicas=1,  # Create 1 additional node for redundancy
+                containers=containers,
+                resource_reqs=resource_reqs
+            )
+            if result.get('status') != 'submitted':
+                logger.error(f"Failed to create additional worker node for redundancy: {result.get('error', 'Unknown error')}")
+                # Continue with single node - better than failing completely
+            else:
+                logger.info(f"Triggered creation of additional worker node for redundancy (task_id: {result.get('task_id')})")
+                # Return early - wait for new node to be created before scheduling
+                # The recovery task will retry on next cycle
+                return {
+                    'status': 'waiting_for_node',
+                    'pods_created': 0,
+                    'aws_task_id': result.get('task_id'),
+                    'message': f'All replicas would be placed on single node. Creating additional worker node for redundancy. Will retry pod creation after node is ready.',
+                    'worker_nodes_before': len(worker_nodes),
+                    'worker_nodes_needed': len(worker_nodes) + 1,
+                    'placement_hostname': single_hostname
+                }
         
         # 6. Verify placement count matches missing_replicas
         if total_placement_count != missing_replicas:

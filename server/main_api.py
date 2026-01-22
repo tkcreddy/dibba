@@ -1885,16 +1885,46 @@ async def list_pods_by_filter_api(
                 container_status = container.get("status") or "unknown"
                 
                 # Skip pause containers if they slip through
+                # Only compare if both IDs are non-None to avoid incorrectly skipping containers with missing IDs
                 if pause_container and isinstance(pause_container, dict):
                     pause_cid = pause_container.get("cid") or pause_container.get("container_id")
-                    if container_id == pause_cid:
+                    if container_id is not None and pause_cid is not None and container_id == pause_cid:
                         continue
+                
+                # Determine full container task ID (format: {container-name}-{pod-id})
+                # This matches the containerd task ID format like "simple-api-b077fc1e35784e80"
+                # Priority: Use container_id if it's already a full task ID, otherwise construct it
+                if container_id:
+                    # Check if container_id is already a full task ID (contains both container name and pod ID)
+                    # Full task IDs have format: {name}-{pod_id}, e.g., "simple-api-b077fc1e35784e80"
+                    if "-" in str(container_id) and str(pod_id) in str(container_id):
+                        # Already full task ID format - use it directly
+                        full_container_id = container_id
+                        # Extract container name from full task ID if name is missing/unknown
+                        if container_name == "unknown" and "-" in container_id:
+                            # Extract name from format: {name}-{pod_id}
+                            parts = container_id.split("-")
+                            if len(parts) > 1 and parts[-1] == str(pod_id):
+                                container_name = "-".join(parts[:-1])
+                                logger.debug(f"Extracted container_name '{container_name}' from full task ID '{container_id}'")
+                    elif container_name and container_name != "unknown":
+                        # Construct full task ID: container-name-pod-id
+                        full_container_id = f"{container_name}-{pod_id}"
+                    else:
+                        # Fallback: use container_id as-is
+                        full_container_id = container_id
+                elif container_name and container_name != "unknown":
+                    # No container_id but we have a name - construct full task ID
+                    full_container_id = f"{container_name}-{pod_id}"
+                else:
+                    # Final fallback: use pod_id (shouldn't happen for application containers)
+                    full_container_id = pod_id
                 
                 containers_processed = True
                 
                 # Build container view (similar to pod_view but with container info)
                 container_view = {
-                    "container_id": container_id,  # This replaces pod_id as primary identifier
+                    "container_id": full_container_id,  # Full task ID like "simple-api-b077fc1e35784e80"
                     "container_name": container_name,
                     "pod_id": pod_id,  # Keep pod_id for reference
                     "pod_name": p.get("pod_name") or pod_id,
@@ -1930,7 +1960,7 @@ async def list_pods_by_filter_api(
                     
                     # Get health check data for THIS SPECIFIC container
                     if container_name and container_name != 'unknown':
-                        logger.debug(f"Getting health check data for pod {pod_id}, container {container_name}")
+                        logger.info(f"Getting health check data for pod {pod_id}, container {container_name} (full container_id: {full_container_id})")
                         
                         # Check if readiness has already succeeded
                         readiness_succeeded = False
@@ -1942,12 +1972,14 @@ async def list_pods_by_filter_api(
                                 logger.debug(f"Readiness has already succeeded for pod {pod_id}, excluding readiness checks from count")
                         
                         # Get liveness probe success rate for this container
+                        # Health check key format: health:history:{pod_id}:{container_name}:{probe_type}
                         try:
+                            logger.debug(f"Calling get_health_check_success_rate for pod_id={pod_id}, probe_type=liveness, container_name={container_name}")
                             liveness_rate = get_health_check_success_rate(
                                 rd, pod_id, 'liveness', container_name, seconds=180
                             )
                             total_liveness_checks = liveness_rate.get('total_checks', 0)
-                            logger.debug(f"Liveness rate for pod {pod_id} container {container_name}: {liveness_rate}")
+                            logger.info(f"Liveness rate for pod {pod_id} container {container_name}: {liveness_rate} (total_checks: {total_liveness_checks})")
                             if total_liveness_checks > 0:
                                 health_data['liveness'] = {
                                     'success_rate': (liveness_rate.get('successful_checks', 0) / total_liveness_checks * 100) if total_liveness_checks > 0 else 0.0,
@@ -1956,14 +1988,16 @@ async def list_pods_by_filter_api(
                                 }
                         except Exception as e:
                             logger.warning(f"Could not get liveness rate for pod {pod_id} container {container_name}: {e}", exc_info=True)
+                            logger.debug(f"Health check key would be: health:history:{pod_id}:{container_name}:liveness")
                         
                         # Get readiness probe success rate for this container
                         try:
+                            logger.debug(f"Calling get_health_check_success_rate for pod_id={pod_id}, probe_type=readiness, container_name={container_name}")
                             readiness_rate = get_health_check_success_rate(
                                 rd, pod_id, 'readiness', container_name, seconds=180
                             )
                             total_readiness_checks = readiness_rate.get('total_checks', 0)
-                            logger.debug(f"Readiness rate for pod {pod_id} container {container_name}: {readiness_rate}")
+                            logger.info(f"Readiness rate for pod {pod_id} container {container_name}: {readiness_rate} (total_checks: {total_readiness_checks})")
                             if total_readiness_checks > 0:
                                 health_data['readiness'] = {
                                     'success_rate': (readiness_rate.get('successful_checks', 0) / total_readiness_checks * 100) if total_readiness_checks > 0 else 0.0,
@@ -2784,16 +2818,34 @@ async def list_pods_by_namespace_api(
 @app.post("/containerd/terminate_pod/")
 async def terminate_pod_api(request: TerminatePodRequest, user: str = Depends(get_current_user)):
     # DO NOT call worker or redis or grpc here beyond enqueueing.
+    
+    # Perform reverse lookup to get actual pod ID from container ID if needed
+    pod_name = request.pod_name
+    if pod_name and "-" in pod_name:  # Likely a container task ID (e.g., "simple-api-b077fc1e35784e80")
+        actual_pod_id = store.get_pod_id_from_container_id(
+            container_id=pod_name,
+            namespace=request.namespace,
+            hostname=request.host_name
+        )
+        if actual_pod_id:
+            logger.info(f"Resolved container ID '{pod_name}' to pod ID '{actual_pod_id}'")
+            pod_name = actual_pod_id
+        else:
+            # Fallback: try extracting pod ID from container task ID format
+            logger.warning(f"Could not find pod for container ID '{pod_name}', trying fallback extraction")
+            pod_name = pod_name.split("-")[-1]  # Extract last part (pod ID)
+    
     result = submit_celery_task(
         task=terminate_pod_task,
-        args=(request.namespace, request.pod_name),
+        args=(request.namespace, pod_name),
         kwargs={"cni_network": request.cni_network, "ifname": request.ifname},
         queue_info=create_host_queue_info(request.host_name, ue),
         operation_name="terminate_pod",
         error_code="TERMINATE_POD_ERROR",
         additional_data={
             "namespace": request.namespace,
-            "pod_name": request.pod_name,
+            "pod_name": pod_name,
+            "original_pod_name": request.pod_name,  # Keep original for reference
             "host_name": request.host_name,
         },
     )

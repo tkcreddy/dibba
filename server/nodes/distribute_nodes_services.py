@@ -1,4 +1,5 @@
 import re
+from collections import defaultdict
 from logpkg.log_kcld import LogKCld,log_to_file
 from typing import Optional, List, Dict, Any
 from utils.redis.redis_interface import RedisInterface
@@ -567,6 +568,7 @@ class ClusterWorkerDistribution:
             logger.info(f"Placing {service_name} instance {instance_num} (CPU: {requirements['cpu']}, Memory: {requirements['memory']})")
 
             # First pass: Find all nodes that can fit this instance
+            # IMPORTANT: Calculate instance_count including already-placed instances in this distribution run
             candidate_nodes = []
             for i in range(num_nodes):
                 node = self.worker_nodes[i]
@@ -575,20 +577,25 @@ class ClusterWorkerDistribution:
                 current_memory_usage = sum(
                     self.cluster_infos[s]['memory'] for s, _ in distribution[i] if s in self.cluster_infos)
                 
+                # Calculate current instance count for this service on this node
+                # This includes: existing pods + instances already placed in this distribution run
+                current_instances_on_node = sum(1 for s, _ in distribution[i] if s == service_name)
+                instance_count_on_node = service_node_counts[service_name][i] + current_instances_on_node
+                
                 logger.info(f"  Node {i}: available CPU={node['cpu']}, used CPU={current_cpu_usage}, available Memory={node['memory']}, used Memory={current_memory_usage}")
                 logger.info(f"  Node {i}: After adding this instance: CPU={current_cpu_usage + requirements['cpu']}/{node['cpu']}, Memory={current_memory_usage + requirements['memory']}/{node['memory']}")
+                logger.info(f"  Node {i}: Current instances of {service_name}: existing={service_node_counts[service_name][i]}, in_current_distribution={current_instances_on_node}, total={instance_count_on_node}")
 
                 if (node['cpu'] >= current_cpu_usage + requirements['cpu'] and
                         node['memory'] >= current_memory_usage + requirements['memory']):
                     resource_usage = current_cpu_usage + requirements['cpu'] + current_memory_usage + requirements['memory']
-                    instance_count_on_node = service_node_counts[service_name][i]
                     # Calculate available resources (for redundancy prioritization)
                     available_cpu = node['cpu'] - current_cpu_usage
                     available_memory = node['memory'] - current_memory_usage
                     candidate_nodes.append({
                         'node_index': i,
                         'resource_usage': resource_usage,
-                        'instance_count': instance_count_on_node,
+                        'instance_count': instance_count_on_node,  # Use calculated count including current distribution
                         'available_cpu': available_cpu,
                         'available_memory': available_memory,
                         'node': node
@@ -608,14 +615,110 @@ class ClusterWorkerDistribution:
             # 3. If all nodes have instances, prefer the one with fewer instances
             # 4. If tied on instance count, prefer lower resource usage
             
+            # STRICT REDUNDANCY ENFORCEMENT: If we're placing multiple instances of the same service,
+            # NEVER place a second instance on a node that already has an instance, even if it has more resources.
+            # This ensures true redundancy across nodes.
+            total_instances_needed = self.cluster_infos[service_name].get('instances', 1)
+            
+            # Calculate total instances (existing + being placed) to determine if we need redundancy
+            # Count existing instances across all nodes
+            total_existing_instances = sum(service_node_counts[service_name].values())
+            # Count instances being placed in this distribution run (before placing current instance)
+            instances_being_placed = sum(1 for s, _ in sum(distribution.values(), []) if s == service_name)
+            # Total instances after placing this one
+            total_instances_after_placement = total_existing_instances + instances_being_placed + 1  # +1 for current instance being placed
+            
             # Separate candidates into two groups: nodes with 0 instances vs nodes with instances
             nodes_with_zero_instances = [c for c in candidate_nodes if c['instance_count'] == 0]
             nodes_with_instances = [c for c in candidate_nodes if c['instance_count'] > 0]
             
-            if nodes_with_zero_instances:
+            logger.warning(
+                f"  Redundancy check for {service_name} instance {instance_num}: "
+                f"existing={total_existing_instances}, being_placed={instances_being_placed}, "
+                f"total_after={total_instances_after_placement}, nodes_available={num_nodes}, "
+                f"nodes_with_zero_instances={len(nodes_with_zero_instances)}, "
+                f"candidate_nodes={len(candidate_nodes)}, instance_counts={[c['instance_count'] for c in candidate_nodes]}"
+            )
+            
+            # STRICT REDUNDANCY: If we will have multiple instances total (2+) and there are multiple nodes available,
+            # Ensure even distribution across nodes for maximum redundancy.
+            # This applies even when placing just 1 instance if there's already 1 existing instance.
+            if total_instances_after_placement >= 2 and num_nodes >= 2:
+                if len(nodes_with_zero_instances) > 0:
+                    # We have nodes with 0 instances - MUST use only those for redundancy
+                    # For even distribution: when placing multiple instances, cycle through nodes with 0 instances
+                    # This ensures we use all available nodes before placing a second instance on any node
+                    
+                    # Calculate how many instances have been placed so far in this distribution run
+                    instances_placed_so_far = sum(1 for s, inst in sum(distribution.values(), []) if s == service_name)
+                    
+                    # For even distribution: use modulo to cycle through nodes with 0 instances
+                    # This ensures we distribute evenly: instance 0 -> node 0, instance 1 -> node 1, etc.
+                    if len(nodes_with_zero_instances) > 1:
+                        # Sort nodes by index for consistent ordering, then by available resources
+                        nodes_with_zero_instances.sort(
+                            key=lambda x: (x['node_index'], -(x['available_cpu'] + x['available_memory']))
+                        )
+                        # Use modulo to cycle through nodes for even distribution
+                        node_index_in_zero_list = instances_placed_so_far % len(nodes_with_zero_instances)
+                        best_candidate = nodes_with_zero_instances[node_index_in_zero_list]
+                        logger.info(
+                            f"  Selected node {best_candidate['node_index']} (0 instances of {service_name}, "
+                            f"available CPU: {best_candidate['available_cpu']}, available Memory: {best_candidate['available_memory']}) "
+                            f"for EVEN distribution (instance {instance_num}, instances placed so far: {instances_placed_so_far}, "
+                            f"nodes with 0 instances: {len(nodes_with_zero_instances)}, "
+                            f"using node index {node_index_in_zero_list} in zero-instances list)"
+                        )
+                    else:
+                        # Only one node with 0 instances - use it
+                        best_candidate = nodes_with_zero_instances[0]
+                        logger.info(f"  Selected node {best_candidate['node_index']} (0 instances of {service_name}, available CPU: {best_candidate['available_cpu']}, available Memory: {best_candidate['available_memory']}) for STRICT redundancy (instances needed: {total_instances_needed}, nodes available: {num_nodes}, nodes with 0 instances: {len(nodes_with_zero_instances)})")
+                else:
+                    # No nodes with 0 instances available - this means all nodes already have instances
+                    # This should not happen if we're placing the first few instances, but can happen if
+                    # we have more instances than nodes. In this case, prefer the node with fewer instances.
+                    # However, if we're placing instance 0 or 1 and all nodes have instances, this is a bug.
+                    if instance_num < 2:
+                        logger.error(
+                            f"  ERROR: Placing instance {instance_num} of {service_name} but all {num_nodes} nodes already have instances. "
+                            f"This violates redundancy. Node instance counts: {[c['instance_count'] for c in candidate_nodes]}. "
+                            f"Returning None to trigger node creation."
+                        )
+                        return None  # Trigger node creation
+                    
+                    # For even distribution when all nodes have instances: use modulo to cycle through nodes
+                    # Sort by instance count first (fewer instances = better), then by node index for consistency
+                    candidate_nodes.sort(key=lambda x: (x['instance_count'], x['node_index'], x['resource_usage']))
+                    
+                    # Calculate how many instances have been placed so far
+                    instances_placed_so_far = sum(1 for s, inst in sum(distribution.values(), []) if s == service_name)
+                    
+                    # Group candidates by instance count
+                    candidates_by_count = defaultdict(list)
+                    for c in candidate_nodes:
+                        candidates_by_count[c['instance_count']].append(c)
+                    
+                    # Get nodes with minimum instance count
+                    min_count = min(candidates_by_count.keys())
+                    min_count_nodes = candidates_by_count[min_count]
+                    
+                    # Use modulo to cycle through nodes with minimum count for even distribution
+                    if len(min_count_nodes) > 1:
+                        node_index_in_min_list = instances_placed_so_far % len(min_count_nodes)
+                        best_candidate = min_count_nodes[node_index_in_min_list]
+                    else:
+                        best_candidate = min_count_nodes[0]
+                    
+                    logger.warning(
+                        f"  WARNING: All {num_nodes} nodes already have instances of {service_name}. "
+                        f"Selected node {best_candidate['node_index']} with {best_candidate['instance_count']} instances "
+                        f"(even distribution: instance {instance_num}, instances placed so far: {instances_placed_so_far}). "
+                        f"This may indicate insufficient nodes for full redundancy."
+                    )
+            elif nodes_with_zero_instances:
+                # Single instance needed, or only 1 node available - use normal logic
                 # Prioritize nodes with 0 instances for redundancy
                 # Among these, prefer nodes with more available resources (to balance load)
-                # Sort by total available capacity in descending order (more available = better)
                 nodes_with_zero_instances.sort(
                     key=lambda x: x['available_cpu'] + x['available_memory'],
                     reverse=True  # Descending order: more available resources first
@@ -633,10 +736,52 @@ class ClusterWorkerDistribution:
 
             # Place the instance
             distribution[best_node].append((service_name, instance_num))
+            # Update the count for tracking (but we calculate it dynamically above)
             service_node_counts[service_name][best_node] += 1
             logger.info(f"Placed {service_name} instance {instance_num} on node {best_node}. Current distribution: {distribution}")
 
+        # Final validation: Check if redundancy is violated (multiple instances on same node when multiple nodes available)
+        for service_name, requirements in self.cluster_infos.items():
+            instances_needed = requirements.get('instances', 1)
+            if instances_needed >= 2 and num_nodes >= 2:
+                # Check how many nodes have instances of this service
+                nodes_with_instances = set()
+                for node_index, placements in distribution.items():
+                    for s, _ in placements:
+                        if s == service_name:
+                            nodes_with_instances.add(node_index)
+                
+                # If we need 2+ instances but they're all on the same node, this violates redundancy
+                if len(nodes_with_instances) == 1 and instances_needed >= 2:
+                    single_node = list(nodes_with_instances)[0]
+                    hostname = self.worker_nodes[single_node].get('hostname', f'node_{single_node}')
+                    logger.error(
+                        f"REDUNDANCY VIOLATION: All {instances_needed} instances of {service_name} are placed on a single node "
+                        f"({hostname}) despite {num_nodes} nodes being available. This violates redundancy requirements. "
+                        f"Returning None to trigger node creation."
+                    )
+                    return None  # Return None to trigger AWS node creation in scheduler
+        
         logger.info(f"Final distribution result: {distribution}")
+        
+        # Log detailed distribution summary for debugging
+        for service_name, requirements in self.cluster_infos.items():
+            instances_needed = requirements.get('instances', 1)
+            nodes_used = set()
+            for node_index, placements in distribution.items():
+                for s, _ in placements:
+                    if s == service_name:
+                        hostname = self.worker_nodes[node_index].get('hostname', f'node_{node_index}')
+                        nodes_used.add(hostname)
+            logger.info(
+                f"Service {service_name}: {instances_needed} instances needed, distributed across {len(nodes_used)} node(s): {sorted(nodes_used)}"
+            )
+            if instances_needed >= 2 and len(nodes_used) == 1:
+                logger.warning(
+                    f"Service {service_name}: WARNING - {instances_needed} instances all on same node {list(nodes_used)[0]}. "
+                    f"This violates redundancy but may be acceptable if only 1 node available."
+                )
+        
         return distribution
 
 

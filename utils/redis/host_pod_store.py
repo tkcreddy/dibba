@@ -715,6 +715,76 @@ class HostPodStore:
         return pods
     
     @log_to_file(logger)
+    @handle_errors("get_pod_id_from_container_id", "REDIS_ERROR")
+    def get_pod_id_from_container_id(
+        self,
+        container_id: str,
+        namespace: Optional[str] = None,
+        hostname: Optional[str] = None
+    ) -> Optional[str]:
+        """Get the actual pod ID from a container ID by looking up in Redis.
+        
+        Searches through pods in Redis to find the pod that contains a container
+        with the given container_id (cid). Returns the pod's pod_id.
+        
+        Args:
+            container_id: Container ID (cid) or container task ID to look up
+            namespace: Optional namespace to limit search
+            hostname: Optional hostname to limit search
+            
+        Returns:
+            The pod_id (pause container ID) if found, None otherwise
+        """
+        if not container_id or not isinstance(container_id, str):
+            return None
+        
+        try:
+            # Get pods to search through
+            if hostname and namespace:
+                pods = self.get_pods_by_host_and_namespace(hostname, namespace)
+            elif hostname:
+                pods = self.get_pods_by_host(hostname)
+            elif namespace:
+                pods = self.get_pods_by_namespace(namespace)
+            else:
+                # Search all pods (less efficient, but works)
+                all_pod_ids = self.redis.smembers(RedisKeyPatterns.POD_INDEX_ALL)
+                pods = []
+                for pod_id in all_pod_ids:
+                    pod_id_str = pod_id.decode('utf-8') if isinstance(pod_id, bytes) else pod_id
+                    pod = self.get_pod(pod_id_str)
+                    if pod:
+                        pods.append(pod)
+            
+            # Search through pods to find the one containing this container
+            for pod in pods:
+                containers = pod.get('containers', [])
+                for container in containers:
+                    container_cid = container.get('cid') or container.get('id')
+                    # Also check if container_id matches the full task ID format
+                    # (e.g., "simple-api-b077fc1e35784e80" matches container with cid or task ID)
+                    if container_cid == container_id:
+                        # Found the pod containing this container, return its pod_id
+                        return pod.get('pod_id')
+                    
+                    # Check if container_id is a full task ID and matches constructed task ID
+                    container_name = container.get('name')
+                    pod_id_from_pod = pod.get('pod_id')
+                    if container_name and pod_id_from_pod:
+                        # Construct full task ID: container-name-pod-id
+                        constructed_task_id = f"{container_name}-{pod_id_from_pod}"
+                        if constructed_task_id == container_id:
+                            return pod_id_from_pod
+            
+            # Not found
+            logger.warning(f"Could not find pod containing container {container_id} in Redis")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error looking up pod for container {container_id}: {e}", exc_info=True)
+            return None
+    
+    @log_to_file(logger)
     @handle_errors("delete_pod", "REDIS_ERROR")
     def delete_pod(self, pod_id: str) -> None:
         """Delete pod and all associated indexes.

@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional
 from logpkg.log_kcld import LogKCld, log_to_file
 from utils.celery.celery_config import celery_app
 from utils.redis.redis_interface import RedisInterface
-from utils.redis.host_pod_store import HostPodStore, HostStatus
+from utils.redis.host_pod_store import HostPodStore, HostStatus, RedisKeyPatterns
 from utils.redis.deployment_store import DeploymentStore
 from server.nodes.distribute_nodes_services import ClusterWorkerDistribution, get_worker_nodes_from_redis
 from server.sched.scheduler import DeploymentScheduler
@@ -22,6 +22,59 @@ from time import sleep
 from utils.exceptions import AWSError
 
 logger = LogKCld()
+
+
+def _get_pod_id_from_container_id(container_id: str, namespace: Optional[str] = None, hostname: Optional[str] = None) -> Optional[str]:
+    """Get the actual pod ID from a container ID by looking up in Redis.
+    
+    Searches through pods in Redis to find the pod that contains a container
+    with the given container_id (cid). Returns the pod's pod_id.
+    
+    Args:
+        container_id: Container ID (cid) or container task ID to look up
+        namespace: Optional namespace to limit search
+        hostname: Optional hostname to limit search
+        
+    Returns:
+        The pod_id (pause container ID) if found, None otherwise
+    """
+    try:
+        redis_interface = RedisInterface()
+        host_pod_store = HostPodStore(redis_interface)
+        
+        # Get pods to search through
+        if hostname and namespace:
+            pods = host_pod_store.get_pods_by_host_and_namespace(hostname, namespace)
+        elif hostname:
+            pods = host_pod_store.get_pods_by_host(hostname)
+        elif namespace:
+            pods = host_pod_store.get_pods_by_namespace(namespace)
+        else:
+            # Search all pods (less efficient, but works)
+            all_pod_ids = host_pod_store.redis.smembers(RedisKeyPatterns.POD_INDEX_ALL)
+            pods = []
+            for pod_id in all_pod_ids:
+                pod_id_str = pod_id.decode('utf-8') if isinstance(pod_id, bytes) else pod_id
+                pod = host_pod_store.get_pod(pod_id_str)
+                if pod:
+                    pods.append(pod)
+        
+        # Search through pods to find the one containing this container
+        for pod in pods:
+            containers = pod.get('containers', [])
+            for container in containers:
+                container_cid = container.get('cid') or container.get('id')
+                if container_cid == container_id:
+                    # Found the pod containing this container, return its pod_id
+                    return pod.get('pod_id')
+        
+        # Not found
+        logger.warning(f"Could not find pod containing container {container_id} in Redis")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error looking up pod for container {container_id}: {e}", exc_info=True)
+        return None
 
 
 @celery_app.task(name="deployment.recover_missing_replicas")
@@ -104,12 +157,41 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     if not candidate_pods:
                         candidate_pods = all_pods
                 
-                # Separate pods by status: RUNNING vs UNKNOWN/other
-                # First, check for UNKNOWN pods to terminate them
+                # Separate pods by status: RUNNING vs UNKNOWN/STOPPED/other
+                # First, check for UNKNOWN and STOPPED pods to terminate them
                 unknown_pods = [
                     pod for pod in candidate_pods
                     if pod.get('status', '').upper() in ('UNKNOWN', 'UNKOWN')  # Handle typo too
                 ]
+                
+                # Also check for STOPPED pods - these should be terminated and recreated
+                stopped_pods = [
+                    pod for pod in candidate_pods
+                    if pod.get('status', '').upper() in ('STOPPED', 'STOPPING', 'EXITED')
+                ]
+                
+                # Also check for pods with stopped containers
+                # This is critical: a pod might be marked as RUNNING but have stopped containers
+                pods_with_stopped_containers = []
+                for pod in candidate_pods:
+                    containers = pod.get('containers', [])
+                    if not containers or not isinstance(containers, list):
+                        continue  # Skip pods without containers list
+                    
+                    for container in containers:
+                        if not isinstance(container, dict):
+                            continue  # Skip invalid container entries
+                        
+                        container_status = container.get('status', '').upper()
+                        container_name = container.get('name', 'unknown')
+                        
+                        if container_status in ('STOPPED', 'STOPPING', 'EXITED'):
+                            logger.warning(
+                                f"Deployment {namespace}/{name}: Pod {pod.get('pod_id')} has stopped container "
+                                f"{container_name} (status: {container_status}). Will terminate pod for recreation."
+                            )
+                            pods_with_stopped_containers.append(pod)
+                            break  # Only add once per pod
                 
                 pods_terminated = 0
                 
@@ -239,6 +321,153 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     logger.info(f"Terminated {pods_terminated} UNKNOWN pods")
                     recovery_results['pods_terminated'] = recovery_results.get('pods_terminated', 0) + pods_terminated
                 
+                # Priority 2: Terminate STOPPED pods (they should be recreated)
+                if stopped_pods:
+                    logger.warning(f"Deployment {namespace}/{name}: Found {len(stopped_pods)} pods in STOPPED state, terminating them for recreation")
+                    logger.info(f"STOPPED pod IDs: {[p.get('pod_id') for p in stopped_pods[:10]]}{'...' if len(stopped_pods) > 10 else ''} (showing first 10)")
+                    
+                    # Get list of pods currently being terminated to avoid duplicate attempts
+                    try:
+                        terminating_pod_ids = redis_client.smembers(PODS_TERMINATING_KEY)
+                        terminating_pod_ids = {pid.decode('utf-8') if isinstance(pid, bytes) else pid for pid in terminating_pod_ids}
+                    except Exception as e:
+                        logger.warning(f"Failed to check terminating pods: {e}", exc_info=True)
+                        terminating_pod_ids = set()
+                    
+                    # Use centralized scheduler function for pod termination
+                    scheduler = DeploymentScheduler()
+                    for pod in stopped_pods:
+                        pod_id = pod.get("pod_id")
+                        hostname = pod.get("hostname")
+                        namespace = pod.get("namespace")
+                        
+                        # Look up actual pod ID from Redis if pod_id looks like a container task ID
+                        if pod_id and "-" in pod_id:
+                            actual_pod_id = _get_pod_id_from_container_id(pod_id, namespace=namespace, hostname=hostname)
+                            if actual_pod_id:
+                                pod_id = actual_pod_id
+                            else:
+                                # Fallback: extract from pod_id if lookup fails
+                                pod_id = pod_id.split("-")[-1]
+                        
+                        if not pod_id or not hostname:
+                            logger.warning(f"Skipping STOPPED pod with missing pod_id or hostname: {pod}")
+                            continue
+                        
+                        # Skip if already being terminated
+                        if pod_id in terminating_pod_ids:
+                            logger.debug(f"Skipping STOPPED pod {pod_id}: already being terminated")
+                            # Remove from candidate_pods so it's not counted
+                            candidate_pods = [p for p in candidate_pods if p.get('pod_id') != pod_id]
+                            continue
+                        
+                        try:
+                            result = scheduler.terminate_pod_on_host(
+                                pod_id=pod_id,
+                                namespace=namespace,
+                                hostname=hostname
+                            )
+                            
+                            if result.get('status') == 'submitted':
+                                pods_terminated += 1
+                                logger.info(f"Terminated STOPPED pod {pod_id} for recreation (task_id: {result.get('task_id')})")
+                                # Mark pod as being terminated to prevent recovery task from trying again
+                                try:
+                                    redis_client.sadd(PODS_TERMINATING_KEY, pod_id)
+                                    redis_client.expire(PODS_TERMINATING_KEY, 600)  # 10 minutes TTL
+                                    logger.debug(f"Marked STOPPED pod {pod_id} as terminating")
+                                except Exception as mark_error:
+                                    logger.warning(f"Failed to mark STOPPED pod {pod_id} as terminating: {mark_error}")
+                                # Remove from candidate_pods so it's not counted
+                                candidate_pods = [p for p in candidate_pods if p.get('pod_id') != pod_id]
+                            else:
+                                logger.warning(f"Failed to terminate STOPPED pod {pod_id}: {result.get('error', 'Unknown error')}")
+                        except Exception as e:
+                            logger.error(f"Failed to terminate STOPPED pod {pod_id}: {e}", exc_info=True)
+                    
+                    logger.info(f"Terminated {pods_terminated} STOPPED pods for recreation")
+                    recovery_results['pods_terminated'] = recovery_results.get('pods_terminated', 0) + pods_terminated
+                
+                # Priority 3: Terminate pods with stopped containers (similar to STOPPED pods)
+                if pods_with_stopped_containers:
+                    # Remove pods that were already handled as STOPPED pods
+                    pods_with_stopped_containers = [
+                        p for p in pods_with_stopped_containers
+                        if p.get('pod_id') not in [sp.get('pod_id') for sp in stopped_pods]
+                    ]
+                    
+                    if pods_with_stopped_containers:
+                        logger.warning(f"Deployment {namespace}/{name}: Found {len(pods_with_stopped_containers)} pods with stopped containers, terminating them for recreation")
+                        logger.info(f"Pods with stopped containers IDs: {[p.get('pod_id') for p in pods_with_stopped_containers[:10]]}{'...' if len(pods_with_stopped_containers) > 10 else ''} (showing first 10)")
+                        
+                        # Get list of pods currently being terminated to avoid duplicate attempts
+                        try:
+                            terminating_pod_ids = redis_client.smembers(PODS_TERMINATING_KEY)
+                            terminating_pod_ids = {pid.decode('utf-8') if isinstance(pid, bytes) else pid for pid in terminating_pod_ids}
+                        except Exception as e:
+                            logger.warning(f"Failed to check terminating pods: {e}", exc_info=True)
+                            terminating_pod_ids = set()
+                        
+                        # Use centralized scheduler function for pod termination
+                        scheduler = DeploymentScheduler()
+                        for pod in pods_with_stopped_containers:
+                            original_pod_id = pod.get("pod_id")
+                            pod_id = _get_actual_pod_id(pod)  # Ensure we use pause container ID, not container task ID
+                            hostname = pod.get("hostname")
+                            
+                            if not pod_id or not hostname:
+                                logger.warning(
+                                    f"Skipping pod with stopped containers (missing pod_id or hostname). "
+                                    f"Original pod_id: {original_pod_id}, Extracted pod_id: {pod_id}, Pod: {pod}"
+                                )
+                                continue
+                            
+                            # Log if extraction happened
+                            if original_pod_id != pod_id:
+                                logger.info(
+                                    f"Extracted actual pod ID from container task ID: "
+                                    f"'{original_pod_id}' -> '{pod_id}' for termination"
+                                )
+                            
+                            # Skip if already being terminated
+                            if pod_id in terminating_pod_ids:
+                                logger.debug(f"Skipping pod {pod_id} with stopped containers: already being terminated")
+                                # Remove from candidate_pods so it's not counted
+                                candidate_pods = [p for p in candidate_pods if p.get('pod_id') != pod_id]
+                                continue
+                            
+                            try:
+                                logger.info(
+                                    f"Terminating pod with stopped containers: "
+                                    f"pod_id={pod_id} (extracted from original={original_pod_id}), "
+                                    f"hostname={hostname}, namespace={namespace}"
+                                )
+                                result = scheduler.terminate_pod_on_host(
+                                    pod_id=pod_id,
+                                    namespace=namespace,
+                                    hostname=hostname
+                                )
+                                
+                                if result.get('status') == 'submitted':
+                                    pods_terminated += 1
+                                    logger.info(f"Terminated pod {pod_id} with stopped containers for recreation (task_id: {result.get('task_id')})")
+                                    # Mark pod as being terminated to prevent recovery task from trying again
+                                    try:
+                                        redis_client.sadd(PODS_TERMINATING_KEY, pod_id)
+                                        redis_client.expire(PODS_TERMINATING_KEY, 600)  # 10 minutes TTL
+                                        logger.debug(f"Marked pod {pod_id} with stopped containers as terminating")
+                                    except Exception as mark_error:
+                                        logger.warning(f"Failed to mark pod {pod_id} as terminating: {mark_error}")
+                                    # Remove from candidate_pods so it's not counted
+                                    candidate_pods = [p for p in candidate_pods if p.get('pod_id') != pod_id]
+                                else:
+                                    logger.warning(f"Failed to terminate pod {pod_id} with stopped containers: {result.get('error', 'Unknown error')}")
+                            except Exception as e:
+                                logger.error(f"Failed to terminate pod {pod_id} with stopped containers: {e}", exc_info=True)
+                        
+                        logger.info(f"Terminated {pods_terminated} pods with stopped containers for recreation")
+                        recovery_results['pods_terminated'] = recovery_results.get('pods_terminated', 0) + pods_terminated
+                
                 # Now filter to only RUNNING pods for validation
                 running_candidate_pods = [
                     pod for pod in candidate_pods
@@ -339,6 +568,16 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     for pod in pods_on_down_hosts:
                         pod_id = pod.get("pod_id")
                         hostname = pod.get("hostname")
+                        namespace = pod.get("namespace")
+                        
+                        # Look up actual pod ID from Redis if pod_id looks like a container task ID
+                        if pod_id and "-" in pod_id:
+                            actual_pod_id = _get_pod_id_from_container_id(pod_id, namespace=namespace, hostname=hostname)
+                            if actual_pod_id:
+                                pod_id = actual_pod_id
+                            else:
+                                # Fallback: extract from pod_id if lookup fails
+                                pod_id = pod_id.split("-")[-1]
                         
                         if not pod_id or not hostname:
                             logger.warning(f"Skipping pod on down host with missing pod_id or hostname: {pod}")
@@ -408,6 +647,16 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     for pod in unknown_pods:
                         pod_id = pod.get("pod_id")
                         hostname = pod.get("hostname")
+                        pod_namespace = pod.get("namespace") or namespace
+                        
+                        # Look up actual pod ID from Redis if pod_id looks like a container task ID
+                        if pod_id and "-" in pod_id:
+                            actual_pod_id = _get_pod_id_from_container_id(pod_id, namespace=pod_namespace, hostname=hostname)
+                            if actual_pod_id:
+                                pod_id = actual_pod_id
+                            else:
+                                # Fallback: extract from pod_id if lookup fails
+                                pod_id = pod_id.split("-")[-1]
                         
                         if not pod_id or not hostname:
                             logger.warning(f"Skipping UNKNOWN pod with missing pod_id or hostname: {pod}")
@@ -424,7 +673,9 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                                 pods_terminated += 1
                                 logger.info(f"Terminated UNKNOWN pod {pod_id} (task_id: {result.get('task_id')})")
                                 # Remove from running_pods list so it's not counted
-                                running_pods = [p for p in running_pods if p.get('pod_id') != pod_id]
+                                # Get original pod_id for comparison
+                                original_pod_id = pod.get("pod_id")
+                                running_pods = [p for p in running_pods if p.get('pod_id') != original_pod_id]
                             else:
                                 logger.warning(f"Failed to terminate UNKNOWN pod {pod_id}: {result.get('error', 'Unknown error')}")
                         except Exception as e:
@@ -511,6 +762,16 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     for pod in pods_to_terminate:
                         pod_id = pod.get("pod_id")
                         hostname = pod.get("hostname")
+                        namespace = pod.get("namespace")
+                        
+                        # Look up actual pod ID from Redis if pod_id looks like a container task ID
+                        if pod_id and "-" in pod_id:
+                            actual_pod_id = _get_pod_id_from_container_id(pod_id, namespace=namespace, hostname=hostname)
+                            if actual_pod_id:
+                                pod_id = actual_pod_id
+                            else:
+                                # Fallback: extract from pod_id if lookup fails
+                                pod_id = pod_id.split("-")[-1]
                         
                         if not pod_id or not hostname:
                             continue
@@ -612,12 +873,18 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                 # Count existing pods + in-flight pod creations for this deployment
                 # IMPORTANT: Also count pods in CREATED/PENDING states as they're being created
                 # These pods might not have last_updated yet or might be too new
+                # EXCLUDE STOPPED/STOPPING/EXITED pods from count (they're being terminated and recreated)
                 creating_state_pods = [
                     p for p in candidate_pods
                     if p.get('status', '').upper() in ('CREATED', 'PENDING', 'RESTARTING')
                 ]
                 # Count all pods including those being created (both in Redis and in-flight)
-                all_pods_count = len(candidate_pods) + len(creating_pod_keys_for_deployment)
+                # Exclude STOPPED/STOPPING/EXITED/UNKNOWN pods as they're being terminated
+                valid_candidate_pods = [
+                    p for p in candidate_pods
+                    if p.get('status', '').upper() not in ('STOPPED', 'STOPPING', 'EXITED', 'UNKNOWN', 'UNKOWN')
+                ]
+                all_pods_count = len(valid_candidate_pods) + len(creating_pod_keys_for_deployment)
                 
                 # CRITICAL: Clean up stale creating keys if no pods exist
                 # If we have creating keys but no candidate_pods, and we have zero running replicas,
@@ -795,6 +1062,48 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                     if pending_count > 0 or readiness_wait_count > 0:
                         logger.info(f"Deployment {namespace}/{name}: Found {pending_count} pending pods and {readiness_wait_count} pods in readiness wait period (initialDelaySeconds={readiness_initial_delay}s). Waiting for them to become ready before creating more. Total pods: {all_pods_count} (Running: {current_replicas}, Pending: {pending_count}, InReadinessWait: {readiness_wait_count}, Failed/Stopped: {failed_stopped_count})")
                         continue
+                    
+                    # FINAL SAFETY CHECK: Re-verify all_pods_count hasn't changed (race condition protection)
+                    # Re-count to ensure we have the latest state
+                    try:
+                        # Quick re-check of current state
+                        current_app_pods = host_pod_store.get_pods_by_application(app_label)
+                        current_candidate_pods = [
+                            pod for pod in current_app_pods
+                            if pod.get('namespace') == namespace
+                        ]
+                        current_valid_pods = [
+                            p for p in current_candidate_pods
+                            if p.get('status', '').upper() not in ('STOPPED', 'STOPPING', 'EXITED', 'UNKNOWN', 'UNKOWN')
+                        ]
+                        # Re-check creating keys
+                        current_creating_keys = redis_client.smembers(PODS_CREATING_KEY)
+                        current_creating_keys_for_deployment = {
+                            key.decode('utf-8') if isinstance(key, bytes) else key
+                            for key in current_creating_keys
+                            if f"{namespace}:{name}:" in (key.decode('utf-8') if isinstance(key, bytes) else key)
+                        }
+                        updated_all_pods_count = len(current_valid_pods) + len(current_creating_keys_for_deployment)
+                        
+                        # If count changed significantly, recalculate
+                        if abs(updated_all_pods_count - all_pods_count) > 0:
+                            logger.warning(f"Deployment {namespace}/{name}: Pod count changed during calculation (was {all_pods_count}, now {updated_all_pods_count}). Recalculating pods_to_create.")
+                            all_pods_count = updated_all_pods_count
+                            # Recalculate pods needed
+                            if all_pods_count >= max_replicas:
+                                logger.warning(f"Deployment {namespace}/{name}: After re-check, already at or above max_replicas ({all_pods_count} >= {max_replicas}). Skipping pod creation.")
+                                continue
+                            if all_pods_count >= min_replicas:
+                                logger.warning(f"Deployment {namespace}/{name}: After re-check, already at or above min_replicas ({all_pods_count} >= {min_replicas}). No pods to create.")
+                                continue
+                            pods_needed_for_min = min_replicas - all_pods_count
+                            max_pods_we_can_create = max_replicas - all_pods_count
+                            pods_to_create = min(pods_needed_for_min, max_pods_we_can_create)
+                            if pods_to_create <= 0:
+                                logger.info(f"Deployment {namespace}/{name}: After re-check, no pods to create (all_pods_count={all_pods_count}, min={min_replicas}, max={max_replicas})")
+                                continue
+                    except Exception as recheck_error:
+                        logger.warning(f"Failed to re-check pod count: {recheck_error}. Using original calculation.")
                     
                     missing_count = pods_to_create
                     target_replicas = all_pods_count + pods_to_create
@@ -1017,6 +1326,16 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
             for pod in unknown_pods:
                 pod_id = pod.get("pod_id")
                 hostname = pod.get("hostname")
+                pod_namespace = pod.get("namespace") or namespace
+                
+                # Look up actual pod ID from Redis if pod_id looks like a container task ID
+                if pod_id and "-" in pod_id:
+                    actual_pod_id = _get_pod_id_from_container_id(pod_id, namespace=pod_namespace, hostname=hostname)
+                    if actual_pod_id:
+                        pod_id = actual_pod_id
+                    else:
+                        # Fallback: extract from pod_id if lookup fails
+                        pod_id = pod_id.split("-")[-1]
                 
                 if not pod_id or not hostname:
                     logger.warning(f"Skipping UNKNOWN pod with missing pod_id or hostname: {pod}")
@@ -1267,6 +1586,16 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
             for pod in pods_to_terminate:
                 pod_id = pod.get("pod_id")
                 hostname = pod.get("hostname")
+                namespace = pod.get("namespace")
+                
+                # Look up actual pod ID from Redis if pod_id looks like a container task ID
+                if pod_id and "-" in pod_id:
+                    actual_pod_id = _get_pod_id_from_container_id(pod_id, namespace=namespace, hostname=hostname)
+                    if actual_pod_id:
+                        pod_id = actual_pod_id
+                    else:
+                        # Fallback: extract from pod_id if lookup fails
+                        pod_id = pod_id.split("-")[-1]
                 
                 if not pod_id or not hostname:
                     continue
@@ -1297,6 +1626,36 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
             missing_replicas = min_replicas - running_pods_count
             logger.info(f"Scaling up: {running_pods_count} running pods, min_replicas={min_replicas}, need {missing_replicas} more pods")
             logger.info(f"Current running pod IDs: {[p.get('pod_id') for p in running_pods]}")
+            
+            # CRITICAL: Check if pods are already being created by recover_missing_replicas task
+            # This prevents double-creation when both tasks run simultaneously
+            PODS_CREATING_KEY = "pods:creating"
+            redis_client = redis_interface.redis_client
+            try:
+                creating_keys = redis_client.smembers(PODS_CREATING_KEY)
+                creating_keys_for_deployment = {
+                    key.decode('utf-8') if isinstance(key, bytes) else key
+                    for key in creating_keys
+                    if f"{namespace}:{deployment_name}:" in (key.decode('utf-8') if isinstance(key, bytes) else key)
+                }
+                if creating_keys_for_deployment:
+                    logger.warning(
+                        f"Deployment {namespace}/{deployment_name}: Pods are already being created by recover_missing_replicas task "
+                        f"(creating_keys: {creating_keys_for_deployment}). Skipping pod creation in scale_deployment to prevent double-creation."
+                    )
+                    return {
+                        "status": "success",
+                        "deployment": deployment_name,
+                        "namespace": namespace,
+                        "pods_created": 0,
+                        "pods_terminated": pods_terminated,
+                        "current_replicas": running_pods_count,
+                        "min_replicas": min_replicas,
+                        "max_replicas": max_replicas,
+                        "message": "Pods already being created by recovery task"
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to check creating keys: {e}. Proceeding with pod creation.")
             
             # Get available worker nodes
             worker_nodes_raw = get_worker_nodes_from_redis(redis_interface)
@@ -1353,9 +1712,137 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                 }
             }
             
-            # Use distribution service to find placement
-            distribution = ClusterWorkerDistribution(worker_nodes, cluster_info)
+            # Count existing pods per host per service to ensure distribution and redundancy
+            # This prevents placing multiple replicas on the same host
+            # Format: {hostname: {service_name: count}}
+            existing_pods_per_host = {}
+            for pod in running_pods:
+                pod_hostname = pod.get('hostname')
+                if pod_hostname:
+                    if pod_hostname not in existing_pods_per_host:
+                        existing_pods_per_host[pod_hostname] = {}
+                    # Count pods for this service (app_label) on this host
+                    existing_pods_per_host[pod_hostname][app_label] = existing_pods_per_host[pod_hostname].get(app_label, 0) + 1
+            
+            logger.warning(f"Deployment {namespace}/{deployment_name}: Existing pods per host: {existing_pods_per_host}")
+            logger.warning(f"Deployment {namespace}/{deployment_name}: Available worker nodes: {[n.get('hostname') for n in worker_nodes_raw]} (count: {len(worker_nodes_raw)})")
+            logger.warning(f"Deployment {namespace}/{deployment_name}: Need to create {missing_replicas} replicas, currently have {running_pods_count} running pods")
+            
+            # CRITICAL: Check if we need 2+ replicas total but only have 1 worker node - create additional node for redundancy
+            total_replicas_after = running_pods_count + missing_replicas
+            if total_replicas_after >= 2 and len(worker_nodes_raw) == 1:
+                logger.warning(
+                    f"Deployment {namespace}/{deployment_name}: Only 1 worker node available but will have {total_replicas_after} total replicas. "
+                    f"Creating additional worker node for redundancy."
+                )
+                
+                # Check if AWS nodes are already being created for this namespace
+                AWS_NODES_CREATING_KEY_PREFIX = "aws_nodes:creating"
+                aws_nodes_creating_key = f"{AWS_NODES_CREATING_KEY_PREFIX}:{namespace}"
+                try:
+                    lock_exists = redis_client.exists(aws_nodes_creating_key)
+                    if lock_exists:
+                        logger.warning(f"Deployment {namespace}/{deployment_name}: AWS nodes are already being created for namespace {namespace}. Waiting for them to be ready.")
+                        return {
+                            "status": "waiting_for_node",
+                            "deployment": deployment_name,
+                            "namespace": namespace,
+                            "pods_created": 0,
+                            "pods_terminated": pods_terminated,
+                            "current_replicas": running_pods_count,
+                            "min_replicas": min_replicas,
+                            "max_replicas": max_replicas,
+                            "message": "AWS nodes already being created. Will retry pod creation after node is ready."
+                        }
+                except Exception as e:
+                    logger.warning(f"Failed to check AWS nodes creating lock: {e}. Proceeding with node creation.")
+                
+                # Acquire lock before creating AWS nodes
+                try:
+                    lock_acquired = redis_client.set(aws_nodes_creating_key, "1", nx=True, ex=300)  # 5 minute TTL
+                    if not lock_acquired:
+                        logger.warning(f"Deployment {namespace}/{deployment_name}: Could not acquire AWS node creation lock. Another process may be creating nodes.")
+                        return {
+                            "status": "waiting_for_node",
+                            "deployment": deployment_name,
+                            "namespace": namespace,
+                            "pods_created": 0,
+                            "pods_terminated": pods_terminated,
+                            "current_replicas": running_pods_count,
+                            "min_replicas": min_replicas,
+                            "max_replicas": max_replicas,
+                            "message": "AWS node creation already in progress. Will retry pod creation after node is ready."
+                        }
+                except Exception as e:
+                    logger.warning(f"Failed to acquire AWS nodes creating lock: {e}. Proceeding with node creation.")
+                
+                # Use scheduler to create AWS node (similar to recover_missing_replicas)
+                # DeploymentScheduler is already imported at the top of the file
+                scheduler = DeploymentScheduler()
+                try:
+                    result = scheduler.create_aws_nodes_for_recovery(
+                        namespace=namespace,
+                        deployment_name=deployment_name,
+                        app_label=app_label,
+                        missing_replicas=1,  # Create 1 additional node
+                        containers=containers,
+                        resource_reqs={'cpu_millicores': total_cpu_millicores, 'memory_mb': total_memory_mb}
+                    )
+                    if result.get('status') == 'submitted':
+                        logger.warning(f"Deployment {namespace}/{deployment_name}: Triggered creation of additional worker node (task_id: {result.get('task_id')}). Will retry after node is ready.")
+                        return {
+                            "status": "waiting_for_node",
+                            "deployment": deployment_name,
+                            "namespace": namespace,
+                            "pods_created": 0,
+                            "pods_terminated": pods_terminated,
+                            "current_replicas": running_pods_count,
+                            "min_replicas": min_replicas,
+                            "max_replicas": max_replicas,
+                            "aws_task_id": result.get('task_id'),
+                            "message": "Creating additional worker node for redundancy. Will retry pod creation after node is ready."
+                        }
+                    else:
+                        logger.error(f"Deployment {namespace}/{deployment_name}: Failed to create additional worker node: {result.get('error', 'Unknown error')}")
+                        # Release lock on error
+                        try:
+                            redis_client.delete(aws_nodes_creating_key)
+                        except Exception:
+                            pass
+                        # Continue with single node - better than failing completely
+                except Exception as e:
+                    logger.error(f"Deployment {namespace}/{deployment_name}: Exception creating AWS node: {e}", exc_info=True)
+                    # Release lock on error
+                    try:
+                        redis_client.delete(aws_nodes_creating_key)
+                    except Exception:
+                        pass
+                    # Continue with single node - better than failing completely
+            
+            # Use distribution service to find placement with existing pods info for redundancy
+            distribution = ClusterWorkerDistribution(worker_nodes, cluster_info, existing_pods_per_host=existing_pods_per_host)
             placement_by_index = distribution.distribute_cluster_nodes()
+            
+            if placement_by_index:
+                logger.warning(f"Deployment {namespace}/{deployment_name}: Distribution result: {placement_by_index}")
+                # Log which nodes will get pods
+                nodes_used = set()
+                for node_idx, placements in placement_by_index.items():
+                    if node_idx < len(worker_nodes_raw):
+                        hostname = worker_nodes_raw[node_idx].get('hostname')
+                        nodes_used.add(hostname)
+                        logger.warning(f"Deployment {namespace}/{deployment_name}: Node {node_idx} ({hostname}) will get {len(placements)} pod(s): {placements}")
+                
+                # Check if all pods are on same node
+                if missing_replicas >= 2 and len(nodes_used) == 1:
+                    single_node = list(nodes_used)[0]
+                    logger.error(
+                        f"Deployment {namespace}/{deployment_name}: ERROR - All {missing_replicas} replicas being placed on single node {single_node}. "
+                        f"This violates redundancy! Available nodes: {[n.get('hostname') for n in worker_nodes_raw]}, "
+                        f"existing pods: {existing_pods_per_host}"
+                    )
+            else:
+                logger.warning(f"Deployment {namespace}/{deployment_name}: Distribution returned None - no placement found")
             
             # If placement fails, try to create AWS nodes
             if not placement_by_index:
@@ -1554,9 +2041,9 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                     for node in worker_nodes_raw
                 ]
                 
-                # Retry distribution with updated nodes
+                # Retry distribution with updated nodes (still use existing_pods_per_host for redundancy)
                 logger.info(f"Retrying distribution with {len(worker_nodes)} worker nodes (including new AWS nodes)")
-                distribution = ClusterWorkerDistribution(worker_nodes, cluster_info)
+                distribution = ClusterWorkerDistribution(worker_nodes, cluster_info, existing_pods_per_host=existing_pods_per_host)
                 placement_by_index = distribution.distribute_cluster_nodes()
                 
                 if not placement_by_index:
@@ -1603,9 +2090,49 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
             if total_placement_count != missing_replicas:
                 logger.warning(f"Mismatch: placement created {total_placement_count} pods but expected {missing_replicas}. This may indicate an issue with the distribution algorithm.")
             
+            # Check for redundancy: If we need 2+ replicas but all are placed on the same node,
+            # this violates redundancy requirements
+            if missing_replicas >= 2 and len(placement) == 1:
+                # All replicas are being placed on a single node - need redundancy
+                single_hostname = list(placement.keys())[0]
+                logger.warning(
+                    f"All {missing_replicas} replicas for {namespace}/{deployment_name} are being placed on a single node "
+                    f"({single_hostname}). This violates redundancy requirements. "
+                    f"Existing pods per host: {existing_pods_per_host}"
+                )
+                # If we only have 1 worker node, we should create another one
+                if len(worker_nodes_raw) == 1:
+                    logger.warning(f"Only 1 worker node available. Should create additional node for redundancy, but scale_deployment doesn't handle AWS node creation. Will rely on recover_missing_replicas to handle this.")
+                else:
+                    logger.error(
+                        f"Multiple worker nodes available ({len(worker_nodes_raw)}) but distribution placed all replicas on same node. "
+                        f"This is a distribution algorithm issue. Worker nodes: {[n.get('hostname') for n in worker_nodes_raw]}"
+                    )
+            
+            # Mark pods as creating BEFORE creating them to prevent race conditions
+            # This ensures recover_missing_replicas won't create duplicate pods
+            PODS_CREATING_KEY = "pods:creating"
+            redis_client = redis_interface.redis_client
+            instances_to_create = []
+            for hostname, pod_info_list in placement.items():
+                for app_name, instance_num in pod_info_list:
+                    instances_to_create.append(instance_num)
+            
+            # Mark all instances as creating before any pod creation
+            for instance_num in instances_to_create:
+                creating_pod_key = f"{namespace}:{deployment_name}:{instance_num}"
+                try:
+                    redis_client.sadd(PODS_CREATING_KEY, creating_pod_key)
+                    redis_client.expire(PODS_CREATING_KEY, 300)  # 5 minutes TTL
+                    logger.info(f"Pre-marked pod creation {creating_pod_key} as in-flight to prevent double-creation")
+                except Exception as mark_error:
+                    logger.warning(f"Failed to pre-mark pod creation {creating_pod_key} as in-flight: {mark_error}")
+            
             # Create pods using centralized scheduler function
             scheduler = DeploymentScheduler()
             pods_created_tasks = []  # Track all task IDs for verification
+            created_instances = []  # Track instance numbers that were successfully created
+            
             for hostname, pod_info_list in placement.items():
                 logger.info(f"Creating {len(pod_info_list)} pods on {hostname}")
                 for app_name, instance_num in pod_info_list:
@@ -1655,12 +2182,25 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                         if result.get('status') == 'submitted':
                             task_id = result.get('task_id')
                             pods_created += 1
+                            created_instances.append(instance_num)
                             pods_created_tasks.append({"hostname": hostname, "instance": instance_num, "task_id": task_id})
                             logger.info(f"Successfully submitted pod creation for {app_label} instance {instance_num} on {hostname} (task_id: {task_id})")
                         else:
                             logger.error(f"Failed to create pod for {app_label} instance {instance_num} on {hostname}: {result.get('error', 'Unknown error')}")
                     except Exception as e:
                         logger.error(f"Exception creating pod for {app_label} instance {instance_num} on {hostname}: {e}", exc_info=True)
+            
+            # Clean up creating keys for instances that failed to create
+            # (instances that were pre-marked but didn't actually get created)
+            successfully_created_set = set(created_instances)
+            for instance_num in instances_to_create:
+                if instance_num not in successfully_created_set:
+                    creating_pod_key = f"{namespace}:{deployment_name}:{instance_num}"
+                    try:
+                        redis_client.srem(PODS_CREATING_KEY, creating_pod_key)
+                        logger.info(f"Removed creating key {creating_pod_key} because pod creation failed")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to remove creating key {creating_pod_key}: {cleanup_error}")
             
             logger.info(f"Submitted {pods_created} pod creation tasks. Task details: {pods_created_tasks}")
             

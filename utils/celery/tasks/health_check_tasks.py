@@ -345,20 +345,86 @@ async def _check_pod_health_async(pod_id: str, hostname: str, namespace: str, se
             health_results['readiness']['status'] = 'failed'
             return health_results
         
+        # Check if any container is stopped - if so, trigger recreation
+        pod_status = pod.get('status', '').upper()
+        has_stopped_container = False
+        for container in containers:
+            container_status = container.get('status', '').upper()
+            if container_status in ('STOPPED', 'STOPPING', 'EXITED'):
+                has_stopped_container = True
+                logger.warning(
+                    f"🚨 Pod {pod_id} has stopped container {container.get('name', 'unknown')} "
+                    f"(status: {container_status}). Triggering pod recreation."
+                )
+                break
+        
+        # If pod or container is stopped, trigger recreation immediately
+        if pod_status in ('STOPPED', 'STOPPING') or has_stopped_container:
+            try:
+                from server.sched.scheduler import DeploymentScheduler
+                from utils.celery.tasks.deployment_recovery_tasks import _get_pod_id_from_container_id
+                
+                scheduler = DeploymentScheduler()
+                
+                # Look up actual pod ID from Redis if pod_id looks like a container task ID
+                actual_pod_id = pod_id
+                if pod_id and "-" in pod_id:
+                    actual_pod_id = _get_pod_id_from_container_id(pod_id, namespace=namespace, hostname=hostname)
+                    if not actual_pod_id:
+                        # Fallback: extract from pod_id if lookup fails
+                        actual_pod_id = pod_id.split("-")[-1]
+                
+                # Terminate the stopped pod - recovery task will recreate it
+                result = scheduler.terminate_pod_on_host(
+                    pod_id=actual_pod_id,  # Use actual pod ID (pause container ID), not container task ID
+                    hostname=hostname,
+                    namespace=namespace
+                )
+                
+                if result.get('status') == 'success':
+                    logger.info(
+                        f"✅ Successfully terminated stopped pod {pod_id} for recreation. "
+                        f"Recovery task will recreate it."
+                    )
+                    health_results['restart_triggered'] = True
+                    health_results['restart_reason'] = 'Container stopped'
+                    health_results['restart_message'] = f"Pod terminated for recreation (task_id: {result.get('task_id')})"
+                else:
+                    logger.error(
+                        f"❌ Failed to terminate stopped pod {pod_id}: {result.get('error', 'Unknown error')}"
+                    )
+                    health_results['restart_triggered'] = False
+                    health_results['restart_error'] = result.get('error', 'Unknown error')
+                    
+            except Exception as restart_error:
+                logger.error(
+                    f"❌ Error triggering recreation for stopped pod {pod_id}: {restart_error}",
+                    exc_info=True
+                )
+                health_results['restart_triggered'] = False
+                health_results['restart_error'] = str(restart_error)
+            
+            # Return early since container is stopped - no point in running health checks
+            health_results['liveness']['status'] = 'failed'
+            health_results['liveness']['reason'] = 'Container stopped'
+            health_results['readiness']['status'] = 'failed'
+            health_results['readiness']['reason'] = 'Container stopped'
+            return health_results
+        
         # Get health check configuration from deployment
         health_checks = None
         if deployment:
             deployment_spec = deployment.get('deployment_spec', {})
             health_checks = deployment_spec.get('health_checks', {})
         
-            # Check each container
-            logger.debug(f"Checking {len(containers)} container(s) for pod {pod_id}")
-            for container in containers:
-                container_name = container.get('name')
-                if not container_name:
-                    logger.debug(f"Skipping container without name in pod {pod_id}: {container}")
-                    continue
-                logger.info(f"🔵 [ASYNC] Checking container {container_name} in pod {pod_id}")
+        # Check each container
+        logger.debug(f"Checking {len(containers)} container(s) for pod {pod_id}")
+        for container in containers:
+            container_name = container.get('name')
+            if not container_name:
+                logger.debug(f"Skipping container without name in pod {pod_id}: {container}")
+                continue
+            logger.info(f"🔵 [ASYNC] Checking container {container_name} in pod {pod_id}")
             
             # Get container ports
             ports = container.get('ports', [])
@@ -551,6 +617,59 @@ async def _check_pod_health_async(pod_id: str, hostname: str, namespace: str, se
                                 'failure_threshold': liveness_probe.get('failureThreshold', 3),
                                 'success_threshold': liveness_probe.get('successThreshold', 1)
                             }
+                            
+                            # If liveness probe has failed (reached failureThreshold), restart/recreate the pod
+                            if final_status == 'failed':
+                                logger.warning(
+                                    f"🚨 Liveness probe FAILED for pod {pod_id} container {container_name} "
+                                    f"(consecutive_failures={updated_state.get('consecutive_failures', 0)}, "
+                                    f"failure_threshold={liveness_probe.get('failureThreshold', 3)}). "
+                                    f"Triggering pod restart/recreation."
+                                )
+                                
+                                # Trigger pod restart/recreation
+                                try:
+                                    from server.sched.scheduler import DeploymentScheduler
+                                    from utils.celery.tasks.deployment_recovery_tasks import _get_pod_id_from_container_id
+                                    
+                                    scheduler = DeploymentScheduler()
+                                    
+                                    # Look up actual pod ID from Redis if pod_id looks like a container task ID
+                                    actual_pod_id = pod_id
+                                    if pod_id and "-" in pod_id:
+                                        actual_pod_id = _get_pod_id_from_container_id(pod_id, namespace=namespace, hostname=hostname)
+                                        if not actual_pod_id:
+                                            # Fallback: extract from pod_id if lookup fails
+                                            actual_pod_id = pod_id.split("-")[-1]
+                                    
+                                    # Terminate the unhealthy pod - recovery task will recreate it
+                                    result = scheduler.terminate_pod_on_host(
+                                        pod_id=actual_pod_id,  # Use actual pod ID (pause container ID), not container task ID
+                                        hostname=hostname,
+                                        namespace=namespace
+                                    )
+                                    
+                                    if result.get('status') == 'success':
+                                        logger.info(
+                                            f"✅ Successfully terminated unhealthy pod {pod_id} for restart. "
+                                            f"Recovery task will recreate it."
+                                        )
+                                        health_results['liveness']['restart_triggered'] = True
+                                        health_results['liveness']['restart_message'] = f"Pod terminated for restart (task_id: {result.get('task_id')})"
+                                    else:
+                                        logger.error(
+                                            f"❌ Failed to terminate unhealthy pod {pod_id}: {result.get('error', 'Unknown error')}"
+                                        )
+                                        health_results['liveness']['restart_triggered'] = False
+                                        health_results['liveness']['restart_error'] = result.get('error', 'Unknown error')
+                                        
+                                except Exception as restart_error:
+                                    logger.error(
+                                        f"❌ Error triggering restart for unhealthy pod {pod_id}: {restart_error}",
+                                        exc_info=True
+                                    )
+                                    health_results['liveness']['restart_triggered'] = False
+                                    health_results['liveness']['restart_error'] = str(restart_error)
                         else:
                             # Not time to check yet, use existing state
                             health_results['liveness'] = {
