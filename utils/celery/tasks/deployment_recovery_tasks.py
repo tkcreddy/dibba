@@ -466,7 +466,7 @@ def recover_missing_replicas_task() -> Dict[str, Any]:
                                 logger.error(f"Failed to terminate pod {pod_id} with stopped containers: {e}", exc_info=True)
                         
                         logger.info(f"Terminated {pods_terminated} pods with stopped containers for recreation")
-                        recovery_results['pods_terminated'] = recovery_results.get('pods_terminated', 0) + pods_terminated
+                    recovery_results['pods_terminated'] = recovery_results.get('pods_terminated', 0) + pods_terminated
                 
                 # Now filter to only RUNNING pods for validation
                 running_candidate_pods = [
@@ -1728,6 +1728,17 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
             logger.warning(f"Deployment {namespace}/{deployment_name}: Available worker nodes: {[n.get('hostname') for n in worker_nodes_raw]} (count: {len(worker_nodes_raw)})")
             logger.warning(f"Deployment {namespace}/{deployment_name}: Need to create {missing_replicas} replicas, currently have {running_pods_count} running pods")
             
+            # CRITICAL: If no nodes are available, log detailed diagnostic info
+            if len(worker_nodes_raw) == 0:
+                logger.error(
+                    f"Deployment {namespace}/{deployment_name}: NO AVAILABLE WORKER NODES! "
+                    f"This will prevent pod creation. Check: "
+                    f"1. Are worker nodes online in Redis? "
+                    f"2. Are nodes marked as 'online' status? "
+                    f"3. Is host/pod sync running on worker nodes? "
+                    f"4. Are there any stale AWS node creation locks?"
+                )
+            
             # CRITICAL: Check if we need 2+ replicas total but only have 1 worker node - create additional node for redundancy
             total_replicas_after = running_pods_count + missing_replicas
             if total_replicas_after >= 2 and len(worker_nodes_raw) == 1:
@@ -1742,7 +1753,26 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                 try:
                     lock_exists = redis_client.exists(aws_nodes_creating_key)
                     if lock_exists:
-                        logger.warning(f"Deployment {namespace}/{deployment_name}: AWS nodes are already being created for namespace {namespace}. Waiting for them to be ready.")
+                        # Check if lock is stale (older than 5 minutes) - if so, clear it
+                        lock_ttl = redis_client.ttl(aws_nodes_creating_key)
+                        if lock_ttl == -1:  # Key exists but has no expiration (stale)
+                            logger.warning(f"Deployment {namespace}/{deployment_name}: Found stale AWS node creation lock (no TTL). Clearing it.")
+                            redis_client.delete(aws_nodes_creating_key)
+                            lock_exists = False
+                        elif lock_ttl > 0:
+                            # Lock exists and is valid - but we have available nodes, so proceed with pod creation
+                            # Don't block pod creation on available nodes just because AWS nodes are being created
+                            logger.info(f"Deployment {namespace}/{deployment_name}: AWS nodes are being created (lock TTL: {lock_ttl}s), but {len(worker_nodes_raw)} node(s) are available. Proceeding with pod creation on available nodes.")
+                            lock_exists = False  # Don't block - proceed with pod creation
+                        else:
+                            # Lock expired (TTL = 0) - clear it
+                            logger.warning(f"Deployment {namespace}/{deployment_name}: AWS node creation lock expired. Clearing it.")
+                            redis_client.delete(aws_nodes_creating_key)
+                            lock_exists = False
+                    
+                    # Only wait if we have NO available nodes AND lock exists
+                    if lock_exists and len(worker_nodes_raw) == 0:
+                        logger.warning(f"Deployment {namespace}/{deployment_name}: No available nodes and AWS nodes are being created. Waiting for them to be ready.")
                         return {
                             "status": "waiting_for_node",
                             "deployment": deployment_name,
@@ -1752,7 +1782,7 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                             "current_replicas": running_pods_count,
                             "min_replicas": min_replicas,
                             "max_replicas": max_replicas,
-                            "message": "AWS nodes already being created. Will retry pod creation after node is ready."
+                            "message": "No available nodes. AWS nodes being created. Will retry pod creation after node is ready."
                         }
                 except Exception as e:
                     logger.warning(f"Failed to check AWS nodes creating lock: {e}. Proceeding with node creation.")
@@ -1853,13 +1883,32 @@ def scale_deployment_task(deployment_name: str, namespace: str) -> Dict[str, Any
                 try:
                     is_creating = redis_client.exists(aws_nodes_creating_key)
                     if is_creating:
-                        logger.info(f"AWS nodes are already being created for namespace {namespace}. Skipping duplicate creation attempt.")
-                        return {
-                            "status": "error",
-                            "error": f"AWS nodes already being created for namespace {namespace}",
-                            "pods_created": 0,
-                            "pods_terminated": 0,
-                        }
+                        # Check if lock is stale
+                        lock_ttl = redis_client.ttl(aws_nodes_creating_key)
+                        if lock_ttl == -1:  # Key exists but has no expiration (stale)
+                            logger.warning(f"Deployment {namespace}/{deployment_name}: Found stale AWS node creation lock (no TTL). Clearing it.")
+                            redis_client.delete(aws_nodes_creating_key)
+                            is_creating = False
+                        elif lock_ttl <= 0:  # Lock expired
+                            logger.warning(f"Deployment {namespace}/{deployment_name}: AWS node creation lock expired. Clearing it.")
+                            redis_client.delete(aws_nodes_creating_key)
+                            is_creating = False
+                        else:
+                            # Lock is valid - but if we have available nodes, we should still try to create pods
+                            # Only skip if we have NO available nodes
+                            if len(worker_nodes_raw) == 0:
+                                logger.info(f"Deployment {namespace}/{deployment_name}: No available nodes and AWS nodes are already being created for namespace {namespace}. Skipping duplicate creation attempt.")
+                                return {
+                                    "status": "waiting_for_node",
+                                    "error": f"No available nodes. AWS nodes already being created for namespace {namespace}",
+                                    "pods_created": 0,
+                                    "pods_terminated": 0,
+                                    "message": "Waiting for AWS nodes to be ready."
+                                }
+                            else:
+                                # We have available nodes - proceed with pod creation, but don't create more AWS nodes
+                                logger.info(f"Deployment {namespace}/{deployment_name}: AWS nodes are being created, but {len(worker_nodes_raw)} node(s) are available. Proceeding with pod creation on available nodes.")
+                                is_creating = False  # Don't block - proceed with pod creation on available nodes
                 except Exception as e:
                     logger.warning(f"Failed to check AWS nodes creating status: {e}", exc_info=True)
                 

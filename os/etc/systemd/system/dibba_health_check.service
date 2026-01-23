@@ -1,0 +1,20 @@
+[Unit]
+Description=My Dibba health check worker
+After=network.target, dibba_host_pod_consumer.service
+
+[Service]
+Type=simple
+User=root
+PIDFile=/run/dibba_health_check.pid
+WorkingDirectory=/opt/dibba
+ExecStart=/opt/dibba/scripts/start_health_check_worker.sh
+StandardOutput=append:/var/log/dibba/health_check_work.log
+StandardError=append:/var/log/dibba/health_check_work.err.log
+Restart=on-failure
+RestartSec=5
+Environment="PYTHONUNBUFFERED=1"
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

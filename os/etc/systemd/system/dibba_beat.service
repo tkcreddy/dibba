@@ -1,0 +1,20 @@
+[Unit]
+Description=My Dibba beat worker
+After=network.target, dibba_host_pod_consumer.service, dibba_health_check.service
+
+[Service]
+Type=simple
+User=root
+PIDFile=/run/dibba_beat.pid
+WorkingDirectory=/opt/dibba
+ExecStart=/opt/dibba/scripts/start_beat.sh
+StandardOutput=append:/var/log/dibba/beat.log
+StandardError=append:/var/log/dibba/beat.err.log
+Restart=on-failure
+RestartSec=5
+Environment="PYTHONUNBUFFERED=1"
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

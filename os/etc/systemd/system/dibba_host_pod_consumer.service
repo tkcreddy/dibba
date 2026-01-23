@@ -1,15 +1,14 @@
 [Unit]
-Description=My Dibba worker
+Description=My Dibba host_pod Gather
 After=network.target
 
 [Service]
 Type=simple
 User=root
-PIDFile=/run/dibba.pid
+PIDFile=/run/dibba_host_pod.pid
 WorkingDirectory=/opt/dibba
 #ExecStart=/opt/dibba/.venv/bin/celery -A utils.celery.worker_node:app worker -l
- info
-ExecStart=/opt/dibba/scripts/start_host_pod_consumer
+ExecStart=/opt/dibba/scripts/start_host_pod_consumer.sh
 StandardOutput=append:/var/log/dibba/host_pod_consumer.log
 StandardError=append:/var/log/dibba/host_pod_consumer.err.log
 Restart=on-failure

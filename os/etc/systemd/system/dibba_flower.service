@@ -1,0 +1,26 @@
+[Unit]
+Description=Flower UI for Celery
+After=network.target redis.service
+Requires=redis.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dibba
+User=root
+
+EnvironmentFile=-/opt/dibba/dibba.env
+Environment="PATH=/opt/dibba/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+
+ExecStart=/opt/dibba/.venv/bin/celery -A utils.celery.celery_app flower \
+  --port=5555 \
+  --url_prefix=/flower \
+  --persistent=True \
+  --db=/var/log/dibba/flower_db/flower.db \
+  --state_save_interval=10000
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
